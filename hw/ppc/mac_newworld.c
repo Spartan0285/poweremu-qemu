@@ -508,7 +508,9 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
+    /* QEMU_PPC_NDRV overrides the VGA NDRV (e.g. the hardware-cursor build) */
+    filename = getenv("QEMU_PPC_NDRV") ? g_strdup(getenv("QEMU_PPC_NDRV")) :
+               qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
     if (filename) {
         gchar *ndrv_file;
         gsize ndrv_size;

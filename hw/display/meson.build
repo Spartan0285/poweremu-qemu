@@ -61,6 +61,18 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
+system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
+  'ppc_mac_gpu.c',
+  'ppc_mac_gpu_renderer_sw.c',
+), pixman])
+
+if host_os == 'darwin'
+  metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)
+  if metal_fw.found()
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m'), metal_fw])
+  endif
+endif
+
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
