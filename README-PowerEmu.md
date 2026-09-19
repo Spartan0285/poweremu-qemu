@@ -27,7 +27,7 @@ PowerEmu repository.
     python3 -m venv ~/.poweremu-buildenv && ~/.poweremu-buildenv/bin/pip install "distlib<0.4"
     mkdir build && cd build
     ../configure --python=$HOME/.poweremu-buildenv/bin/python3 \
-        --target-list=ppc-softmmu --disable-docs --enable-plugins \
+        --target-list=ppc-softmmu --disable-docs --enable-plugins --disable-sdl \
         -Dqom_cast_debug=false -Doptimization=3 -Db_lto=true
     ninja qemu-system-ppc
 
