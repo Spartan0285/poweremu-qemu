@@ -158,9 +158,17 @@ int qemu_dup_flags(int fd, int flags)
         goto fail;
     }
 
-    /* Set/unset flags that we can with fcntl */
+    /*
+     * Set/unset flags that we can with fcntl.  macOS character devices (raw
+     * disks such as /dev/rdisk4) refuse F_SETFL with ENOTTY whatever the
+     * flags; that is harmless when the ones F_SETFL could change already
+     * match.
+     */
     if (fcntl(ret, F_SETFL, flags) == -1) {
-        goto fail;
+        const int settable = O_APPEND | O_NONBLOCK | O_ASYNC;
+        if (errno != ENOTTY || ((flags ^ dup_flags) & settable)) {
+            goto fail;
+        }
     }
 
     /* Truncate the file in the cases that open() would truncate it */
