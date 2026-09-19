@@ -22,8 +22,12 @@ PowerEmu repository.
 ## Building (Apple silicon, Homebrew)
 
     brew install meson ninja pkgconf glib pixman libslirp libusb sdl2 gnutls jpeg-turbo libpng zstd
+    # QEMU 10.0's mkvenv needs distlib.version, which pip >= 25's vendored
+    # distlib (0.4) no longer has; give configure a Python with distlib 0.3.
+    python3 -m venv ~/.poweremu-buildenv && ~/.poweremu-buildenv/bin/pip install "distlib<0.4"
     mkdir build && cd build
-    ../configure --target-list=ppc-softmmu --disable-docs --enable-plugins \
+    ../configure --python=$HOME/.poweremu-buildenv/bin/python3 \
+        --target-list=ppc-softmmu --disable-docs --enable-plugins \
         -Dqom_cast_debug=false -Doptimization=3 -Db_lto=true
     ninja qemu-system-ppc
 
