@@ -22,6 +22,8 @@
  *    11 MOTION   i32 dx, dy                     (relative, pixels)
  *    12 BUTTONS  u32 mask: 1 left, 2 right, 4 middle
  *    13 WHEEL    i32 dy (lines; positive = away from the user), i32 dx
+ *    14 POINT    u32 x, y                       (absolute, guest pixels:
+ *                                                for the USB tablet)
  *
  * Copyright (c) 2026 Spartan0285
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -43,7 +45,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PowerEmuDisplay, POWEREMU_DISPLAY)
 
 enum {
     PE_SURFACE = 1, PE_DAMAGE = 2, PE_CURSOR = 3, PE_MOUSE = 4,
-    PE_KEY = 10, PE_MOTION = 11, PE_BUTTONS = 12, PE_WHEEL = 13,
+    PE_KEY = 10, PE_MOTION = 11, PE_BUTTONS = 12, PE_WHEEL = 13, PE_POINT = 14,
 };
 
 struct PowerEmuDisplay {
@@ -319,6 +321,14 @@ static void pe_input(PowerEmuDisplay *pd, uint32_t type, const uint8_t *p, uint3
         if (len >= 8) {
             qemu_input_queue_rel(pd->dcl.con, INPUT_AXIS_X, v[0]);
             qemu_input_queue_rel(pd->dcl.con, INPUT_AXIS_Y, v[1]);
+            qemu_input_event_sync();
+        }
+        break;
+    case PE_POINT:
+        /* Goes to the absolute pointer (usb-tablet): no capture needed. */
+        if (len >= 8 && pd->width > 0 && pd->height > 0) {
+            qemu_input_queue_abs(pd->dcl.con, INPUT_AXIS_X, v[0], 0, pd->width - 1);
+            qemu_input_queue_abs(pd->dcl.con, INPUT_AXIS_Y, v[1], 0, pd->height - 1);
             qemu_input_event_sync();
         }
         break;

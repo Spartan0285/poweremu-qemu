@@ -220,9 +220,15 @@ static void pci_unin_main_init(Object *obj)
     memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
                           "unin-pci-isa-mmio", 0x00800000);
 
+    /*
+     * 512 MB (0x80000000-0x9fffffff) rather than the 256 MB of the stock
+     * machine: a graphics card with 128 MB of VRAM, aligned to 128 MB,
+     * pushes its register BAR to 0x90000000, which the CPU could not reach
+     * through a 256 MB hole.  Nothing else lives at 0x9xxxxxxx on mac99.
+     */
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
-                             0x80000000ULL, 0x10000000ULL);
+                             0x80000000ULL, 0x20000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
@@ -360,13 +366,14 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
 
     /*
      * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
-     * memory space with base 0x80000000, size 0x10000000 for Apple's
-     * AppleMacRiscPCI driver
+     * memory space for Apple's AppleMacRiscPCI/AGP driver: the upper 16
+     * bits select 256 MB regions, bit n for n * 256 MB.  Bits 8 and 9:
+     * 0x80000000 and 0x90000000, matching the 512 MB hole above.
      */
     d->config[0x48] = 0x0;
     d->config[0x49] = 0x0;
     d->config[0x4a] = 0x0;
-    d->config[0x4b] = 0x1;
+    d->config[0x4b] = 0x3;
 
     if (((UNINMainPCIHost *)d)->agp_capable) {
         unin_add_agp_capability(d, errp);
