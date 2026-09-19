@@ -300,6 +300,19 @@ static void handleAnyDeviceErrors(Error * err)
     QemuCocoaView
  ------------------------------------------------------
 */
+static void qemu_toggle_full_panel(void);
+
+/* A borderless (full-panel) window must still take keyboard focus. */
+@interface QemuWindow : NSWindow
+@end
+@implementation QemuWindow
+- (BOOL) canBecomeKeyWindow { return YES; }
+- (BOOL) canBecomeMainWindow { return YES; }
+/* The green title-bar button: use the full-panel mode, never macOS's native
+ * fullscreen (letterboxed below the notch, menu bar gone). */
+- (void) toggleFullScreen:(id)sender { qemu_toggle_full_panel(); }
+@end
+
 @interface QemuCocoaView : NSView
 {
     QEMUScreen screen;
@@ -321,6 +334,11 @@ static void handleAnyDeviceErrors(Error * err)
     int mouseX;
     int mouseY;
     bool mouseOn;
+    /* full-panel fullscreen: borderless window over the whole screen */
+    BOOL fullPanel;
+    NSRect savedFrame;
+    NSWindowStyleMask savedStyle;
+    NSView *panelView;
 }
 - (void) switchSurface:(pixman_image_t *)image;
 - (void) grabMouse;
@@ -333,9 +351,16 @@ static void handleAnyDeviceErrors(Error * err)
 - (BOOL) isMouseGrabbed;
 - (QEMUScreen) gscreen;
 - (void) raiseAllKeys;
+- (void) toggleFullPanel;
+- (BOOL) isFullPanel;
 @end
 
 QemuCocoaView *cocoaView;
+
+static void qemu_toggle_full_panel(void)
+{
+    [cocoaView toggleFullPanel];
+}
 
 static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
 {
@@ -378,10 +403,17 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [self setClipsToBounds:YES];
 #endif
         [self setWantsLayer:YES];
+        /*
+         * The guest framebuffer is 8-bit sRGB.  On wide-gamut / EDR displays
+         * AppKit would otherwise give this view a float16 backing store and
+         * convert every refresh through CoreGraphics' RGBAf16 path.
+         */
+        [[self layer] setContentsFormat:kCAContentsFormatRGBA8Uint];
         cursorLayer = [[CALayer alloc] init];
         [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
-        [cursorLayer setAutoresizingMask:kCALayerMaxXMargin |
-                                         kCALayerMinYMargin];
+        /* No autoresizing mask: AppKit re-lays this layer out when the view
+         * is reparented/resized (fullscreen) and stretched the cursor.
+         * setMouseX re-asserts the geometry instead. */
         [[self layer] addSublayer:cursorLayer];
 
     }
@@ -455,11 +487,30 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     mouseY = y;
     mouseOn = on;
 
+    /* Sublayers use the view's bounds, which updateBounds keeps in guest
+     * pixels at any view size - no scaling here. */
     position.x = mouseX;
     position.y = screen.height - mouseY;
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
+    if (cursor) {
+        CGRect want = CGRectMake(0, 0, cursor->width, cursor->height);
+        if (getenv("QEMU_CURSOR_DEBUG") &&
+            (!CGRectEqualToRect([cursorLayer bounds], want) ||
+             !CATransform3DIsIdentity([cursorLayer transform]))) {
+            CGRect b = [cursorLayer bounds];
+            fprintf(stderr, "cursor layer drifted: bounds %.1fx%.1f identity %d "
+                    "(super %.1fx%.1f, view frame %.1fx%.1f)\n",
+                    b.size.width, b.size.height,
+                    CATransform3DIsIdentity([cursorLayer transform]),
+                    [[self layer] bounds].size.width,
+                    [[self layer] bounds].size.height,
+                    [self frame].size.width, [self frame].size.height);
+        }
+        [cursorLayer setTransform:CATransform3DIdentity];
+        [cursorLayer setBounds:want];
+    }
     [cursorLayer setPosition:position];
     [cursorLayer setHidden:!mouseOn];
     [CATransaction commit];
@@ -511,6 +562,52 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [cursorLayer setContents:(id)image];
     [CATransaction commit];
     CGImageRelease(image);
+    [self setMouseX:mouseX y:mouseY on:mouseOn];   /* re-apply view scale */
+}
+
+/*
+ * Present the guest framebuffer as the layer's contents rather than drawing
+ * it in -drawRect:.  On wide-gamut/EDR displays -drawRect: renders into a
+ * float16 backing store, and CoreGraphics' RGBAf16 resampler then dominated
+ * QEMU's host CPU time; as layer contents, Core Animation composites and
+ * colour-converts the image on the GPU.
+ */
+- (BOOL) wantsUpdateLayer
+{
+    return YES;
+}
+
+- (void) updateLayer
+{
+    CALayer *layer = [self layer];
+
+    if (!pixman_image) {
+        [layer setContents:nil];
+        [layer setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
+        return;
+    }
+    int w = pixman_image_get_width(pixman_image);
+    int h = pixman_image_get_height(pixman_image);
+    int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
+    int stride = pixman_image_get_stride(pixman_image);
+    /* Copy: the layer may keep the image after the surface is replaced. */
+    CFDataRef data = CFDataCreate(NULL,
+                                  (const UInt8 *)pixman_image_get_data(pixman_image),
+                                  (CFIndex)stride * h);
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+    CGImageRef image = CGImageCreate(w, h, DIV_ROUND_UP(bitsPerPixel, 8) * 2,
+                                     bitsPerPixel, stride, colorspace,
+                                     kCGBitmapByteOrder32Little |
+                                     kCGImageAlphaNoneSkipFirst,
+                                     provider, NULL, 0,
+                                     kCGRenderingIntentDefault);
+    [layer setContentsGravity:kCAGravityResize];
+    [layer setMagnificationFilter:zoom_interpolation == kCGInterpolationNone ?
+                                  kCAFilterNearest : kCAFilterLinear];
+    [layer setContents:(id)image];
+    CGImageRelease(image);
+    CGDataProviderRelease(provider);
+    CFRelease(data);
 }
 
 - (void) drawRect:(NSRect) rect
@@ -622,8 +719,98 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     return size;
 }
 
+- (void) layoutFullPanel
+{
+    NSSize c = [panelView bounds].size;
+    NSRect area = NSMakeRect(0, 0, c.width, c.height);
+    NSSize f = [self fixAspectRatio:c];
+
+    /*
+     * Below the notch: if the guest fits the area under the camera housing
+     * (safe area) at least as large as the whole panel - e.g. 16:10 or the
+     * 1440x904-style modes - put it there, so the top of the guest screen
+     * is not hidden behind the notch.  Guests shaped like the whole panel
+     * (1440x932 etc.) still use all of it.
+     */
+    NSEdgeInsets in = [[[self window] screen] safeAreaInsets];
+    if (in.top > 0 || in.bottom > 0 || in.left > 0 || in.right > 0) {
+        NSRect safe = NSMakeRect(in.left, in.bottom,
+                                 c.width - in.left - in.right,
+                                 c.height - in.top - in.bottom);
+        NSSize fs = [self fixAspectRatio:safe.size];
+        if (fs.width * fs.height >= f.width * f.height * 0.995) {
+            area = safe;
+            f = fs;
+        }
+    }
+    [self setFrame:NSMakeRect(area.origin.x + floor((area.size.width - f.width) / 2),
+                              area.origin.y + floor((area.size.height - f.height) / 2),
+                              f.width, f.height)];
+    [self updateBounds];
+    [self setMouseX:mouseX y:mouseY on:mouseOn];
+}
+
+- (BOOL) isFullPanel
+{
+    return fullPanel;
+}
+
+/*
+ * Fullscreen over the whole panel.  macOS's native fullscreen keeps apps
+ * below the camera housing on notched MacBooks (1440x900 of 1440x932) and
+ * hides the menu bar for good, so a 1440x932 guest was shrunk with black
+ * bars and there was no way back out.  Instead: a borderless window over the
+ * entire screen, the guest view centred at the largest size that keeps its
+ * aspect, Dock hidden and menu bar auto-hidden (release the mouse with
+ * Ctrl+Alt+G to reach it); Ctrl+Alt+F toggles.
+ */
+- (void) toggleFullPanel
+{
+    NSWindow *w = [self window];
+    if (!fullPanel) {
+        NSScreen *sc = [w screen] ?: [NSScreen mainScreen];
+        savedFrame = [w frame];
+        savedStyle = [w styleMask];
+        fullPanel = YES;
+        panelView = [[NSView alloc] initWithFrame:[sc frame]];
+        [panelView setWantsLayer:YES];
+        [[panelView layer] setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
+        [self retain];
+        [w setContentView:panelView];
+        [panelView addSubview:self];
+        [self release];
+        [w setStyleMask:NSWindowStyleMaskBorderless];
+        [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
+                                      NSApplicationPresentationAutoHideMenuBar];
+        [w setFrame:[sc frame] display:YES];
+        [panelView setFrame:[[w contentView] bounds]];
+        [self layoutFullPanel];
+        [w makeKeyAndOrderFront:nil];
+        [self grabMouse];
+    } else {
+        fullPanel = NO;
+        [self retain];
+        [self removeFromSuperview];
+        [w setContentView:self];
+        [self release];
+        [panelView release];
+        panelView = nil;
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+        [w setStyleMask:savedStyle];
+        [w setFrame:savedFrame display:YES];
+        [self resizeWindow];
+        [self updateBounds];
+        [self setMouseX:mouseX y:mouseY on:mouseOn];
+        [self ungrabMouse];
+    }
+}
+
 - (void) resizeWindow
 {
+    if (fullPanel) {
+        [self layoutFullPanel];
+        return;
+    }
     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
 
     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
@@ -1018,6 +1205,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                         case 'g':
                             [self ungrabMouse];
                             return true;
+
+                        // toggle (full-panel) fullscreen
+                        case 'f':
+                            [self toggleFullPanel];
+                            return true;
                     }
                 }
             }
@@ -1068,6 +1260,21 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
             qemu_input_event_sync();
 
             return true;
+        case NSEventTypeMouseMoved:
+        case NSEventTypeLeftMouseDragged:
+        case NSEventTypeRightMouseDragged:
+        case NSEventTypeOtherMouseDragged:
+            /*
+             * While grabbed with a relative pointer the host cursor is frozen,
+             * so AppKit's first-responder / tracking-area delivery can stall
+             * (e.g. after the fullscreen panel reparents the view).  Deltas
+             * don't depend on where the event lands: take them here.
+             */
+            if (isMouseGrabbed && !isAbsoluteEnabled) {
+                [self handleMouseEvent:event];
+                return true;
+            }
+            return false;
         default:
             return false;
     }
@@ -1094,12 +1301,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
     with_bql(^{
         if (isAbsoluteEnabled) {
-            CGFloat d = (CGFloat)screen.height / [self frame].size.height;
-            NSPoint p = [event locationInWindow];
+            /* Bounds are guest pixels (updateBounds); this also accounts
+             * for the view being centred inside the fullscreen panel. */
+            NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
 
             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x, 0, screen.width);
+            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y, 0, screen.height);
         } else {
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
             qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
@@ -1295,7 +1503,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
 
         // create a window
-        window = [[NSWindow alloc] initWithContentRect:[cocoaView frame]
+        window = [[QemuWindow alloc] initWithContentRect:[cocoaView frame]
             styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskClosable
             backing:NSBackingStoreBuffered defer:NO];
         if(!window) {
@@ -1433,7 +1641,16 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
  */
 - (void) doToggleFullScreen:(id)sender
 {
-    [[cocoaView window] toggleFullScreen:sender];
+    [cocoaView toggleFullPanel];
+}
+
+- (BOOL) validateMenuItem:(NSMenuItem *)item
+{
+    if ([item action] == @selector(doToggleFullScreen:)) {
+        [item setTitle:[cocoaView isFullPanel] ? @"Exit Fullscreen"
+                                               : @"Enter Fullscreen"];
+    }
+    return YES;
 }
 
 - (void) setFullGrab:(id)sender
@@ -2101,13 +2318,23 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 
     [QemuApplication sharedApplication];
 
+    /*
+     * An emulator must not be App Napped: when its window is behind another
+     * app macOS would otherwise drop the whole process to background
+     * priority (efficiency cores, throttled timers), and the guest crawls.
+     */
+    [[[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiated |
+                                 NSActivityLatencyCritical
+                          reason:@"Running a virtual machine"] retain];
+
     // Create an Application controller
     QemuCocoaAppController *controller = [[QemuCocoaAppController alloc] init];
     [NSApp setDelegate:controller];
 
     /* if fullscreen mode is to be used */
     if (opts->has_full_screen && opts->full_screen) {
-        [[cocoaView window] toggleFullScreen: nil];
+        [cocoaView toggleFullPanel];
     }
     if (opts->u.cocoa.has_full_grab && opts->u.cocoa.full_grab) {
         [controller setFullGrab: nil];
