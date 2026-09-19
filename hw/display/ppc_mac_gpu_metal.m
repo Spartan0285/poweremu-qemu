@@ -6383,9 +6383,62 @@ static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
  * the same memory are distinct Metal objects, so Metal does not order a
  * write through one against a read through another: a draw that would read
  * (or re-target) written memory through a different view flushes first. */
-#define R200_MAX_WRITTEN 32
-static struct { uint64_t lo, hi; R200TexKey key; } g_r200_written[R200_MAX_WRITTEN];
+#define R200_MAX_WRITTEN 128
+static struct { uint64_t lo, hi; R200TexKey key; uint32_t epoch; } g_r200_written[R200_MAX_WRITTEN];
 static int g_r200_nwritten;
+
+/*
+ * Instead of stopping the vCPU until the GPU is done, a conflict can end
+ * the batch and start a new one that the GPU runs only after the previous
+ * one completes (a shared event signalled at the end of each batch and
+ * waited for at the start of the next).  The written ranges stay for the
+ * CPU-side checks; conflicts only look at the current batch's (epoch).
+ * PPCGPU_SPLIT=0 goes back to waiting.
+ */
+static uint32_t g_r200_epoch;
+static id<MTLSharedEvent> g_r200_event;
+static uint64_t g_r200_event_val;
+static uint64_t g_r200_stat_splits;
+
+static bool r200_split_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_SPLIT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* A new command buffer, ordered after everything committed before it. */
+static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
+{
+    id<MTLCommandBuffer> cb = [[st->commandQueue commandBuffer] retain];
+    if (g_r200_event && g_r200_event_val) {
+        [cb encodeWaitForEvent:g_r200_event value:g_r200_event_val];
+    }
+    return cb;
+}
+
+static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
+{
+    int w = 0;
+    while (w < g_r200_nwritten && memcmp(&g_r200_written[w].key, key, sizeof(*key))) {
+        w++;
+    }
+    if (w < g_r200_nwritten) {
+        g_r200_written[w].epoch = g_r200_epoch;       /* written again in this batch */
+        return;
+    }
+    if (w == R200_MAX_WRITTEN) {
+        return;                /* full: the next draw flushes (see the conflict check) */
+    }
+    g_r200_written[w].lo = lo;
+    g_r200_written[w].hi = hi;
+    g_r200_written[w].key = *key;
+    g_r200_written[w].epoch = g_r200_epoch;
+    g_r200_nwritten++;
+}
 
 /* VRAM ranges read (as textures) by draws in the open or in-flight batches. */
 #define R200_MAX_READ 64
@@ -6435,6 +6488,9 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
 static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same)
 {
     for (int i = 0; i < g_r200_nwritten; i++) {
+        if (g_r200_written[i].epoch != g_r200_epoch) {
+            continue;          /* an earlier batch: the GPU orders it before this one */
+        }
         if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi &&
             !(same && !memcmp(same, &g_r200_written[i].key, sizeof(*same)))) {
             return true;
@@ -6502,6 +6558,9 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
             done(arg, seq);
         }];
     }
+    if (g_r200_event) {
+        [g_r200_cb encodeSignalEvent:g_r200_event value:++g_r200_event_val];
+    }
     [g_r200_cb commit];
     [g_r200_inflight release];
     g_r200_inflight = g_r200_cb;           /* keeps the reference */
@@ -6565,7 +6624,7 @@ static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch
         }
         @autoreleasepool {
             if (!g_r200_cb) {
-                g_r200_cb = [[st->commandQueue commandBuffer] retain];
+                g_r200_cb = r200_new_cb(st);
             }
             if (g_r200_enc) {
                 [g_r200_enc endEncoding];
@@ -6900,8 +6959,8 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         R200TexKey rk = { pkt->rt_offset, pkt->rt_width, pkt->rt_height, bpr,
                           (uint32_t)rtpf };
         uint64_t rlo = pkt->rt_offset, rhi = rlo + (uint64_t)bpr * pkt->rt_height;
-        bool conflict = r200_batch_conflict(rlo, rhi, &rk) ||
-                        g_r200_nwritten == R200_MAX_WRITTEN;
+        bool full = g_r200_nwritten == R200_MAX_WRITTEN;
+        bool conflict = r200_batch_conflict(rlo, rhi, &rk);
         for (int t = 0; t < R200_MAX_TEX && !conflict; t++) {
             const R200TexUnit *tu = &pkt->tex[t];
             if (u.texinfo[t][0] && !tu->host_data) {
@@ -6909,12 +6968,23 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                (uint64_t)tu->pitch * tu->height, NULL);
             }
         }
-        if (conflict) {
-            metal_flush_r200(st);
+        if (full) {
+            metal_flush_r200(st);                  /* forget everything written */
+        } else if (conflict) {
             g_r200_stat_conflicts++;
+            if (r200_split_enabled()) {
+                if (!g_r200_event) {
+                    g_r200_event = [st->device newSharedEvent];
+                }
+                r200_commit(NULL, NULL);           /* the GPU keeps the order */
+                g_r200_epoch++;
+                g_r200_stat_splits++;
+            } else {
+                metal_flush_r200(st);
+            }
         }
         if (!g_r200_cb) {
-            g_r200_cb = [[st->commandQueue commandBuffer] retain];
+            g_r200_cb = r200_new_cb(st);
         }
         bool want_ds = pkt->depth_enable || pkt->stencil_enable;
         bool enc_ds = g_r200_enc_depth_off != ~0u;
@@ -6955,17 +7025,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 }
                 if (dtex) {
                     uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
-                    int w = 0;
-                    while (w < g_r200_nwritten &&
-                           memcmp(&g_r200_written[w].key, &dk, sizeof(dk))) {
-                        w++;
-                    }
-                    if (w == g_r200_nwritten && w < R200_MAX_WRITTEN) {
-                        g_r200_written[w].lo = dlo;
-                        g_r200_written[w].hi = dhi;
-                        g_r200_written[w].key = dk;
-                        g_r200_nwritten++;
-                    }
+                    r200_note_written(dlo, dhi, &dk);
                 }
             }
             if (dtex) {
@@ -6993,17 +7053,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                                   pkt->rt_height, 0, 1 }];
             g_r200_enc_key = rk;
             g_r200_stat_passes++;
-            int w = 0;
-            while (w < g_r200_nwritten &&
-                   memcmp(&g_r200_written[w].key, &rk, sizeof(rk))) {
-                w++;
-            }
-            if (w == g_r200_nwritten) {
-                g_r200_written[w].lo = rlo;
-                g_r200_written[w].hi = rhi;
-                g_r200_written[w].key = rk;
-                g_r200_nwritten++;
-            }
+            r200_note_written(rlo, rhi, &rk);
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
         [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
