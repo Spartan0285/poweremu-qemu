@@ -182,11 +182,25 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
     char name[32];
     int fd;
 
-    pe_free_shm(pd);
-    pd->dirty = false;
     if (!ds) {
+        pe_free_shm(pd);
+        pd->dirty = false;
         return;
     }
+    /*
+     * The GPU model hands over a new surface whenever the guest rewrites
+     * the display start (every page flip, among others).  If the size is
+     * the same, keep the shared memory PowerEmu already shows and refresh
+     * its contents: re-announcing it made PowerEmu show a blank frame.
+     */
+    if (pd->shm_image && surface_width(ds) == pd->width && surface_height(ds) == pd->height) {
+        pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
+                               0, 0, 0, 0, 0, 0, pd->width, pd->height);
+        pe_damage(pd, 0, 0, pd->width, pd->height);
+        return;
+    }
+    pe_free_shm(pd);
+    pd->dirty = false;
     pd->width = surface_width(ds);
     pd->height = surface_height(ds);
     pd->stride = pd->width * 4;
@@ -215,13 +229,13 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
     pd->shm_image = pixman_image_create_bits(PIXMAN_a8r8g8b8, pd->width, pd->height,
                                              pd->shm, pd->stride);
 
+    /* Fill it before PowerEmu sees it, so the first frame isn't blank. */
+    pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
+                           0, 0, 0, 0, 0, 0, pd->width, pd->height);
+
     uint32_t msg[3] = { pd->width, pd->height, pd->stride };
     pe_send(pd, PE_SURFACE, msg, sizeof(msg), fd);
     close(fd);
-
-    /* The whole new screen, whatever the comparison would say. */
-    pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
-                           0, 0, 0, 0, 0, 0, pd->width, pd->height);
     pe_damage(pd, 0, 0, pd->width, pd->height);
 }
 
