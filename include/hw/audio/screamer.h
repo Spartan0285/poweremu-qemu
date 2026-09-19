@@ -27,6 +27,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "qemu/timer.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "audio/audio.h"
 
@@ -54,6 +55,9 @@ struct ScreamerState {
 
     uint32_t wpos;
     uint32_t rpos;
+    QEMUTimer *pace_timer;        /* pulls TX DMA at the sample rate */
+    int64_t pace_last, pace_frac, pace_idle;
+    bool primed;                  /* jitter buffer filled, output running */
 
     uint32_t bpos;
     uint32_t ppos;
