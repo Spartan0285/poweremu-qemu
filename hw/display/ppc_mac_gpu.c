@@ -221,6 +221,32 @@ static struct {
     int64_t since;
 } r200_rate;
 
+/*
+ * Running totals for PowerEmu's performance overlay (the "perf" property):
+ * a frame is a flip or a write into the scanout that follows 3D drawing;
+ * textures are counted per draw by where they are read from; vram_high is
+ * the highest VRAM byte any render target, depth buffer or texture used.
+ */
+static struct {
+    uint64_t frames, draws, tex_vram, tex_agp, agp_bytes, vram_high;
+    bool drew;
+} r200_perf;
+
+static void r200_perf_present(void)
+{
+    if (r200_perf.drew) {
+        r200_perf.frames++;
+        r200_perf.drew = false;
+    }
+}
+
+static void r200_perf_high(uint64_t end)
+{
+    if (end > r200_perf.vram_high) {
+        r200_perf.vram_high = end;
+    }
+}
+
 static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
 {
     if (s->renderer && s->renderer->flush_r200) {
@@ -280,6 +306,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
         if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
             hi > s->regs.crtc_offset) {
             r200_rate.presents++;          /* 2D write into the scanout */
+            r200_perf_present();
         }
     }
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
@@ -4574,6 +4601,26 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
                                       s->vram_size, &pkt) == 0) {
         memory_region_set_dirty(&s->vram, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+        r200_perf.draws++;
+        r200_perf.drew = true;
+        r200_perf_high((uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+        if (pkt.depth_enable && pkt.depth_pitch) {
+            r200_perf_high((uint64_t)pkt.depth_offset +
+                           (uint64_t)pkt.rt_height * pkt.depth_pitch * pkt.depth_bpp);
+        }
+        for (int t = 0; t < R200_MAX_TEX; t++) {
+            if (!pkt.tex[t].enabled) {
+                continue;
+            }
+            uint64_t bytes = (uint64_t)pkt.tex[t].pitch * pkt.tex[t].height;
+            if (pkt.tex[t].host_data) {
+                r200_perf.tex_agp++;
+                r200_perf.agp_bytes += bytes;
+            } else {
+                r200_perf.tex_vram++;
+                r200_perf_high((uint64_t)pkt.tex[t].offset + bytes);
+            }
+        }
     }
     for (int t = 0; t < R200_MAX_TEX; t++) {
         g_free((void *)pkt.tex[t].host_data);
@@ -7450,6 +7497,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
             r200_rate.flips++;             /* page flip: one frame */
+            r200_perf_present();
         }
         s->regs.crtc_offset = val;
         s->display_invalid = true;
@@ -8710,6 +8758,18 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
 };
 
+/* Read-only "perf": the running totals behind PowerEmu's overlay. */
+static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
+{
+    PPCMacGPUState *s = PPC_MAC_GPU(obj);
+    return g_strdup_printf("frames=%" PRIu64 " draws=%" PRIu64 " tex_vram=%" PRIu64
+                           " tex_agp=%" PRIu64 " agp_bytes=%" PRIu64
+                           " vram_high=%" PRIu64 " vram_usable=%u",
+                           r200_perf.frames, r200_perf.draws, r200_perf.tex_vram,
+                           r200_perf.tex_agp, r200_perf.agp_bytes, r200_perf.vram_high,
+                           s->regs.config_memsize);
+}
+
 static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -8727,6 +8787,7 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, ppc_mac_gpu_properties);
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    object_class_property_add_str(klass, "perf", ppc_mac_gpu_get_perf, NULL);
 }
 
 static const TypeInfo ppc_mac_gpu_type_info = {

@@ -139,6 +139,37 @@ static void pe_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h
     if (w <= 0 || h <= 0) {
         return;
     }
+    /*
+     * Many updates repaint what is already there (the GPU model reports the
+     * whole screen each refresh).  For 32-bit screens, find the rows that
+     * really changed, comparing colour bytes only (x8r8g8b8's spare byte is
+     * not kept), and pass on just those; an idle screen then costs nothing.
+     */
+    pixman_format_code_t fmt = pixman_image_get_format(ds->image);
+    if (fmt == PIXMAN_x8r8g8b8 || fmt == PIXMAN_a8r8g8b8) {
+        const uint8_t *src = (const uint8_t *)pixman_image_get_data(ds->image);
+        int sstride = pixman_image_get_stride(ds->image);
+        int first = -1, last = -1;
+
+        for (int row = y; row < y + h; row++) {
+            const uint32_t *a = (const uint32_t *)(src + (size_t)row * sstride) + x;
+            const uint32_t *b = (const uint32_t *)((uint8_t *)pd->shm + (size_t)row * pd->stride) + x;
+            for (int i = 0; i < w; i++) {
+                if ((a[i] ^ b[i]) & 0x00ffffff) {
+                    if (first < 0) {
+                        first = row;
+                    }
+                    last = row;
+                    break;
+                }
+            }
+        }
+        if (first < 0) {
+            return;
+        }
+        y = first;
+        h = last - first + 1;
+    }
     /* Converts whatever depth the guest uses to BGRA. */
     pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
                            x, y, 0, 0, x, y, w, h);
@@ -188,7 +219,10 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
     pe_send(pd, PE_SURFACE, msg, sizeof(msg), fd);
     close(fd);
 
-    pe_gfx_update(dcl, 0, 0, pd->width, pd->height);
+    /* The whole new screen, whatever the comparison would say. */
+    pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
+                           0, 0, 0, 0, 0, 0, pd->width, pd->height);
+    pe_damage(pd, 0, 0, pd->width, pd->height);
 }
 
 static void pe_refresh(DisplayChangeListener *dcl)
