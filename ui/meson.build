@@ -11,6 +11,7 @@ system_ss.add(files(
   'input-keymap.c',
   'input-legacy.c',
   'input-barrier.c',
+  'poweremu-display.c',
   'input.c',
   'kbd-state.c',
   'keymaps.c',

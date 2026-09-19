@@ -496,6 +496,19 @@
             '*height': 'str' } }
 
 ##
+# @PowerEmuDisplayProperties:
+#
+# Properties for poweremu-display objects, which show the guest's
+# screen in the PowerEmu app and take its keyboard and mouse input.
+#
+# @path: the Unix socket PowerEmu listens on
+#
+# Since: 10.0
+##
+{ 'struct': 'PowerEmuDisplayProperties',
+  'data': { 'path': 'str' } }
+
+##
 # @InputLinuxProperties:
 #
 # Properties for input-linux objects.
@@ -1104,6 +1117,7 @@
     'filter-replay',
     'filter-rewriter',
     'input-barrier',
+    'poweremu-display',
     { 'name': 'input-linux',
       'if': 'CONFIG_LINUX' },
     'iommufd',
@@ -1179,6 +1193,7 @@
       'filter-replay':              'NetfilterProperties',
       'filter-rewriter':            'FilterRewriterProperties',
       'input-barrier':              'InputBarrierProperties',
+      'poweremu-display':           'PowerEmuDisplayProperties',
       'input-linux':                { 'type': 'InputLinuxProperties',
                                       'if': 'CONFIG_LINUX' },
       'iommufd':                    'IOMMUFDProperties',
