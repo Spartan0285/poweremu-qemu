@@ -805,6 +805,69 @@ static void powerpc_excp_7xx(PowerPCCPU *cpu, int excp)
     powerpc_set_excp_state(cpu, vector, new_msr);
 }
 
+/*
+ * Debug aid: PPC_FAULT_WATCH=lo-hi (hex) logs user-mode DSI/ISI faults whose
+ * address lies in [lo,hi] to /tmp/ppc_fault.log, with registers and the code
+ * around NIP and LR, so a guest crash can be matched to a binary on disk.
+ */
+static void ppc_fault_watch(CPUPPCState *env, int excp)
+{
+    static int state = -1, hits;
+    static uint32_t lo, hi;
+    static FILE *fp;
+    uint32_t addr;
+
+    if (state < 0) {
+        const char *w = getenv("PPC_FAULT_WATCH");
+        state = w && sscanf(w, "%x-%x", &lo, &hi) == 2;
+        if (state) {
+            fp = fopen("/tmp/ppc_fault.log", "w");
+            state = fp != NULL;
+        }
+    }
+    if (!state || hits >= 64 || !(env->msr & ((target_ulong)1 << MSR_PR))) {
+        return;
+    }
+    addr = excp == POWERPC_EXCP_DSI ? env->spr[SPR_DAR] : env->nip;
+    if (addr < lo || addr > hi) {
+        return;
+    }
+    /* recurring handled faults repeat the same (nip, addr): log each once */
+    static uint64_t seen[64];
+    uint64_t key = ((uint64_t)(uint32_t)env->nip << 32) | addr;
+    for (int i = 0; i < hits; i++) {
+        if (seen[i] == key) {
+            return;
+        }
+    }
+    seen[hits++] = key;
+    fprintf(fp, "=== %s #%d nip=%08x lr=%08x ctr=%08x dar=%08x dsisr=%08x"
+            " msr=%08x\n", excp == POWERPC_EXCP_DSI ? "DSI" : "ISI", hits,
+            (uint32_t)env->nip, (uint32_t)env->lr, (uint32_t)env->ctr,
+            (uint32_t)env->spr[SPR_DAR], (uint32_t)env->spr[SPR_DSISR],
+            (uint32_t)env->msr);
+    for (int i = 0; i < 32; i++) {
+        fprintf(fp, "r%-2d=%08x%s", i, (uint32_t)env->gpr[i],
+                i % 8 == 7 ? "\n" : " ");
+    }
+    uint32_t centres[2] = { (uint32_t)env->nip, (uint32_t)env->lr };
+    for (int c = 0; c < 2; c++) {
+        uint32_t base = (centres[c] & ~3u) - 0x80;
+        uint8_t buf[0x100];
+        fprintf(fp, "code @%s %08x:", c ? "lr" : "nip", base);
+        if (cpu_memory_rw_debug(env_cpu(env), base, buf, sizeof(buf), 0)) {
+            fprintf(fp, " <unreadable>\n");
+            continue;
+        }
+        for (int i = 0; i < (int)sizeof(buf); i += 4) {
+            fprintf(fp, "%s%02x%02x%02x%02x", i % 32 ? " " : "\n  ",
+                    buf[i], buf[i + 1], buf[i + 2], buf[i + 3]);
+        }
+        fprintf(fp, "\n");
+    }
+    fflush(fp);
+}
+
 static void powerpc_excp_74xx(PowerPCCPU *cpu, int excp)
 {
     CPUPPCState *env = &cpu->env;
@@ -836,9 +899,11 @@ static void powerpc_excp_74xx(PowerPCCPU *cpu, int excp)
         break;
     case POWERPC_EXCP_DSI:       /* Data storage exception                   */
         trace_ppc_excp_dsi(env->spr[SPR_DSISR], env->spr[SPR_DAR]);
+        ppc_fault_watch(env, excp);
         break;
     case POWERPC_EXCP_ISI:       /* Instruction storage exception            */
         trace_ppc_excp_isi(msr, env->nip);
+        ppc_fault_watch(env, excp);
         msr |= env->error_code;
         break;
     case POWERPC_EXCP_EXTERNAL:  /* External input                           */

@@ -2792,9 +2792,22 @@ static void gen_lmw(DisasContext *ctx)
     }
     gen_set_access_type(ctx, ACCESS_INT);
     t0 = tcg_temp_new();
-    t1 = tcg_constant_i32(rD(ctx->opcode));
     gen_addr_imm_index(ctx, t0, 0);
-    gen_helper_lmw(tcg_env, t0, t1);
+    /*
+     * Expand inline: each word goes through the TLB fast path instead of a
+     * helper that probes the whole range first.  Apple's compilers emit
+     * lmw/stmw in most prologues and epilogues, so the helper dominated
+     * Mac OS X guests.  A fault part-way through restarts the instruction
+     * with some registers already loaded, which the architecture allows;
+     * the address lives in a temporary, so rA in the range is harmless.
+     */
+    for (int r = rD(ctx->opcode); r < 32; r++) {
+        tcg_gen_qemu_ld_tl(cpu_gpr[r], t0, ctx->mem_idx, DEF_MEMOP(MO_UL));
+        if (r < 31) {
+            gen_addr_add(ctx, t0, t0, 4);
+        }
+    }
+    (void)t1;
 }
 
 /* stmw */
@@ -2809,9 +2822,15 @@ static void gen_stmw(DisasContext *ctx)
     }
     gen_set_access_type(ctx, ACCESS_INT);
     t0 = tcg_temp_new();
-    t1 = tcg_constant_i32(rS(ctx->opcode));
     gen_addr_imm_index(ctx, t0, 0);
-    gen_helper_stmw(tcg_env, t0, t1);
+    /* Inline, as for lmw. */
+    for (int r = rS(ctx->opcode); r < 32; r++) {
+        tcg_gen_qemu_st_tl(cpu_gpr[r], t0, ctx->mem_idx, DEF_MEMOP(MO_UL));
+        if (r < 31) {
+            gen_addr_add(ctx, t0, t0, 4);
+        }
+    }
+    (void)t1;
 }
 
 /***                    Integer load and store strings                     ***/
