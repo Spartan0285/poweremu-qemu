@@ -26,8 +26,15 @@
 
 #ifdef CONFIG_SOFTMMU
 
-#define CPU_TLB_DYN_MIN_BITS 6
-#define CPU_TLB_DYN_DEFAULT_BITS 8
+/*
+ * The TLB is direct-mapped, and the dynamic sizing only looks at how many
+ * entries are in use, not at conflicts.  With a 64-entry floor a Mac OS X
+ * PPC guest thrashed: ~4M loads/s bounced through the victim TLB because
+ * two hot pages shared a slot.  1024 entries keep conflicts rare; a full
+ * flush then clears 32 KB instead of 2 KB.
+ */
+#define CPU_TLB_DYN_MIN_BITS 10
+#define CPU_TLB_DYN_DEFAULT_BITS 10
 
 # if HOST_LONG_BITS == 32
 /* Make sure we do not require a double-word shift for the TLB load */
