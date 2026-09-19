@@ -319,6 +319,7 @@ static void pe_input(PowerEmuDisplay *pd, uint32_t type, const uint8_t *p, uint3
         break;
     case PE_MOTION:
         if (len >= 8) {
+            qemu_input_handler_activate_kind(INPUT_EVENT_MASK_REL);  /* buttons follow */
             qemu_input_queue_rel(pd->dcl.con, INPUT_AXIS_X, v[0]);
             qemu_input_queue_rel(pd->dcl.con, INPUT_AXIS_Y, v[1]);
             qemu_input_event_sync();
@@ -327,6 +328,7 @@ static void pe_input(PowerEmuDisplay *pd, uint32_t type, const uint8_t *p, uint3
     case PE_POINT:
         /* Goes to the absolute pointer (usb-tablet): no capture needed. */
         if (len >= 8 && pd->width > 0 && pd->height > 0) {
+            qemu_input_handler_activate_kind(INPUT_EVENT_MASK_ABS);  /* buttons follow */
             qemu_input_queue_abs(pd->dcl.con, INPUT_AXIS_X, v[0], 0, pd->width - 1);
             qemu_input_queue_abs(pd->dcl.con, INPUT_AXIS_Y, v[1], 0, pd->height - 1);
             qemu_input_event_sync();
