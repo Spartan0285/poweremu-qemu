@@ -60,6 +60,21 @@ typedef struct BlitPathStats {
 
 static BlitPathStats g_blit_stats;
 
+/*
+ * Bring-up diagnostics.  These were written while the GPU model was being
+ * reverse-engineered and several of them do real per-draw work (CRC scans,
+ * VRAM probes, register audits), so they stay off unless asked for.
+ */
+static bool gpu_diag_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_DIAG") != NULL;
+    }
+    return on;
+}
+
 /* ========================================================================
  * Framebuffer write watch — Phase A drag body audit
  * Logs every non-SRT write to the visible framebuffer.
@@ -71,6 +86,7 @@ static void fb_write_watch(const char *path, const char *src_kind,
                            uint32_t w, uint32_t h,
                            bool from_srt, bool nonzero_sample)
 {
+    if (!gpu_diag_on()) return;
     /* Only log the first 500 events to keep it manageable */
     if (g_fb_watch_count >= 500) return;
     /* Only log framebuffer writes (dst near offset 0) */
@@ -1421,7 +1437,10 @@ static void r200_agp_tc_flush(void);
 static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
 {
     uint32_t seq = 0;
-    r200_agp_tc_flush();
+
+    if (s->regs.aic_ctrl & 1) {
+        r200_agp_tc_flush();       /* only the card's own GART can remap */
+    }
     /*
      * Fence modes (PPCGPU_ASYNC_FENCE): 0 synchronous, 1 deferred, 2 (default)
      * hybrid.  The guest driver polls a fence once and otherwise sleeps with
@@ -1704,6 +1723,47 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
     return buf;
 }
 
+/*
+ * How the guest actually talks to us.  A paravirtual device would replace
+ * trapping register accesses with commands in shared memory, so measuring
+ * the split says what such a rewrite could win.  PPCGPU_TRAFFIC=1 prints it
+ * once a second.
+ */
+static struct {
+    uint64_t mmio_writes, mmio_reads, ring_dwords, type0_regs, draws;
+    int64_t t0;
+} r200_traffic;
+
+static bool r200_in_pm4;          /* replaying the ring, not a guest trap */
+
+static void r200_traffic_tick(void)
+{
+    int64_t now;
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_TRAFFIC") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    now = g_get_monotonic_time();
+    if (!r200_traffic.t0) {
+        r200_traffic.t0 = now;
+        return;
+    }
+    if (now - r200_traffic.t0 >= 1000000) {
+        double secs = (now - r200_traffic.t0) / 1e6;
+        fprintf(stderr, "[TRAFFIC] %.0f mmio-writes/s %.0f mmio-reads/s "
+                "%.0f ring-dwords/s %.0f type0-regs/s %.0f draws/s\n",
+                r200_traffic.mmio_writes / secs, r200_traffic.mmio_reads / secs,
+                r200_traffic.ring_dwords / secs, r200_traffic.type0_regs / secs,
+                r200_traffic.draws / secs);
+        memset(&r200_traffic, 0, sizeof(r200_traffic));
+        r200_traffic.t0 = now;
+    }
+}
+
 static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
                                            uint32_t reg_base,
                                            bool one_reg_wr,
@@ -1734,7 +1794,9 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
         gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
                       reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
 
+        r200_in_pm4 = true;
         ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
+        r200_in_pm4 = false;
     }
 }
 
@@ -2827,7 +2889,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             /* Content probe: check if source VRAM has non-zero data */
             {
                 static int content_probe_log = 0;
-                if (content_probe_log < 30) {
+                if (gpu_diag_on() && content_probe_log < 30) {
                     int nonzero_count = 0;
                     int total_probed = 0;
                     uint32_t sample_px = 0;
@@ -4614,7 +4676,7 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
         }
     }
 
-    {
+    if (gpu_diag_on()) {
         /* Log each new combination of pipeline state once: a cheap map of
          * which R200 features an application actually exercises. */
         static uint64_t seen[512];
@@ -4667,6 +4729,7 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
         memory_region_set_dirty(&s->vram, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
         r200_perf.draws++;
+        r200_traffic.draws++;
         r200_perf.drew = true;
         r200_perf_high((uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
         if (pkt.depth_enable && pkt.depth_pitch) {
@@ -4729,7 +4792,9 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
     ppc_mac_gpu_snapshot_3d_state(s, &state);
 
     /* Phase 1: Log every 3D draw for compositor analysis */
-    ppc_mac_gpu_log_3d_draw(&state, cmd);
+    if (gpu_diag_on()) {
+        ppc_mac_gpu_log_3d_draw(&state, cmd);
+    }
 
     /*
      * Phase 3 — Next-gate detection.
@@ -6566,6 +6631,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  rd reg=%03x", (unsigned)addr);
     }
+    r200_traffic.mmio_reads++;
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
     if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
@@ -6668,7 +6734,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         {
             static int rbbm_read_count = 0;
             rbbm_read_count++;
-            if (rbbm_read_count <= 20 || rbbm_read_count % 1000 == 0) {
+            if (gpu_diag_on() &&
+                (rbbm_read_count <= 20 || rbbm_read_count % 1000 == 0)) {
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=idle_poll sequence_id=%d "
                          "note=RBBM_STATUS_always_idle\n",
@@ -7013,7 +7080,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         {
             static int scratch_read_count = 0;
             scratch_read_count++;
-            if (scratch_read_count <= 50 || scratch_read_count % 500 == 0) {
+            if (gpu_diag_on() &&
+                (scratch_read_count <= 50 || scratch_read_count % 500 == 0)) {
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=scratch_poll sequence_id=%d "
                          "note=SCRATCH_REG%d_fence_check\n",
@@ -7411,6 +7479,12 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* No flush here: CPU-side 2D operations check their own VRAM ranges
      * (r200_vram_access), fences complete asynchronously, and the other
      * registers do not touch VRAM. */
+    if (r200_in_pm4) {
+        r200_traffic.type0_regs++;
+    } else {
+        r200_traffic.mmio_writes++;
+    }
+    r200_traffic_tick();
     gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
                   size, (uint64_t)addr, val, ppc_mac_gpu_reg_name(addr));
 
@@ -7818,6 +7892,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
          */
         if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
+            r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
+                                                          : val;
             ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
         }
 

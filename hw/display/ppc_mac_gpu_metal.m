@@ -2940,6 +2940,17 @@ static void r200_macrotile_validate(uint32_t pitch_pixels,
  * Used by Phase 3A probe surface validation to verify identity
  * before/after NOP-blend draws.
  */
+/* Bring-up diagnostics: real per-draw work (CRC scans, probes), off by default. */
+static bool r200_diag_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_DIAG") != NULL;
+    }
+    return on;
+}
+
 static uint32_t compute_vram_region_crc(uint8_t *vram_ptr, uint64_t vram_size,
                                          uint32_t color_offset,
                                          uint32_t pitch_pixels,
@@ -3555,7 +3566,8 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     static int metal_draw_count = 0;
     int draw_num = metal_draw_count++;
-    bool verbose = (draw_num < 50) || (draw_num % 100 == 0);
+    bool verbose = r200_diag_on() &&
+                   ((draw_num < 50) || (draw_num % 100 == 0));
 
     /* Phase A — entry-point VRAM check for draws 77-78 */
     if (draw_num == 77 || draw_num == 78) {
@@ -4526,7 +4538,7 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
              * Compute CRC before loading into Metal.
              */
             uint32_t before_crc = 0;
-            bool do_probe_check = nop_blend &&
+            bool do_probe_check = nop_blend && r200_diag_on() &&
                 (metal_exec_count <= 50 || metal_exec_count % 200 == 0);
             if (do_probe_check) {
                 before_crc = compute_vram_region_crc(
