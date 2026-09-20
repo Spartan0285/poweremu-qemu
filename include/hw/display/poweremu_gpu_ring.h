@@ -35,7 +35,21 @@
 #define PE_GPU_RING_BYTES   (1u << 20)      /* 1 MB of packets */
 #define PE_GPU_DATA_OFFSET  (PE_GPU_RING_OFFSET + PE_GPU_RING_BYTES)
 #define PE_GPU_DATA_BYTES   (32u << 20)     /* vertices, textures */
-#define PE_GPU_BAR_BYTES    (PE_GPU_DATA_OFFSET + PE_GPU_DATA_BYTES)
+
+/*
+ * A PCI BAR's size must be a power of two -- the decoder is an address
+ * mask, so there is no way to express one that is not -- and control page
+ * plus ring plus data is 0x2101000, which is not.  The BAR is therefore
+ * rounded up to the next power of two and the tail is simply left
+ * unmapped: it is a container region with nothing behind it, so it costs
+ * address space and no memory.
+ *
+ * What must not follow the rounding is PE_GPU_SHARED_BYTES below.  That is
+ * the extent the host validates every guest offset against, and widening it
+ * to the BAR would have the host accept offsets that point past the end of
+ * the memory it actually allocated.
+ */
+#define PE_GPU_BAR_BYTES    (64u << 20)
 
 /*
  * Every offset a packet carries -- vertices, texels, render targets, the
@@ -45,7 +59,7 @@
  * check and hand it to the renderer unmodified, because the shared mapping
  * is exactly what the renderer is given as "VRAM".
  */
-#define PE_GPU_SHARED_BYTES (PE_GPU_BAR_BYTES - PE_GPU_RING_OFFSET)
+#define PE_GPU_SHARED_BYTES (PE_GPU_RING_BYTES + PE_GPU_DATA_BYTES)
 #define PE_GPU_DATA_BASE    (PE_GPU_DATA_OFFSET - PE_GPU_RING_OFFSET)
 
 /* Control registers, byte offsets within the control page. */
