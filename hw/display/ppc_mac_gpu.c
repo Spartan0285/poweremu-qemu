@@ -749,6 +749,17 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
 static FILE *gpu_debug_fp = NULL;
 static uint64_t gpu_debug_seq = 0;
 
+static bool gpu_verify_fetch(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VERIFY_FETCH");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static bool gpu_debug_enabled(void)
 {
     static int enabled = -1;
@@ -4402,6 +4413,30 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     float pix_bias = (R3D(0x1C4C) & (1u << 27)) ? 0.0f : 0.5f;  /* D3D centres */
 
     /*
+     * Resolve each vertex array to a host pointer once for the whole draw.
+     *
+     * r200_read_dwords() was called per vertex per array, and each call
+     * re-derived the framebuffer base from a register, bounds-checked, then
+     * copied into a stack buffer only to byte-swap out of it again -- two
+     * passes over every vertex. Between them the fetch and that copying were
+     * most of a 13.8% cluster in the profile.
+     *
+     * Arrays that live in VRAM, which is nearly all of them, are read
+     * straight from the host pointer with the swap done in place. Anything
+     * else -- AGP, GART, an array that runs off the end -- still goes through
+     * r200_read_dwords, which stays the one place that knows how to find
+     * memory that is not simply there.
+     */
+    uint8_t *const vram_host = memory_region_get_ram_ptr(&s->vram);
+    const uint32_t arr_fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t arr_off[16];
+    bool arr_fast[16];
+    for (uint32_t a = 0; a < narrays && a < 16; a++) {
+        arr_fast[a] = vram_host && arr_addr[a] >= arr_fb_base;
+        arr_off[a] = arr_fast[a] ? arr_addr[a] - arr_fb_base : 0;
+    }
+
+    /*
      * Where each attribute starts in the gathered stream, when there is one
      * array per attribute. This is a property of the draw, not of the
      * vertex, but it used to be recomputed inside the vertex loop with an
@@ -4446,8 +4481,42 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
             /* gather this vertex's dwords from every array, in order */
             for (uint32_t a = 0; a < narrays; a++) {
                 uint32_t n = MIN(arr_count[a], 64u - sn);
-                if (n && !r200_read_dwords(s, arr_addr[a] + e * arr_stride[a] * 4,
-                                           stream + sn, n)) {
+                uint32_t off;
+
+                if (!n) {
+                    continue;
+                }
+                /*
+                 * The bounds test is per access rather than per draw because
+                 * an indexed draw picks its element from the index list and
+                 * the range it will touch is not known in advance.
+                 */
+                off = arr_off[a] + e * arr_stride[a] * 4;
+                if (a < 16 && arr_fast[a] &&
+                    (uint64_t)off + (uint64_t)n * 4 <= s->vram_size) {
+                    const uint8_t *p = vram_host + off;
+                    for (uint32_t i = 0; i < n; i++) {
+                        stream[sn + i] = ldl_be_p(p + i * 4);
+                    }
+                    /*
+                     * PPCGPU_VERIFY_FETCH=1 runs the old path as well and
+                     * reports any disagreement. Wrong vertex data does not
+                     * crash; it draws something slightly wrong, which is far
+                     * harder to attribute later than a loud complaint now.
+                     */
+                    if (unlikely(gpu_verify_fetch())) {
+                        uint32_t ref[64];
+                        if (r200_read_dwords(s, arr_addr[a] +
+                                             e * arr_stride[a] * 4, ref, n) &&
+                            memcmp(ref, stream + sn, n * 4) != 0) {
+                            r200_warn_once(&r200_warned, 512,
+                                           "fast vertex fetch differs at "
+                                           "0x%08x", arr_addr[a]);
+                        }
+                    }
+                } else if (!r200_read_dwords(s,
+                                             arr_addr[a] + e * arr_stride[a] * 4,
+                                             stream + sn, n)) {
                     r200_warn_once(&r200_warned, 256,
                                    "vertex fetch failed at 0x%08x", arr_addr[a]);
                     g_free(verts);
