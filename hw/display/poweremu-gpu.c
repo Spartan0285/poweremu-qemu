@@ -1143,6 +1143,67 @@ static void pe_gpu_test_reset(PowerEmuGPUState *s, PEGpuTestRing *r)
     r->used = 0;
 }
 
+/*
+ * Replay a capture recorded by the guest ring writer.
+ *
+ * The guest half writes packets before there is any kernel driver to carry
+ * them, and dumps the batches to a file (see PowerEmu's guest/gld/pering.c).
+ * Feeding that file through the real packet path here checks that the two
+ * halves agree about the protocol -- byte order, packet sizes, offsets --
+ * without a kext, a mapping, or even a running guest, which is where such
+ * disagreements are most expensive to find.
+ *
+ *     POWEREMU_GPU_REPLAY=<file> qemu-system-ppc -machine none -display none
+ *
+ * Each batch in the file is: u32 ring bytes, u32 data high-water mark, the
+ * ring, then the data area, all big-endian as the guest wrote them.
+ */
+static int pe_gpu_replay(const char *path)
+{
+    PowerEmuGPUState *s = g_new0(PowerEmuGPUState, 1);
+    FILE *f = fopen(path, "rb");
+    int batches = 0;
+    uint8_t hdr[8];
+
+    if (!f) {
+        fprintf(stderr, "poweremu-gpu: cannot read %s\n", path);
+        return 1;
+    }
+    s->shared_ptr = g_malloc0(PE_GPU_SHARED_BYTES);
+    s->enable = 1;
+
+    while (fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr)) {
+        uint32_t ring = ldl_be_p(hdr);
+        uint32_t data_end = ldl_be_p(hdr + 4);
+        uint32_t data_bytes;
+
+        if (ring > PE_GPU_RING_BYTES || data_end < PE_GPU_DATA_BASE ||
+            data_end > PE_GPU_SHARED_BYTES) {
+            fprintf(stderr, "poweremu-gpu: batch %d is malformed\n", batches);
+            fclose(f);
+            return 1;
+        }
+        data_bytes = data_end - PE_GPU_DATA_BASE;
+        if (fread(s->shared_ptr, 1, ring, f) != ring ||
+            fread(s->shared_ptr + PE_GPU_DATA_BASE, 1, data_bytes, f)
+                != data_bytes) {
+            fprintf(stderr, "poweremu-gpu: batch %d is truncated\n", batches);
+            fclose(f);
+            return 1;
+        }
+        s->tail = 0;
+        pe_gpu_run(s, ring);
+        batches++;
+    }
+    fclose(f);
+    printf("replayed %d batches: %" PRIu64 " packets, %" PRIu64 " draws, "
+           "%" PRIu64 " vertices, %" PRIu64 " textures, %" PRIu64 " presents, "
+           "%" PRIu64 " rejected, fence %u, error %u\n",
+           batches, s->packets, s->draws, s->vertices, s->textures,
+           s->presents, s->rejected, s->fence, s->error);
+    return s->rejected || s->error ? 1 : 0;
+}
+
 static int pe_gpu_selftest(void)
 {
     PowerEmuGPUState *s = g_new0(PowerEmuGPUState, 1);
@@ -1525,6 +1586,9 @@ static void pe_gpu_register(void)
      */
     if (getenv("POWEREMU_GPU_SELFTEST")) {
         exit(pe_gpu_selftest());
+    }
+    if (getenv("POWEREMU_GPU_REPLAY")) {
+        exit(pe_gpu_replay(getenv("POWEREMU_GPU_REPLAY")));
     }
 }
 type_init(pe_gpu_register);
