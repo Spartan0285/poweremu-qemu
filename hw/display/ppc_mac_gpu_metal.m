@@ -6377,7 +6377,7 @@ static R200TexKey g_r200_enc_key;
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
-                g_r200_stat_conflicts;
+                g_r200_stat_conflicts, g_r200_stat_view_hit, g_r200_stat_view_new;
 
 /* VRAM ranges written by render passes in the open batch.  Views that alias
  * the same memory are distinct Metal objects, so Metal does not order a
@@ -6418,6 +6418,98 @@ static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
         [cb encodeWaitForEvent:g_r200_event value:g_r200_event_val];
     }
     return cb;
+}
+
+/*
+ * Vertex staging.
+ *
+ * Every draw hands Metal the vertices it expanded from the guest's index
+ * list.  Anything over a few dozen vertices is too big to pass inline, and
+ * a game sends hundreds of draws a frame, so allocating a buffer per draw
+ * means millions of allocations a session.  Bump-allocate out of one large
+ * buffer instead, and put it back in the pool once the command buffer that
+ * referenced it has completed.
+ */
+#define R200_ARENA_SIZE (8 * 1024 * 1024)
+
+static NSMutableArray *g_r200_arena_free;     /* idle, ready to reuse */
+static NSMutableArray *g_r200_arena_used;     /* referenced by the open batch */
+static id<MTLBuffer> g_r200_arena;
+static size_t g_r200_arena_off;
+static pthread_mutex_t g_r200_arena_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Space for @len bytes, or NULL when a one-off buffer is needed instead. */
+static void *r200_arena_alloc(PPCMacGPUMetalState *st, size_t len,
+                              id<MTLBuffer> *buf, size_t *off)
+{
+    len = (len + 255) & ~(size_t)255;         /* keep offsets aligned */
+    if (len > R200_ARENA_SIZE) {
+        return NULL;
+    }
+    if (!g_r200_arena || g_r200_arena_off + len > [g_r200_arena length]) {
+        if (g_r200_arena) {
+            if (!g_r200_arena_used) {
+                g_r200_arena_used = [[NSMutableArray alloc] init];
+            }
+            [g_r200_arena_used addObject:g_r200_arena];
+            [g_r200_arena release];
+            g_r200_arena = nil;
+        }
+        pthread_mutex_lock(&g_r200_arena_lock);
+        id<MTLBuffer> reuse = [g_r200_arena_free lastObject];
+        if (reuse) {
+            g_r200_arena = [reuse retain];
+            [g_r200_arena_free removeLastObject];
+        }
+        pthread_mutex_unlock(&g_r200_arena_lock);
+        if (!g_r200_arena) {
+            /* newBuffer... already returns a reference we own. */
+            g_r200_arena = [st->device newBufferWithLength:R200_ARENA_SIZE
+                                options:MTLResourceStorageModeShared];
+            if (!g_r200_arena) {
+                return NULL;
+            }
+        }
+        g_r200_arena_off = 0;
+    }
+    *buf = g_r200_arena;
+    *off = g_r200_arena_off;
+    void *p = (char *)[g_r200_arena contents] + g_r200_arena_off;
+    g_r200_arena_off += len;
+    return p;
+}
+
+/* Hand this batch's staging buffers back once the GPU is done with them. */
+static void r200_arena_recycle_on(id<MTLCommandBuffer> cb)
+{
+    NSMutableArray *mine = g_r200_arena_used;
+    g_r200_arena_used = nil;
+    if (g_r200_arena) {
+        if (!mine) {
+            mine = [[NSMutableArray alloc] init];
+        }
+        [mine addObject:g_r200_arena];
+        [g_r200_arena release];
+        g_r200_arena = nil;
+        g_r200_arena_off = 0;
+    }
+    if (!mine) {
+        return;
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        pthread_mutex_lock(&g_r200_arena_lock);
+        if (!g_r200_arena_free) {
+            g_r200_arena_free = [[NSMutableArray alloc] init];
+        }
+        /* Keep a few around; a deep batch's extras can go. */
+        for (id<MTLBuffer> b in mine) {
+            if ([g_r200_arena_free count] < 8) {
+                [g_r200_arena_free addObject:b];
+            }
+        }
+        pthread_mutex_unlock(&g_r200_arena_lock);
+        [mine release];
+    }];
 }
 
 static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
@@ -6508,6 +6600,7 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     for (int i = 0; i < R200_VIEW_CACHE; i++) {
         if (g_r200_views[i].tex && !memcmp(&g_r200_views[i].key, &k, sizeof(k))) {
             g_r200_views[i].used = ++g_r200_view_clock;
+            g_r200_stat_view_hit++;
             return g_r200_views[i].tex;
         }
         if (g_r200_views[i].used < g_r200_views[lru].used) {
@@ -6528,6 +6621,7 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     }
     /* An evicted view may still be referenced by the open command buffer;
      * the command buffer retains what it uses, so releasing is safe. */
+    g_r200_stat_view_new++;
     [g_r200_views[lru].tex release];
     g_r200_views[lru].key = k;
     g_r200_views[lru].tex = t;
@@ -6561,6 +6655,7 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
     if (g_r200_event) {
         [g_r200_cb encodeSignalEvent:g_r200_event value:++g_r200_event_val];
     }
+    r200_arena_recycle_on(g_r200_cb);
     [g_r200_cb commit];
     [g_r200_inflight release];
     g_r200_inflight = g_r200_cb;           /* keeps the reference */
@@ -7087,21 +7182,28 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
         }
 
-        /* Expand the index list: small draws go inline with setVertexBytes. */
+        /* Expand the index list straight into the staging buffer. */
         size_t vbytes = (size_t)pkt->num_indices * sizeof(R200Vertex);
-        R200Vertex *flat = g_malloc(vbytes);
-        for (uint32_t i = 0; i < pkt->num_indices; i++) {
-            flat[i] = pkt->verts[pkt->indices[i]];
-        }
-        if (vbytes <= 4096) {
-            [enc setVertexBytes:flat length:vbytes atIndex:0];
+        id<MTLBuffer> vb = nil;
+        size_t voff = 0;
+        R200Vertex *flat = r200_arena_alloc(st, vbytes, &vb, &voff);
+        if (flat) {
+            for (uint32_t i = 0; i < pkt->num_indices; i++) {
+                flat[i] = pkt->verts[pkt->indices[i]];
+            }
+            [enc setVertexBuffer:vb offset:voff atIndex:0];
         } else {
-            id<MTLBuffer> vb = [dev newBufferWithBytes:flat length:vbytes
-                                               options:MTLResourceStorageModeShared];
-            [enc setVertexBuffer:vb offset:0 atIndex:0];
-            [vb release];
+            /* Larger than the arena: a one-off buffer for this draw. */
+            R200Vertex *tmp = g_malloc(vbytes);
+            for (uint32_t i = 0; i < pkt->num_indices; i++) {
+                tmp[i] = pkt->verts[pkt->indices[i]];
+            }
+            id<MTLBuffer> one = [dev newBufferWithBytes:tmp length:vbytes
+                                                options:MTLResourceStorageModeShared];
+            [enc setVertexBuffer:one offset:0 atIndex:0];
+            [one release];
+            g_free(tmp);
         }
-        g_free(flat);
         [enc setVertexBytes:&u length:sizeof(u) atIndex:1];
         [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
         for (int t = 0; t < R200_MAX_TEX; t++) {
@@ -7141,13 +7243,15 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     if (g_r200_stat_draws % 2000 == 0) {
         qemu_log("ppc-mac-gpu r200: %llu draws, %llu passes, %llu flushes "
-                 "(%llu hazard), avg flush %llu us\n",
+                 "(%llu hazard), avg flush %llu us, views %llu hit/%llu new\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
                  (unsigned long long)g_r200_stat_flushes,
                  (unsigned long long)g_r200_stat_conflicts,
                  (unsigned long long)(g_r200_stat_flushes ?
-                     g_r200_stat_flush_us / g_r200_stat_flushes : 0));
+                     g_r200_stat_flush_us / g_r200_stat_flushes : 0),
+                 (unsigned long long)g_r200_stat_view_hit,
+                 (unsigned long long)g_r200_stat_view_new);
     }
     return 0;
 }
