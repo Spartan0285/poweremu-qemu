@@ -1518,7 +1518,32 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
         if (nowait > 0) {
             nowait--;
         } else {
-            int64_t deadline = g_get_monotonic_time() + 1500;
+            /*
+             * How long the vCPU will spin for the renderer before deferring.
+             * Tunable because the right value moves with emulator speed, and
+             * it moved: 1500 us was a small part of a 6-14 fps frame and is a
+             * large part of a 55 fps one, where this spin was 15% of the vCPU
+             * thread.
+             *
+             * Measured at the Warcraft menu: 1500 us gives 53.6 fps, 400 us
+             * 60.8, 150 us 62.0, and never waiting 61.5. The knee is far
+             * below the old value, and for a reason worth stating -- a
+             * compositor batch is small and completes in tens of
+             * microseconds, so a short budget still catches it, while a game
+             * frame takes milliseconds and was never going to complete inside
+             * 1500 us. The long budget only ever caught what a short one
+             * catches, and only ever wasted time on what neither could.
+             *
+             * 250 us sits inside the flat region with margin for slower
+             * machines, where the GPU takes longer to finish the small
+             * batches this is here to catch.
+             */
+            static int wait_us = -1;
+            if (wait_us < 0) {
+                const char *w = getenv("PPCGPU_FENCE_WAIT_US");
+                wait_us = w ? atoi(w) : 250;
+            }
+            int64_t deadline = g_get_monotonic_time() + wait_us;
             while ((int32_t)(qatomic_read(&s->regs.r200_fence_done) - seq) < 0) {
                 if (g_get_monotonic_time() >= deadline) {
                     nowait = 16;
