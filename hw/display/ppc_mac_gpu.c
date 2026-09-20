@@ -663,6 +663,32 @@ static void ppc_mac_gpu_vblank(void *opaque)
  * Derive the current display mode from CRTC registers.
  * Returns true if the mode is valid and has changed.
  */
+/*
+ * Adopt a presentation pitch seen in a compositor BLT.  A pitch narrower
+ * than a scanline of the current mode cannot describe the framebuffer, and
+ * taking it would size the shadow buffer (and the surface handed to the UI)
+ * shorter than the rows read out of it.
+ */
+static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
+{
+    uint32_t min = s->disp.width * ((s->disp.bpp + 7) / 8);
+
+    if (dst_pitch < min) {
+        static int pitch_reject_log;
+        if (pitch_reject_log < 10) {
+            fprintf(stderr, "[STRIDE_CHANGE] ignoring BLT pitch %u for "
+                    "%ux%u@%u (needs %u)\n", dst_pitch, s->disp.width,
+                    s->disp.height, s->disp.bpp, min);
+            pitch_reject_log++;
+        }
+        return;
+    }
+    s->disp_stride_override_active = true;
+    s->disp_stride_override_value = dst_pitch;
+    s->disp.stride = dst_pitch;
+    s->display_invalid = true;
+}
+
 static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 {
     PPCMacGPUDisplayMode old = s->disp;
@@ -748,6 +774,24 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     }
 
     /*
+     * Clear the stride override on a resolution change: it belongs to the
+     * mode it was captured in.  This has to happen before the override is
+     * applied below, or the frame that changes resolution gets the old
+     * mode's pitch with the new mode's width -- a stride shorter than a
+     * scanline, which walks off the end of the framebuffer.
+     */
+    if (s->disp_stride_override_active &&
+        (old.width != m->width || old.height != m->height ||
+         old.bpp != m->bpp)) {
+        fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
+                "clearing stride override (was %u)\n",
+                old.width, old.height, m->width, m->height,
+                s->disp_stride_override_value);
+        s->disp_stride_override_active = false;
+        s->disp_stride_override_value = 0;
+    }
+
+    /*
      * Presentation stride override (Phase C):
      * When the QE compositor BLTs its back buffer to the visible
      * framebuffer, the BLT dst_pitch may differ from CRTC_PITCH.
@@ -768,27 +812,24 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         m->stride = s->disp_stride_override_value;
     }
 
+    /*
+     * A stride narrower than one scanline cannot be right whatever the
+     * guest wrote, and anything reading the framebuffer row by row would
+     * run past its end.  Keep the display consistent instead.
+     */
+    if (m->stride < m->width * ((m->bpp + 7) / 8)) {
+        fprintf(stderr, "[STRIDE_CHANGE] stride %u too small for %ux%u@%u, "
+                "using %u\n", m->stride, m->width, m->height, m->bpp,
+                m->width * ((m->bpp + 7) / 8));
+        m->stride = m->width * ((m->bpp + 7) / 8);
+    }
+
     /* Scanout offset */
     m->offset = s->regs.crtc_offset;
 
     /* Validate offset + frame fits in VRAM */
     if (m->offset + (uint64_t)m->stride * m->height > s->vram_size) {
         m->offset = 0;
-    }
-
-    /*
-     * Clear stride override on resolution change.
-     * The override is only valid for the mode it was set in.
-     */
-    if (s->disp_stride_override_active &&
-        (old.width != m->width || old.height != m->height ||
-         old.bpp != m->bpp)) {
-        fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
-                "clearing stride override (was %u)\n",
-                old.width, old.height, m->width, m->height,
-                s->disp_stride_override_value);
-        s->disp_stride_override_active = false;
-        s->disp_stride_override_value = 0;
     }
 
     /* Check if mode changed */
@@ -1336,6 +1377,39 @@ static void r200_fence_done_cb(void *arg, uint32_t seq)
     PPCMacGPUState *s = arg;
     qatomic_set(&s->regs.r200_fence_done, seq);
     qemu_bh_schedule(r200_fence_bh);
+}
+
+/*
+ * The driver reads a scratch register to see how far the GPU has got.
+ * Flushing everything for it (as other status reads do) made each fence
+ * check wait for all the work queued after that fence too - with deep
+ * GPU-side batch chains that was a fifth of the vCPU's time in Warcraft
+ * III.  Wait only for the newest fence queued on this register (its work
+ * is already committed), then report it.  Returns false if the generic
+ * flush is still needed.
+ */
+static bool r200_scratch_read_wait(PPCMacGPUState *s, int idx)
+{
+    uint32_t want = 0;
+    bool pending = false;
+
+    for (uint32_t i = 0; i < s->regs.r200_fence_n; i++) {
+        if (s->regs.r200_fence_q[i].reg == idx) {
+            want = s->regs.r200_fence_q[i].seq;
+            pending = true;
+        }
+    }
+    if (pending) {
+        int64_t deadline = g_get_monotonic_time() + 100000;
+        while ((int32_t)(qatomic_read(&s->regs.r200_fence_done) - want) < 0) {
+            if (g_get_monotonic_time() >= deadline) {
+                return false;                /* something is stuck: flush */
+            }
+            g_usleep(20);
+        }
+        r200_fence_drain(s, qatomic_read(&s->regs.r200_fence_done));
+    }
+    return true;
 }
 
 /*
@@ -2512,10 +2586,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                             srt_so_log++;
                         }
                     }
-                    s->disp_stride_override_active = true;
-                    s->disp_stride_override_value = dst_pitch;
-                    s->disp.stride = dst_pitch;
-                    s->display_invalid = true;
+                    r200_set_present_pitch(s, dst_pitch);
                 }
 
                 /* SRT write-through: metal_blit_2d read from source SRT
@@ -2751,10 +2822,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                     mmio_nosrt_so++;
                 }
             }
-            s->disp_stride_override_active = true;
-            s->disp_stride_override_value = dst_pitch;
-            s->disp.stride = dst_pitch;
-            s->display_invalid = true;
+            r200_set_present_pitch(s, dst_pitch);
 
             /* Content probe: check if source VRAM has non-zero data */
             {
@@ -3147,10 +3215,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                     mmio_so_log++;
                 }
             }
-            s->disp_stride_override_active = true;
-            s->disp_stride_override_value = dst_pitch;
-            s->disp.stride = dst_pitch;
-            s->display_invalid = true;
+            r200_set_present_pitch(s, dst_pitch);
         }
     } else if (rop3 == 0xF0) {
         /* Pattern fill — MC helper handles tiling */
@@ -5557,10 +5622,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                         so_log++;
                                     }
                                 }
-                                s->disp_stride_override_active = true;
-                                s->disp_stride_override_value = dst_pitch;
-                                s->disp.stride = dst_pitch;
-                                s->display_invalid = true;
+                                r200_set_present_pitch(s, dst_pitch);
                             }
                         }
                     }
@@ -6506,7 +6568,10 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
-    if (addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
+    if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
+        r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
+        /* fence poll: answered without flushing later work */
+    } else if (addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
         addr != R200_CRTC_VLINE_CRNT_VLINE && addr != 0x0044) {
         r200_flush_at(s, R200_WHY_REG(addr));
     }

@@ -190,6 +190,16 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
         return;
     }
     /*
+     * Copying a surface whose stride is shorter than its own scanlines
+     * walks off the end of its buffer.  That is a bug wherever it comes
+     * from, but it must not take the guest down with it.
+     */
+    if (surface_stride(ds) < surface_width(ds) * surface_bytes_per_pixel(ds)) {
+        error_report("poweremu-display: ignoring %dx%d surface with stride %d",
+                     surface_width(ds), surface_height(ds), surface_stride(ds));
+        return;
+    }
+    /*
      * The GPU model hands over a new surface whenever the guest rewrites
      * the display start (every page flip, among others).  If the size is
      * the same, keep the shared memory PowerEmu already shows and refresh
