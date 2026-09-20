@@ -648,6 +648,10 @@ struct PPCMacGPUState {
      * Cocoa backend expects little-endian XRGB: bytes [B,G,R,X].
      * We bswap32 each pixel from VRAM into this buffer. */
     uint8_t *shadow_buf;
+    /* What the UI's current surface describes, so it is replaced only when
+     * it would actually differ (see ppc_mac_gpu_display_update). */
+    uint32_t surface_width, surface_height, surface_stride;
+    void *surface_data;
     uint32_t shadow_buf_size;
 
     /* Compositor-direct display: instead of reading the framebuffer

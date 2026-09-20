@@ -562,6 +562,17 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
 static FILE *gpu_debug_fp = NULL;
 static uint64_t gpu_debug_seq = 0;
 
+static bool gpu_debug_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("PPCGPU_DEBUG_LOG");
+        enabled = e && e[0] == '1';
+    }
+    return enabled;
+}
+
 static void gpu_debug_log(const char *fmt, ...)
 {
     /* Per-access debug log: opt-in (PPCGPU_DEBUG_LOG=1).  It writes and
@@ -1161,9 +1172,25 @@ static void ppc_mac_gpu_display_update(void *opaque)
         mode_changed = true;  /* force surface recreation */
     }
 
-    /* Create/replace surface on mode change */
-    if (mode_changed || s->display_invalid) {
+    /*
+     * Create/replace the surface only when it would actually differ.
+     *
+     * display_invalid means "the contents changed", which a page flip or a
+     * blit sets constantly -- but replacing the surface is not how contents
+     * are published.  Each replacement allocates a DisplaySurface and a
+     * pixman image, runs every listener's gfx_switch (which copies the whole
+     * frame), and frees the old one.  At 1280x1024 that was several
+     * megabytes of pointless copying per flip.  Contents reach the UI
+     * through dpy_gfx_update below.
+     */
+    if (mode_changed || width != s->surface_width ||
+        height != s->surface_height || stride != s->surface_stride ||
+        s->shadow_buf != s->surface_data) {
         s->display_invalid = false;
+        s->surface_width = width;
+        s->surface_height = height;
+        s->surface_stride = stride;
+        s->surface_data = s->shadow_buf;
         trace_ppc_mac_gpu_mode_change(width, height, s->disp.bpp, stride);
         DisplaySurface *ds = qemu_create_displaysurface_from(
             width, height,
@@ -1171,6 +1198,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
             stride,
             s->shadow_buf);
         dpy_gfx_replace_surface(s->con, ds);
+    } else {
+        s->display_invalid = false;
     }
 
     /*
@@ -1736,15 +1765,21 @@ static struct {
 
 static bool r200_in_pm4;          /* replaying the ring, not a guest trap */
 
-static void r200_traffic_tick(void)
+static bool r200_traffic_on(void)
 {
-    int64_t now;
     static int on = -1;
 
     if (on < 0) {
         on = getenv("PPCGPU_TRAFFIC") != NULL;
     }
-    if (!on) {
+    return on;
+}
+
+static void r200_traffic_tick(void)
+{
+    int64_t now;
+
+    if (!r200_traffic_on()) {
         return;
     }
     now = g_get_monotonic_time();
@@ -1794,9 +1829,13 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
         gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
                       reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
 
-        r200_in_pm4 = true;
-        ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
-        r200_in_pm4 = false;
+        if (unlikely(r200_traffic_on())) {
+            r200_in_pm4 = true;
+            ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
+            r200_in_pm4 = false;
+        } else {
+            ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
+        }
     }
 }
 
@@ -6631,7 +6670,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  rd reg=%03x", (unsigned)addr);
     }
-    r200_traffic.mmio_reads++;
+    if (unlikely(r200_traffic_on())) {
+        r200_traffic.mmio_reads++;
+    }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
     if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
@@ -6641,8 +6682,10 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         addr != R200_CRTC_VLINE_CRNT_VLINE && addr != 0x0044) {
         r200_flush_at(s, R200_WHY_REG(addr));
     }
-    gpu_debug_log("MMIO_RD size=%u addr=0x%04"PRIx64" (%s)",
-                  size, (uint64_t)addr, ppc_mac_gpu_reg_name(addr));
+    if (unlikely(gpu_debug_enabled())) {
+        gpu_debug_log("MMIO_RD size=%u addr=0x%04"PRIx64" (%s)",
+                      size, (uint64_t)addr, ppc_mac_gpu_reg_name(addr));
+    }
 
     /* EDID compatibility for QEMU VGA NDRV:
      * The NDRV reads EDID data via byte-sized reads at MMIO offsets 0x00-0x7F
@@ -7420,7 +7463,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         }
     }
 
-    trace_ppc_mac_gpu_mmio_read(size, addr, ppc_mac_gpu_reg_name(addr), val);
+    if (unlikely(trace_event_get_state(TRACE_PPC_MAC_GPU_MMIO_READ))) {
+        trace_ppc_mac_gpu_mmio_read(size, addr, ppc_mac_gpu_reg_name(addr), val);
+    }
     return val;
 }
 
@@ -7479,16 +7524,26 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* No flush here: CPU-side 2D operations check their own VRAM ranges
      * (r200_vram_access), fences complete asynchronously, and the other
      * registers do not touch VRAM. */
-    if (r200_in_pm4) {
-        r200_traffic.type0_regs++;
-    } else {
-        r200_traffic.mmio_writes++;
+    if (unlikely(r200_traffic_on())) {
+        if (r200_in_pm4) {
+            r200_traffic.type0_regs++;
+        } else {
+            r200_traffic.mmio_writes++;
+        }
+        r200_traffic_tick();
     }
-    r200_traffic_tick();
-    gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
-                  size, (uint64_t)addr, val, ppc_mac_gpu_reg_name(addr));
+    /*
+     * Every PM4 type-0 register also lands here -- about a million a second
+     * under a game -- so nothing on this path may cost anything while the
+     * loggers are off.
+     */
+    if (unlikely(gpu_debug_enabled())) {
+        const char *nm = ppc_mac_gpu_reg_name(addr);
 
-    trace_ppc_mac_gpu_mmio_write(size, addr, ppc_mac_gpu_reg_name(addr), val);
+        gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
+                      size, (uint64_t)addr, val, nm);
+        trace_ppc_mac_gpu_mmio_write(size, addr, nm, val);
+    }
 
     /* Handle indexed register access */
     if (addr == R200_MM_DATA && s->regs.mm_index) {
