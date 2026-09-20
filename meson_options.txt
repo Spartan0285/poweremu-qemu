@@ -392,3 +392,6 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
+
+option('hardening', type: 'boolean', value: true,
+       description: 'exploit-hardening compiler flags (costs speed in helpers)')

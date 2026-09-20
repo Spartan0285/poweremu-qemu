@@ -38,6 +38,11 @@ if get_option('qemu_suffix').startswith('/')
   error('qemu_suffix cannot start with a /')
 endif
 
+# Exploit hardening costs real time in an emulator: every C helper pays it
+# on entry and exit, and the hot ones are only a dozen instructions long.
+# -Dhardening=false trades it away for speed on a local desktop emulator.
+hardening = get_option('hardening')
+
 qemu_confdir = get_option('sysconfdir') / get_option('qemu_suffix')
 qemu_datadir = get_option('datadir') / get_option('qemu_suffix')
 qemu_docdir = get_option('docdir') / get_option('qemu_suffix')
@@ -486,7 +491,7 @@ if not get_option('stack_protector').disabled()
       return 0;
     }'''
   have_stack_protector = false
-  foreach arg : ['-fstack-protector-strong', '-fstack-protector-all']
+  foreach arg : hardening ? ['-fstack-protector-strong', '-fstack-protector-all'] : []
     # We need to check both a compile and a link, since some compiler
     # setups fail only on a .c->.o compile and some only at link time
     if cc.compiles(stack_protector_probe, args: ['-Werror', arg]) and \
@@ -697,12 +702,13 @@ endif
 
 # Check further flags that make QEMU more robust against malicious parties
 
-hardening_flags = [
-    # Initialize all stack variables to zero. This makes
-    # it harder to take advantage of uninitialized stack
-    # data to drive exploits
-    '-ftrivial-auto-var-init=zero',
-]
+hardening_flags = []
+if hardening
+  # Initialize all stack variables to zero. This makes
+  # it harder to take advantage of uninitialized stack
+  # data to drive exploits
+  hardening_flags += '-ftrivial-auto-var-init=zero'
+endif
 
 # Zero out registers used during a function call
 # upon its return. This makes it harder to assemble
@@ -713,7 +719,7 @@ hardening_flags = [
 #
 # NB2: This clashes with the "retguard" extension of OpenBSD's Clang
 # https://gitlab.com/qemu-project/qemu/-/issues/2278
-if host_os != 'openbsd' and \
+if hardening and host_os != 'openbsd' and \
    cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
                name: '-fzero-call-used-regs=used-gpr',
                args: ['-O2', '-fzero-call-used-regs=used-gpr'])
