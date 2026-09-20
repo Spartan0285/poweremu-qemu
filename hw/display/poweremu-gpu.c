@@ -1197,9 +1197,9 @@ static int pe_gpu_replay(const char *path)
     }
     fclose(f);
     printf("replayed %d batches: %" PRIu64 " packets, %" PRIu64 " draws, "
-           "%" PRIu64 " vertices, %" PRIu64 " textures, %" PRIu64 " presents, "
-           "%" PRIu64 " rejected, fence %u, error %u\n",
-           batches, s->packets, s->draws, s->vertices, s->textures,
+           "%" PRIu64 " vertices, %" PRIu64 " textures, %" PRIu64 " blits, "
+           "%" PRIu64 " presents, %" PRIu64 " rejected, fence %u, error %u\n",
+           batches, s->packets, s->draws, s->vertices, s->textures, s->blits,
            s->presents, s->rejected, s->fence, s->error);
     return s->rejected || s->error ? 1 : 0;
 }
