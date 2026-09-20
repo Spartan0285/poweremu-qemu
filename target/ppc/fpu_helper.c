@@ -3708,6 +3708,35 @@ static inline bool ff_single(double d)
     return (double)(float)d == d;
 }
 
+/*
+ * Set FPRF for a result the fast path produced.
+ *
+ * helper_compute_fprf_float64() decides between five classes with a chain of
+ * softfloat predicates, and it ran on every arithmetic operation -- 2.25% of
+ * the vCPU thread in a Warcraft III profile, on top of the call itself.
+ *
+ * Nearly every result is an ordinary normal number, and that case is two bit
+ * tests on the exponent: not all-zero (zero or denormal) and not all-ones
+ * (infinity or NaN). Anything else goes to the full helper, which stays the
+ * single definition of what the other classes mean.
+ *
+ * The caller has already rejected NaN, so this does not have to distinguish
+ * signalling from quiet -- but it does not assume that either, since the
+ * all-ones exponent is handled by falling through.
+ */
+static inline void ff_fprf(CPUPPCState *env, uint64_t r)
+{
+    uint32_t exp = (r >> 52) & 0x7FF;
+
+    if (likely(exp != 0 && exp != 0x7FF)) {
+        target_ulong fprf = (r >> 63) ? (0x08 << FPSCR_FPRF)
+                                      : (0x04 << FPSCR_FPRF);
+        env->fpscr = (env->fpscr & ~FP_FPRF) | fprf;
+    } else {
+        helper_compute_fprf_float64(env, r);
+    }
+}
+
 uint64_t helper_fastfp_ab(CPUPPCState *env, uint64_t a, uint64_t b, uint32_t op)
 {
     uintptr_t ra = GETPC();
@@ -3731,7 +3760,7 @@ uint64_t helper_fastfp_ab(CPUPPCState *env, uint64_t a, uint64_t b, uint32_t op)
         }
         if (likely(ok && !isnan(r))) {
             uint64_t ret = ff_u(r);
-            helper_compute_fprf_float64(env, ret);
+            ff_fprf(env, ret);
             return ret;
         }
     }
@@ -3785,7 +3814,7 @@ uint64_t helper_fastfp_acb(CPUPPCState *env, uint64_t a, uint64_t c,
         }
         if (likely(ok && !isnan(r))) {
             uint64_t ret = ff_u(r);
-            helper_compute_fprf_float64(env, ret);
+            ff_fprf(env, ret);
             return ret;
         }
     }
