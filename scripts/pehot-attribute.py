@@ -36,11 +36,21 @@ def load_map(path):
         # Only executable regions can contain code we translated; without
         # this, a library's __DATA would claim blocks from whatever was
         # mapped next to it.
-        # No \b: the permission field can start with '-', which is not a
-        # word character, so \b would fail to match and __PAGEZERO (---/---)
-        # would be kept as though it held code.
-        perms = re.search(r'(?:^|\s)([-r][-w][-x])/[-r][-w][-x]', line)
-        if not perms or 'x' not in perms.group(1):
+        # Current *or* maximum permissions, not current alone. CFM/PEF code
+        # -- which is what Warcraft III and CarbonLib are -- is mapped
+        # "r--/rwx": not executable as it sits, executed through the CFM
+        # runtime. Requiring x in the current permissions drops the game's
+        # own code, and with it most of the profile.
+        #
+        # Including data regions this way costs nothing: a region only
+        # receives weight if blocks actually ran in it, and none do in data.
+        #
+        # No \b before the field: it can begin with '-', which is not a word
+        # character, so \b would fail and __PAGEZERO (---/---) would be kept
+        # as though it held code.
+        perms = re.search(r'(?:^|\s)([-r][-w][-x])/([-r][-w][-x])', line)
+        if not perms or ('x' not in perms.group(1) and
+                         'x' not in perms.group(2)):
             continue
         # The path may contain spaces -- "Warcraft III.app" does -- so it is
         # taken as everything after the SM= field rather than as one token.
