@@ -1487,7 +1487,12 @@ static void pe_gpu_class_init(ObjectClass *klass, void *data)
     k->realize = pe_gpu_realize;
     k->exit = pe_gpu_exit;
     k->vendor_id = PCI_VENDOR_ID_REDHAT;        /* placeholder */
-    k->device_id = 0x1050;
+    /*
+     * 0x1050 is virtio-gpu's device ID under the neighbouring vendor 0x1af4,
+     * for the same job: same number, adjacent vendor, guaranteed confusion in
+     * every lspci dump.  0x5047 is 'PG'.
+     */
+    k->device_id = 0x5047;
     k->class_id = PCI_CLASS_DISPLAY_OTHER;
     dc->desc = "PowerEmu paravirtual GPU";
     dc->vmsd = &vmstate_pe_gpu;
