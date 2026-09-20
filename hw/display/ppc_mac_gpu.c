@@ -263,8 +263,167 @@ static void r200_perf_high(uint64_t end)
     }
 }
 
+/*
+ * Draws on a worker thread.
+ * ------------------------
+ * A host sample put 16.7% of the vCPU thread in this device model, with the
+ * draw path the largest named function in the whole profile -- while the
+ * machine around it sat with most of its cores idle. The emulator is one
+ * thread per guest CPU and the guest has one CPU, so the only way to use
+ * those cores is to take work out of that thread.
+ *
+ * What makes it safe is a contract the guest already keeps. Real hardware
+ * reads vertex memory asynchronously, so a driver must not reuse a buffer
+ * until a fence says the GPU is done with it -- and this device already
+ * implements those fences. Reading guest memory from a worker is therefore
+ * not a new hazard; it is the hazard the interface was designed around.
+ *
+ * What is *not* safe is reading registers, because the guest keeps writing
+ * them while the worker runs. Each job therefore carries a snapshot. The
+ * copy is the whole device state by value: the fields a draw reads besides
+ * the registers are three pointers and a size, and copying them along with
+ * the registers is cheaper than auditing which ones a future change might
+ * add.
+ *
+ * Ordering rides on r200_flush_at(), which everything that needs to see
+ * finished drawing already calls. Draining there keeps 2D blits, scanout,
+ * fences and register reads in the order the guest asked for, without any
+ * new ordering rules to get wrong.
+ *
+ * Off by default: PPCGPU_ASYNC_DRAW=1 turns it on. A threading fault in a
+ * device model is the kind that corrupts rarely rather than failing
+ * cleanly, so this does not become the default until it has been measured
+ * and lived with.
+ */
+typedef struct R200DrawJob {
+    PPCMacGPUState state;       /* snapshot: registers by value */
+    uint32_t *body;             /* the PM4 body, copied */
+    uint32_t body_dw;
+    int src;
+    struct R200DrawJob *next;
+} R200DrawJob;
+
+static struct {
+    QemuThread thread;
+    QemuMutex lock;
+    QemuCond wake;              /* work arrived, or stop */
+    QemuCond idle;              /* queue drained */
+    R200DrawJob *head, *tail;
+    unsigned inflight;          /* queued + currently running */
+    bool started;
+    bool stop;
+} r200_async;
+
+static bool r200_async_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_ASYNC_DRAW");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+/* Forward declaration: the worker runs the ordinary draw path. */
+static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
+                                      uint32_t body_dw, int src);
+
+static void *r200_async_worker(void *opaque)
+{
+    qemu_mutex_lock(&r200_async.lock);
+    for (;;) {
+        R200DrawJob *job;
+
+        while (!r200_async.head && !r200_async.stop) {
+            qemu_cond_wait(&r200_async.wake, &r200_async.lock);
+        }
+        if (!r200_async.head && r200_async.stop) {
+            break;
+        }
+        job = r200_async.head;
+        r200_async.head = job->next;
+        if (!r200_async.head) {
+            r200_async.tail = NULL;
+        }
+        /*
+         * Unlocked while drawing: this is the whole point, and the job owns
+         * everything it touches. inflight is not decremented until the draw
+         * is finished, so a drain waits for the work and not merely for the
+         * queue to empty.
+         */
+        qemu_mutex_unlock(&r200_async.lock);
+        ppc_mac_gpu_r200_draw_now(&job->state, job->body, job->body_dw,
+                                  job->src);
+        g_free(job->body);
+        g_free(job);
+        qemu_mutex_lock(&r200_async.lock);
+        if (--r200_async.inflight == 0) {
+            qemu_cond_broadcast(&r200_async.idle);
+        }
+    }
+    qemu_mutex_unlock(&r200_async.lock);
+    return NULL;
+}
+
+/* Wait until every queued draw has finished. */
+static void r200_async_drain(void)
+{
+    if (!r200_async.started) {
+        return;
+    }
+    qemu_mutex_lock(&r200_async.lock);
+    while (r200_async.inflight) {
+        qemu_cond_wait(&r200_async.idle, &r200_async.lock);
+    }
+    qemu_mutex_unlock(&r200_async.lock);
+}
+
+static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
+                              uint32_t body_dw, int src)
+{
+    R200DrawJob *job;
+
+    if (!r200_async_enabled()) {
+        return false;
+    }
+    if (!r200_async.started) {
+        qemu_mutex_init(&r200_async.lock);
+        qemu_cond_init(&r200_async.wake);
+        qemu_cond_init(&r200_async.idle);
+        r200_async.started = true;
+        qemu_thread_create(&r200_async.thread, "r200-draw",
+                           r200_async_worker, NULL, QEMU_THREAD_JOINABLE);
+    }
+
+    job = g_new(R200DrawJob, 1);
+    job->state = *s;                    /* registers and pointers, by value */
+    job->body_dw = body_dw;
+    job->src = src;
+    job->next = NULL;
+    job->body = g_memdup2(d, (size_t)body_dw * 4);
+
+    qemu_mutex_lock(&r200_async.lock);
+    r200_async.inflight++;
+    if (r200_async.tail) {
+        r200_async.tail->next = job;
+    } else {
+        r200_async.head = job;
+    }
+    r200_async.tail = job;
+    qemu_cond_signal(&r200_async.wake);
+    qemu_mutex_unlock(&r200_async.lock);
+    return true;
+}
+
 static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
 {
+    /*
+     * Everything that must see finished drawing comes through here, so this
+     * is the only place that has to wait for the workers -- no new ordering
+     * rules, and none to forget at a new call site.
+     */
+    r200_async_drain();
     if (s->renderer && s->renderer->flush_r200) {
         int64_t t0 = g_get_monotonic_time();
         bool did = s->renderer->flush_r200(s->renderer_opaque);
@@ -4074,7 +4233,12 @@ enum { R200_SRC_VBUF, R200_SRC_INDX, R200_SRC_IMMD };
  * handled — including draws deliberately skipped — so the legacy path never
  * runs in direct mode.
  */
-static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
+/*
+ * The draw itself. Runs on the vCPU thread, or on the draw worker against a
+ * snapshot -- it cannot tell which, and must not care: everything it reads
+ * comes through `s`, which is the snapshot when a worker is running it.
+ */
+static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                                   uint32_t ndw, int src)
 {
     if (!r200_direct_enabled() || !s->renderer || !s->renderer->draw_r200) {
@@ -4856,6 +5020,20 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
     g_free(verts);
     g_free(idx);
     return true;
+}
+
+/*
+ * Hand the draw to a worker when asynchronous drawing is on, and otherwise
+ * run it here. Returning the same value either way is deliberate: a queued
+ * draw has not failed, and its result cannot be known yet.
+ */
+static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
+                                  uint32_t body_dw, int src)
+{
+    if (r200_async_submit(s, d, body_dw, src)) {
+        return true;
+    }
+    return ppc_mac_gpu_r200_draw_now(s, d, body_dw, src);
 }
 
 static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
