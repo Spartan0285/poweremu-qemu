@@ -4184,6 +4184,29 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
     }
     float pix_bias = (R3D(0x1C4C) & (1u << 27)) ? 0.0f : 0.5f;  /* D3D centres */
 
+    /*
+     * Where each attribute starts in the gathered stream, when there is one
+     * array per attribute. This is a property of the draw, not of the
+     * vertex, but it used to be recomputed inside the vertex loop with an
+     * inner loop over the preceding attributes -- O(attributes squared) per
+     * vertex, for an answer that never changed.
+     */
+    uint32_t attr_start[20];          /* matches attr_comps[] above */
+    if (narrays == (uint32_t)nattr) {
+        /*
+         * Only in this case, and only over the arrays that exist: arr_count
+         * is filled per array, so summing it across all attributes would
+         * read past what was initialised whenever the two counts differ.
+         * The original inner loop was safe for the same reason -- it ran
+         * only on this branch -- and hoisting it has to keep that.
+         */
+        uint32_t acc = 0;
+        for (int a = 0; a < nattr; a++) {
+            attr_start[a] = acc;
+            acc += arr_count[a];
+        }
+    }
+
     /* ---- Fetch and transform vertices ---- */
     R200Vertex *verts = g_new0(R200Vertex, nverts);
     for (uint32_t v = 0; v < nverts; v++) {
@@ -4218,26 +4241,39 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
             iv = stream;
         }
         for (int a = 0; a < nattr; a++) {
-            uint32_t raw[16] = { 0 };
+            /*
+             * Deliberately not zero-initialised: that zeroed all 64 bytes
+             * for every attribute of every vertex, which is the hottest
+             * memset in the device model. Only what can be read is cleared.
+             *
+             * "What can be read" is not simply [0, n): the packed-colour
+             * path below reads raw[0] unconditionally, so the first four
+             * words must be defined even when n is smaller. Getting that
+             * wrong gives colours built from stack garbage.
+             */
+            uint32_t raw[16];
+            const uint32_t raw_used = 4;       /* raw[0..3]: see above */
             uint32_t n = MIN((uint32_t)attr_comps[a], 16u);
             if (src == R200_SRC_IMMD) {
                 memcpy(raw, iv, n * 4);
+                if (n < raw_used) {
+                    memset(raw + n, 0, (raw_used - n) * 4);
+                }
                 iv += n;
             } else {
                 uint32_t have;
                 if (narrays == (uint32_t)nattr) {
                     /* one array per attribute: the array's count wins */
-                    uint32_t start = 0;
-                    for (int k = 0; k < a; k++) {
-                        start += arr_count[k];
-                    }
-                    iv = stream + MIN(start, sn);
+                    iv = stream + MIN(attr_start[a], sn);
                     have = MIN(n, arr_count[a]);
                 } else {
                     uint32_t used = iv - stream;
                     have = used < sn ? MIN(n, sn - used) : 0;
                 }
                 memcpy(raw, iv, have * 4);
+                if (have < MAX(n, raw_used)) {
+                    memset(raw + have, 0, (MAX(n, raw_used) - have) * 4);
+                }
                 if (have < n && attr_kind[a] == A_POS && n == 4 && have == 3) {
                     raw[3] = 0x3F800000;          /* short array: w = 1 */
                 }
