@@ -154,3 +154,10 @@ config PPC_MAC_GPU
     bool
     default y if PCI_DEVICES
     depends on PCI
+
+config POWEREMU_GPU
+    bool
+    default y if PCI_DEVICES
+    # The paravirtual GPU executes its packets through the R200 renderer
+    # backends, which are built with PPC_MAC_GPU.
+    depends on PCI && PPC_MAC_GPU

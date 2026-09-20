@@ -66,6 +66,8 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu_renderer_sw.c',
 ), pixman])
 
+system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])
+
 if host_os == 'darwin'
   metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)
   if metal_fw.found()
