@@ -325,6 +325,34 @@ static bool r200_async_enabled(void)
     return on;
 }
 
+/*
+ * Submit to the renderer with the big lock held.
+ *
+ * Every other caller of the renderer runs on the vCPU thread or the main
+ * loop, and those are already serialised against each other by the BQL --
+ * which is exactly why this device could call Metal freely before draws
+ * moved off-thread, and why Metal asserted the moment they did. Taking the
+ * same lock here restores that guarantee without touching the thirty other
+ * call sites, and without serialising the part worth parallelising: by the
+ * time a draw reaches this point its vertices are already fetched and
+ * transformed, which is the expensive half.
+ */
+static int r200_render_draw(PPCMacGPUState *s, uint8_t *vram,
+                            const R200DrawPacket *pkt)
+{
+    bool need_bql = !bql_locked();
+    int r;
+
+    if (need_bql) {
+        bql_lock();
+    }
+    r = s->renderer->draw_r200(s->renderer_opaque, vram, s->vram_size, pkt);
+    if (need_bql) {
+        bql_unlock();
+    }
+    return r;
+}
+
 /* Forward declaration: the worker runs the ordinary draw path. */
 static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                                       uint32_t body_dw, int src);
@@ -4988,8 +5016,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                        "render target 0x%x pitch %u height %u outside VRAM",
                        pkt.rt_offset, pkt.rt_pitch, pkt.rt_height);
     } else if (r200_rate.draws++,
-               s->renderer->draw_r200(s->renderer_opaque, vram,
-                                      s->vram_size, &pkt) == 0) {
+               r200_render_draw(s, vram, &pkt) == 0) {
         memory_region_set_dirty(&s->vram, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
         r200_perf.draws++;
