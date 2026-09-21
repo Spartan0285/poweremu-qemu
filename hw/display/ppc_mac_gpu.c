@@ -3975,6 +3975,28 @@ static void r200_warn_once(uint32_t *mask, uint32_t bit, const char *fmt, ...)
 static uint32_t r200_warned;
 
 /* Texture unit n: R100 register addresses for units 0-2, R200 for 3-5. */
+/*
+ * Fetch `have` words into dst and zero it out to `fill`.
+ *
+ * Both counts are tiny -- at most 16, and usually two or three -- so this
+ * replaces a memcpy and a memset whose lengths are only known at run time.
+ * They were called once per attribute per vertex, a couple of million times
+ * a second, and the call overhead dwarfed the handful of words each one
+ * moved: together they were the emulator's hottest memmove by a wide
+ * margin.  A plain word loop the compiler can see through is faster.
+ */
+static inline void r200_fetch_words(uint32_t *dst, const uint32_t *src,
+                                    uint32_t have, uint32_t fill)
+{
+    uint32_t i = 0;
+    for (; i < have; i++) {
+        dst[i] = src[i];
+    }
+    for (; i < fill; i++) {
+        dst[i] = 0;
+    }
+}
+
 static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
 {
     uint32_t filter, format, offset, size, pitch;
@@ -4551,10 +4573,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
             const uint32_t raw_used = 4;       /* raw[0..3]: see above */
             uint32_t n = MIN((uint32_t)attr_comps[a], 16u);
             if (src == R200_SRC_IMMD) {
-                memcpy(raw, iv, n * 4);
-                if (n < raw_used) {
-                    memset(raw + n, 0, (raw_used - n) * 4);
-                }
+                r200_fetch_words(raw, iv, n, MAX(n, raw_used));
                 iv += n;
             } else {
                 uint32_t have;
@@ -4566,10 +4585,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                     uint32_t used = iv - stream;
                     have = used < sn ? MIN(n, sn - used) : 0;
                 }
-                memcpy(raw, iv, have * 4);
-                if (have < MAX(n, raw_used)) {
-                    memset(raw + have, 0, (MAX(n, raw_used) - have) * 4);
-                }
+                r200_fetch_words(raw, iv, have, MAX(n, raw_used));
                 if (have < n && attr_kind[a] == A_POS && n == 4 && have == 3) {
                     raw[3] = 0x3F800000;          /* short array: w = 1 */
                 }
