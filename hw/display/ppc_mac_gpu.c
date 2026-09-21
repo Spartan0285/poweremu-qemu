@@ -3914,8 +3914,18 @@ static bool r200_read_dwords(PPCMacGPUState *s, uint32_t gpu_addr,
         return false;
     }
     if (gpu_addr >= fb_base && gpu_addr - fb_base + len <= s->vram_size) {
-        memcpy(buf, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-               (gpu_addr - fb_base), len);
+        /*
+         * Byte-swap straight out of VRAM.  Going via the bounce buffer made
+         * a second copy of every vertex fetched, and this is the path
+         * almost every fetch takes; the copy was a third of all the time
+         * the emulator spent in memmove.
+         */
+        const uint8_t *src = (const uint8_t *)
+            memory_region_get_ram_ptr(&s->vram) + (gpu_addr - fb_base);
+        for (uint32_t i = 0; i < count; i++) {
+            dst[i] = ldl_be_p(src + i * 4);
+        }
+        return true;
     } else {
         uint32_t done = 0;
         while (done < len) {
