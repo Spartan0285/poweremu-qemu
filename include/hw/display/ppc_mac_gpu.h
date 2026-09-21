@@ -19,6 +19,9 @@
 #include "ui/console.h"
 #include "qom/object.h"
 
+/* Defined in hw/display/ppc_mac_gpu_renderer.h, private to the device. */
+struct R200Vertex;
+
 /* ========================================================================
  * PCI Identity - ATI Radeon 9200 PRO (RV280)
  * ======================================================================== */
@@ -592,6 +595,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(PPCMacGPUState, PPC_MAC_GPU)
 struct PPCMacGPUState {
     /* Parent */
     PCIDevice pci;
+
+    /* Scratch for vertex assembly, reused across draws.
+     *
+     * These were a g_new0/g_free pair inside the draw path.  Warcraft issues
+     * on the order of 7,000 draws a second, so that was 14,000 allocations a
+     * second plus a full zeroing of a vertex array each time.
+     *
+     * The zeroing itself is still needed: the assembly loop only writes the
+     * attributes a vertex stream actually carries, and leaves spec[] and the
+     * first three components of each tex[] to arrive as zero.  Only the part
+     * in use is cleared, rather than the whole high-water allocation.
+     *
+     * Not thread-safe, and deliberately so: one draw is in flight at a time.
+     */
+    struct R200Vertex *draw_verts;
+    uint32_t draw_verts_cap;      /* in vertices */
+    uint32_t *draw_idx;
+    size_t draw_idx_cap;          /* in indices */
 
     /* Display console */
     QemuConsole *con;

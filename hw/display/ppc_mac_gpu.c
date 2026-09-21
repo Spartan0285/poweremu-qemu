@@ -384,6 +384,8 @@ static void *r200_async_worker(void *opaque)
         ppc_mac_gpu_r200_draw_now(&job->state, job->body, job->body_dw,
                                   job->src);
         g_free(job->body);
+        g_free(job->state.draw_verts);
+        g_free(job->state.draw_idx);
         g_free(job);
         qemu_mutex_lock(&r200_async.lock);
         if (--r200_async.inflight == 0) {
@@ -426,6 +428,17 @@ static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
 
     job = g_new(R200DrawJob, 1);
     job->state = *s;                    /* registers and pointers, by value */
+    /*
+     * The scratch buffers are the one thing that must not be shared. A
+     * snapshot copies their pointers, and the worker growing one would
+     * g_renew memory the device still points at -- which surfaces much
+     * later, as a heap abort inside an unrelated allocation. Give the job
+     * its own, allocated on first use and freed with the job.
+     */
+    job->state.draw_verts = NULL;
+    job->state.draw_verts_cap = 0;
+    job->state.draw_idx = NULL;
+    job->state.draw_idx_cap = 0;
     job->body_dw = body_dw;
     job->src = src;
     job->next = NULL;
@@ -3997,6 +4010,23 @@ static inline void r200_fetch_words(uint32_t *dst, const uint32_t *src,
     }
 }
 
+/*
+ * Grow the shared vertex scratch to hold at least n vertices and return it.
+ *
+ * Every growth must go through here.  The scratch is reachable from the
+ * device, so reallocating it and storing the result only in a local leaves
+ * the device pointing at freed memory -- which is not noticed here but in
+ * the *next* draw, as a heap abort inside an unrelated allocation.
+ */
+static R200Vertex *r200_draw_verts(PPCMacGPUState *s, uint32_t n)
+{
+    if (n > s->draw_verts_cap) {
+        s->draw_verts = g_renew(R200Vertex, s->draw_verts, n);
+        s->draw_verts_cap = n;
+    }
+    return s->draw_verts;
+}
+
 static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
 {
     uint32_t filter, format, offset, size, pitch;
@@ -4492,7 +4522,8 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     }
 
     /* ---- Fetch and transform vertices ---- */
-    R200Vertex *verts = g_new0(R200Vertex, nverts);
+    R200Vertex *verts = r200_draw_verts(s, nverts);
+    memset(verts, 0, sizeof(R200Vertex) * nverts);
     for (uint32_t v = 0; v < nverts; v++) {
         R200Vertex *o = &verts[v];
         float pos[4] = { 0, 0, 0, 1 };
@@ -4551,7 +4582,6 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                                              stream + sn, n)) {
                     r200_warn_once(&r200_warned, 256,
                                    "vertex fetch failed at 0x%08x", arr_addr[a]);
-                    g_free(verts);
                     return true;
                 }
                 sn += n;
@@ -4738,7 +4768,12 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     }
 
     /* ---- Primitive assembly into a triangle list ---- */
-    uint32_t *idx = g_new(uint32_t, (size_t)nverts * 6 + 6);
+    size_t idx_need = (size_t)nverts * 6 + 6;
+    if (idx_need > s->draw_idx_cap) {
+        s->draw_idx = g_renew(uint32_t, s->draw_idx, idx_need);
+        s->draw_idx_cap = idx_need;
+    }
+    uint32_t *idx = s->draw_idx;
     uint32_t ni = 0, prim_class = 0;
     switch (prim) {
     case 4:                                     /* TRIANGLES */
@@ -4778,7 +4813,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
          * Apple: TL,BL,TR), so find c rather than assume it.
          */
         uint32_t nrect = nverts / 3;
-        verts = g_renew(R200Vertex, verts, nverts + nrect);
+        verts = r200_draw_verts(s, nverts + nrect);
         for (uint32_t r = 0; r < nrect; r++) {
             R200Vertex *v = &verts[r * 3];
             int c = 1;
@@ -4835,8 +4870,6 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
         break;
     }
     if (ni == 0) {
-        g_free(verts);
-        g_free(idx);
         return true;
     }
 
@@ -5139,8 +5172,6 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     for (int t = 0; t < R200_MAX_TEX; t++) {
         g_free((void *)pkt.tex[t].host_data);
     }
-    g_free(verts);
-    g_free(idx);
     return true;
 }
 
@@ -9302,6 +9333,12 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);
     s->shadow_buf = NULL;
+    g_free(s->draw_verts);
+    s->draw_verts = NULL;
+    s->draw_verts_cap = 0;
+    g_free(s->draw_idx);
+    s->draw_idx = NULL;
+    s->draw_idx_cap = 0;
     graphic_console_close(s->con);
 }
 
