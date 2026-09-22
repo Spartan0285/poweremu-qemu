@@ -862,7 +862,17 @@ static void mac_dbdma_reset(DeviceState *d)
     int i;
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        DBDMA_channel *ch = &s->channels[i];
+
+        memset(ch->regs, 0, DBDMA_SIZE);
+        /*
+         * A reset during a transfer (a guest restart with disk I/O in
+         * flight) must not leave the channel marked busy: DBDMA_run skips
+         * a processing channel, so the next OS's first DMA would never run.
+         */
+        ch->io.processing = false;
+        ch->io.len = 0;
+        memset(&ch->current, 0, sizeof(ch->current));
     }
 }
 

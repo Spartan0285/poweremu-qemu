@@ -123,6 +123,12 @@ static void ppc_core99_reset(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
 
+    /*
+     * A guest-initiated restart must not leave the decrementer that Mac OS X
+     * programmed armed for the firmware, as the Old World machine already
+     * ensures.
+     */
+    cpu_ppc_tb_reset(&cpu->env);
     cpu_reset(CPU(cpu));
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;

@@ -8942,6 +8942,23 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->mode = PPC_MAC_GPU_MODE_EXT;
     s->display_invalid = true;
 
+    /*
+     * State kept outside the register file must come back to what realize
+     * leaves too, or a guest restart boots against the previous OS's card:
+     * the NDRV would read ATI registers where it expects EDID, and the
+     * screen would keep that OS's stride override and tiled surfaces.
+     */
+    s->edid_read_done = false;
+    s->disp_stride_override_active = false;
+    s->disp_stride_override_value = 0;
+    s->host_data_active = false;
+    s->pm4_fifo_idx = 0;
+    s->pm4_pkt_count = 0;
+    s->compositor_valid = false;
+    memset(s->tiled_surfaces, 0, sizeof(s->tiled_surfaces));
+    s->metal_rt_count = 0;
+    s->vb_count = 0;
+
     timer_del(&s->vblank_timer);
 }
 
