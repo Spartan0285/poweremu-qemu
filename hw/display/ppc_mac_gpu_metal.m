@@ -6866,10 +6866,13 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
             if (tu->format == 10 || tu->format == 11) {
                 /*
-                 * YUV 4:2:2 (QuickTime movie frames, e.g. Warcraft III's
-                 * cinematics).  Undo the TXOFFSET swap, then read the CPU byte
-                 * order: format 11 carries QuickTime's '2vuy' (Cb Y0 Cr Y1),
-                 * format 10 'yuvs' (Y0 Cb Y1 Cr) - found empirically, the
+                 * YUV 4:2:2 (QuickTime movie frames: Warcraft III's
+                 * cinematics, Setup Assistant's welcome movie).  Undo the
+                 * TXOFFSET swap, then read the CPU byte order, which is
+                 * QuickTime's '2vuy' (Cb Y0 Cr Y1) for both formats: 11 was
+                 * verified on Warcraft III's opening movie, 10 on Tiger's
+                 * welcome movie (format 0xca, VRAM, no swap; first texels
+                 * a8 58 62 59 = Cb 168, Y 88, Cr 98, the movie's blue).  The
                  * R200 names describe the GPU's little-endian view.  BT.601
                  * video range into a BGRA texture.
                  */
@@ -6894,12 +6897,8 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                         case 3: g[0] = b[2]; g[1] = b[3]; g[2] = b[0]; g[3] = b[1]; break;
                         default: memcpy(g, b, 4); break;
                         }
-                        int y0, y1, cb, cr;
-                        if (tu->format == 11) {         /* '2vuy': Cb Y0 Cr Y1 */
-                            cb = g[0]; y0 = g[1]; cr = g[2]; y1 = g[3];
-                        } else {                        /* 'yuvs': Y0 Cb Y1 Cr */
-                            y0 = g[0]; cb = g[1]; y1 = g[2]; cr = g[3];
-                        }
+                        /* '2vuy': Cb Y0 Cr Y1 */
+                        int cb = g[0], y0 = g[1], cr = g[2], y1 = g[3];
                         for (int k = 0; k < 2 && x + k < w; k++) {
                             float yy = 1.164f * ((k ? y1 : y0) - 16);
                             float r = yy + 1.596f * (cr - 128);
