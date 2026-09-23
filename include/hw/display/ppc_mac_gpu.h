@@ -786,6 +786,11 @@ struct PPCMacGPUState {
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
     int32_t hwc_x, hwc_y;
     bool hwc_visible;
+    /* A woken machine's window has never been told what the pointer looks
+     * like: the guest uploaded it once, before the machine slept, and will
+     * not do it again.  Set when a machine is restored, acted on at the
+     * next screen update, by which time the window is listening. */
+    bool hwc_announce;
 
     /*
      * Zero-copy VRAM: when VRAM is backed by a shared Metal buffer,

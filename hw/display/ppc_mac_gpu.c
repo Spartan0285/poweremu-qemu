@@ -1032,8 +1032,17 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
      * applied below, or the frame that changes resolution gets the old
      * mode's pitch with the new mode's width -- a stride shorter than a
      * scanline, which walks off the end of the framebuffer.
+     *
+     * Coming from no mode at all is not a resolution change.  A machine
+     * woken from sleep is a fresh device that has just had the sleeping
+     * one's registers and learned scanline length poured into it, and its
+     * first display update therefore reads as 0x0 -> 1680x1050 -- which
+     * threw away the very override the snapshot had just restored, and the
+     * desktop came back sheared into bands.  There is nothing to protect
+     * here: with no previous mode there is no stale pitch to carry over.
      */
     if (s->disp_stride_override_active &&
+        old.width != 0 && old.height != 0 &&
         (old.width != m->width || old.height != m->height ||
          old.bpp != m->bpp)) {
         fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
@@ -1125,6 +1134,21 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+
+    /* A machine that has just been woken: give the window the pointer the
+     * sleeping one had (see ppc_mac_gpu_post_load). */
+    if (s->hwc_announce && s->con) {
+        s->hwc_announce = false;
+        if (s->hwc_w && s->hwc_h) {
+            QEMUCursor *c = cursor_alloc(s->hwc_w, s->hwc_h);
+            c->hot_x = 0;               /* X/Y are the image's top-left */
+            c->hot_y = 0;
+            memcpy(c->data, s->hwc_pix, s->hwc_w * s->hwc_h * 4);
+            dpy_cursor_define(s->con, c);
+            cursor_unref(c);
+        }
+        dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
+    }
 
     {
         int64_t now = g_get_monotonic_time();
@@ -10005,6 +10029,17 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     s->surface_height = 0;
     s->surface_stride = 0;
     memory_region_set_dirty(&s->vram, 0, s->vram_size);
+    /*
+     * The pointer has to be handed to the window again.  Its picture and
+     * position are restored above, but they reached the window in the first
+     * place as one-off announcements when the guest uploaded them, and a
+     * woken machine's guest has no reason to upload anything -- it carries
+     * on from the instant it was stopped.  Left undone, the desktop comes
+     * back correctly with an invisible pointer.  Deferred to the next
+     * screen update rather than done here, because at this moment the
+     * window may not yet be listening.
+     */
+    s->hwc_announce = true;
     if (s->con) {
         dpy_gfx_update_full(s->con);
     }
