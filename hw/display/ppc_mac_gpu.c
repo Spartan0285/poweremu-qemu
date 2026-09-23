@@ -1573,26 +1573,48 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
      * GART addresses must be translated to physical system RAM addresses.
      */
     hwaddr phys;
+    /*
+     * Where this lands, and in which byte order, decides whether a program
+     * waiting on the card ever wakes up.
+     *
+     * The address names memory the card reaches over the bus, never a spot
+     * in its own memory: the driver builds it from the ring's read-pointer
+     * address, which is system RAM.  When address translation is switched
+     * off the address passes through untranslated, so a plain guest
+     * address is the normal case and must be written as such -- there was
+     * no path for it here, and the value went into VRAM or nowhere.
+     *
+     * The card writes these little-endian whatever the processor's order,
+     * which is why the drivers that read them swap.  This wrote them
+     * big-endian, so a number like 2200 arrived as 0x98080000: read as a
+     * signed difference, permanently "not yet".  Either fault alone leaves
+     * a program waiting for ever while everything else looks healthy.
+     * POWEREMU_WB_BE=1 restores the old order for comparison.
+     */
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t wire_val = getenv("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
+                                                 : cpu_to_le32(wb_val);
+
     if (ppc_mac_gpu_gart_translate(s, wb_addr, &phys) ||
         ppc_mac_gpu_agp_translate(s, wb_addr, &phys)) {
-        /* Write to system RAM via GART — guest CPU polls this address.
-         * PPC guest expects big-endian byte order. */
-        uint32_t be_val = cpu_to_be32(wb_val);
         address_space_write(&address_space_memory, phys,
-                            MEMTXATTRS_UNSPECIFIED, &be_val, 4);
+                            MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> GART[0x%x] phys=0x%"PRIx64,
                       reg_idx, wb_val, wb_addr, (uint64_t)phys);
-    } else if (wb_addr + 4 <= s->vram_size) {
-        r200_vram_access(s, wb_addr, wb_addr + 4, true, 6);
-        /* Direct VRAM write */
+    } else if (wb_addr >= fb_base && wb_addr + 4 <= fb_base + s->vram_size) {
+        uint32_t off = wb_addr - fb_base;
+        r200_vram_access(s, off, off + 4, true, 6);
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-        stl_be_p(vram + wb_addr, wb_val);
-        memory_region_set_dirty(&s->vram, wb_addr, 4);
+        memcpy(vram + off, &wire_val, 4);
+        memory_region_set_dirty(&s->vram, off, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> VRAM[0x%x]",
-                      reg_idx, wb_val, wb_addr);
+                      reg_idx, wb_val, off);
     } else {
-        gpu_debug_log("SCRATCH_WB reg%d=0x%x -> FAILED addr=0x%x (out of range)",
-                      reg_idx, wb_val, wb_addr);
+        /* Straight out to memory, as a card whose translation is off does. */
+        address_space_write(&address_space_memory, wb_addr,
+                            MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
+        gpu_debug_log("SCRATCH_WB reg%d=0x%x -> memory[0x%x]", reg_idx, wb_val,
+                      wb_addr);
     }
 }
 
@@ -1615,19 +1637,25 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
     if (!addr || (s->regs.cp_rb_cntl & (1u << 27))) {
         return;                       /* nowhere to write, or the guest said not to */
     }
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t wire_val = getenv("POWEREMU_WB_BE")
+        ? cpu_to_be32(s->regs.cp_rb_rptr) : cpu_to_le32(s->regs.cp_rb_rptr);
+
     if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
         !ppc_mac_gpu_agp_translate(s, addr, &phys)) {
-        if (addr + 4 > s->vram_size) {
-            return;
+        if (addr >= fb_base && addr + 4 <= fb_base + s->vram_size) {
+            uint32_t off = addr - fb_base;
+            memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off,
+                   &wire_val, 4);
+            memory_region_set_dirty(&s->vram, off, 4);
+        } else {
+            address_space_write(&address_space_memory, addr,
+                                MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
         }
-        stl_be_p((uint8_t *)memory_region_get_ram_ptr(&s->vram) + addr,
-                 s->regs.cp_rb_rptr);
-        memory_region_set_dirty(&s->vram, addr, 4);
         return;
     }
-    uint32_t be_val = cpu_to_be32(s->regs.cp_rb_rptr);
     address_space_write(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
-                        &be_val, 4);
+                        &wire_val, 4);
 }
 
 static void ppc_mac_gpu_scratch_writeback(PPCMacGPUState *s, int reg_idx)
@@ -7407,7 +7435,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         ring[n & 255].val = 0;
         ring[n & 255].wr = false;
         n++;
-        if (s->regs.stall_draws != s->regs.stall_draws_seen) {
+        if (s->regs.stall_draws != s->regs.stall_draws_seen || !last_draw_seen) {
             s->regs.stall_draws_seen = s->regs.stall_draws;
             last_draw_seen = now;
             dumped = false;
@@ -7444,6 +7472,27 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                             : s->regs.scratch_addr + 4 <= s->vram_size ? "the card's own memory -- the guest cannot see it there"
                             : "nowhere at all";
                     }), 256u);
+            /* What the waiting program actually sees in that page. */
+            {
+                hwaddr ph;
+                if (ppc_mac_gpu_gart_translate(s, s->regs.scratch_addr, &ph) ||
+                    ppc_mac_gpu_agp_translate(s, s->regs.scratch_addr, &ph)) {
+                    uint32_t page[16];
+                    address_space_read(&address_space_memory, ph,
+                                       MEMTXATTRS_UNSPECIFIED, page, sizeof(page));
+                    fprintf(stderr, "  that page (guest address 0x%" PRIx64 "), "
+                            "as words, each shown both ways round:\n", (uint64_t)ph);
+                    for (int w = 0; w < 16; w += 4) {
+                        fprintf(stderr, "    +%02x:", w * 4);
+                        for (int k = 0; k < 4; k++) {
+                            uint32_t raw = page[w + k];
+                            fprintf(stderr, "  %10u / %10u", le32_to_cpu(raw),
+                                    be32_to_cpu(raw));
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             fprintf(stderr, "  the last commands it pushed:\n");
             for (unsigned i = 0; i < 32; i++) {
                 unsigned k = (pm4_recent_n + i) & 31;
@@ -7908,15 +7957,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 mode = (e && !strcmp(e, "busy")) ? 1
                      : (e && !strcmp(e, "idle")) ? 2 : 0;
             }
+            /*
+             * Bits [7:0] are the only count this register has, and the
+             * driver reads them as room to submit into: a steady 0x40 says
+             * "space for 64", which is what lets Mac OS X finish bringing
+             * the engine up.  Reporting zero hangs the boot.  Halo's freeze
+             * was never here -- it survived both extremes -- so this stays
+             * steady rather than pretending to drain.
+             */
             uint32_t top = s->regs.cp_csq_cntl & 0xFF000000;
-            if (mode == 1) {
-                val = top | 0x202040;
-            } else if (mode == 2) {
-                val = top;
-            } else {
-                val = s->regs.csq_just_submitted ? (top | 0x202040) : top;
-                s->regs.csq_just_submitted = false;
-            }
+            val = (mode == 2) ? top : (top | 0x40);
         }
         break;
     case R200_SCRATCH_UMSK:
