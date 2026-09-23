@@ -3,7 +3,10 @@
  *
  *   -display none -object poweremu-display,id=pd0,path=/tmp/x.sock
  *
- * PowerEmu listens on the Unix socket at `path`; QEMU connects at startup.
+ * PowerEmu listens on the Unix socket at `path`; QEMU connects at startup,
+ * and again every few seconds if the connection is lost -- so a virtual Mac
+ * whose PowerEmu quit unexpectedly rejoins the app when it opens again
+ * instead of running on with nobody able to see or stop it.
  * The guest's screen is copied (as 32-bit BGRA) into shared memory whose
  * file descriptor is passed to PowerEmu with SCM_RIGHTS; afterwards QEMU
  * only says which rectangle changed.  The guest's hardware cursor and its
@@ -62,6 +65,7 @@ struct PowerEmuDisplay {
 
     /* The shared copy of the screen. */
     void *shm;
+    int shm_fd;                 /* kept open, to hand over again on reconnect */
     size_t shm_size;
     int width, height, stride;
     pixman_image_t *shm_image;
@@ -72,6 +76,7 @@ struct PowerEmuDisplay {
 
     uint8_t in[256];
     size_t in_len;
+    int64_t last_try_ms;        /* when we last tried to reach PowerEmu */
     uint32_t buttons;
 };
 
@@ -101,6 +106,20 @@ static void pe_send(PowerEmuDisplay *pd, uint32_t type, const void *payload,
 
 /* ---- the screen ---- */
 
+static void pe_damage(PowerEmuDisplay *pd, int x, int y, int w, int h);
+static gboolean pe_readable(QIOChannel *ioc, GIOCondition cond, gpointer opaque);
+
+static void pe_announce_surface(PowerEmuDisplay *pd)
+{
+    uint32_t msg[3] = { pd->width, pd->height, pd->stride };
+
+    if (pd->shm_fd < 0) {
+        return;
+    }
+    pe_send(pd, PE_SURFACE, msg, sizeof(msg), pd->shm_fd);
+    pe_damage(pd, 0, 0, pd->width, pd->height);
+}
+
 static void pe_free_shm(PowerEmuDisplay *pd)
 {
     if (pd->shm_image) {
@@ -110,6 +129,10 @@ static void pe_free_shm(PowerEmuDisplay *pd)
     if (pd->shm) {
         munmap(pd->shm, pd->shm_size);
         pd->shm = NULL;
+    }
+    if (pd->shm_fd >= 0) {
+        close(pd->shm_fd);
+        pd->shm_fd = -1;
     }
 }
 
@@ -245,16 +268,51 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
     pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
                            0, 0, 0, 0, 0, 0, pd->width, pd->height);
 
-    uint32_t msg[3] = { pd->width, pd->height, pd->stride };
-    pe_send(pd, PE_SURFACE, msg, sizeof(msg), fd);
-    close(fd);
-    pe_damage(pd, 0, 0, pd->width, pd->height);
+    if (pd->shm_fd >= 0) {
+        close(pd->shm_fd);
+    }
+    pd->shm_fd = fd;
+    pe_announce_surface(pd);
+}
+
+/* PowerEmu is gone (it quit, or it crashed): knock on its socket now and
+ * then, and pick up where we left off when it answers. */
+static void pe_try_reconnect(PowerEmuDisplay *pd)
+{
+    SocketAddress addr = { .type = SOCKET_ADDRESS_TYPE_UNIX };
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    QIOChannelSocket *sioc;
+
+    if (now - pd->last_try_ms < 2000) {
+        return;
+    }
+    pd->last_try_ms = now;
+    addr.u.q_unix.path = pd->path;
+    sioc = qio_channel_socket_new();
+    qio_channel_set_name(QIO_CHANNEL(sioc), "poweremu-display");
+    if (qio_channel_socket_connect_sync(sioc, &addr, NULL) < 0) {
+        object_unref(OBJECT(sioc));
+        return;
+    }
+    if (pd->watch) {
+        g_source_remove(pd->watch);
+        pd->watch = 0;
+    }
+    object_unref(OBJECT(pd->sioc));
+    pd->sioc = sioc;
+    pd->in_len = 0;
+    pd->connected = true;
+    pd->watch = qio_channel_add_watch(QIO_CHANNEL(pd->sioc), G_IO_IN, pe_readable, pd, NULL);
+    pe_announce_surface(pd);
 }
 
 static void pe_refresh(DisplayChangeListener *dcl)
 {
     PowerEmuDisplay *pd = container_of(dcl, PowerEmuDisplay, dcl);
 
+    if (!pd->connected) {
+        pe_try_reconnect(pd);
+    }
     graphic_hw_update(dcl->con);
     if (pd->dirty) {
         uint32_t msg[4] = { pd->dx0, pd->dy0, pd->dx1 - pd->dx0, pd->dy1 - pd->dy0 };
@@ -421,6 +479,8 @@ static void pe_complete(UserCreatable *uc, Error **errp)
 {
     PowerEmuDisplay *pd = POWEREMU_DISPLAY(uc);
     SocketAddress addr = { .type = SOCKET_ADDRESS_TYPE_UNIX };
+
+    pd->shm_fd = -1;
 
     if (!pd->path) {
         error_setg(errp, "poweremu-display needs path=");
