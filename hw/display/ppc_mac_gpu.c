@@ -9985,6 +9985,63 @@ static const Property ppc_mac_gpu_properties[] = {
 };
 
 /* Read-only "perf": the running totals behind PowerEmu's overlay. */
+/*
+ * Turning a trace on while the machine is running.
+ *
+ * Every trace in this file asks getenv() at the point it prints, which
+ * meant choosing them before the machine started and restarting to change
+ * one's mind -- painful when the thing being chased takes ten minutes of
+ * booting to reach.  Setting this property sets the environment variable,
+ * so all of them can be switched from the monitor mid-flight:
+ *
+ *   qom-set /machine/peripheral/gpu0 trace POWEREMU_TEX_TRACE
+ *   qom-set /machine/peripheral/gpu0 trace -POWEREMU_TEX_TRACE
+ *
+ * Only names beginning POWEREMU_ are accepted: this is a debugging handle,
+ * not a way to set the emulator's environment at large.
+ */
+static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
+{
+    const char *name = value;
+    bool off = false;
+
+    if (name && name[0] == '-') {
+        off = true;
+        name++;
+    }
+    if (!name || !g_str_has_prefix(name, "POWEREMU_")) {
+        error_setg(errp, "trace names must begin with POWEREMU_");
+        return;
+    }
+    if (off) {
+        g_unsetenv(name);
+    } else {
+        g_setenv(name, "1", true);
+    }
+    fprintf(stderr, "ppc-mac-gpu: %s %s\n", name, off ? "off" : "on");
+}
+
+static char *ppc_mac_gpu_get_trace(Object *obj, Error **errp)
+{
+    /* What is on, of the traces this device knows about. */
+    static const char *const names[] = {
+        "POWEREMU_STALL_TRACE", "POWEREMU_FENCE_TRACE", "POWEREMU_TEX_TRACE",
+        "POWEREMU_VP_TRACE", "POWEREMU_POLL_TRACE",
+    };
+    GString *out = g_string_new(NULL);
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        if (g_getenv(names[i])) {
+            g_string_append_printf(out, "%s%s", out->len ? " " : "", names[i]);
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, false);
+}
+
 static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(obj);
@@ -10124,6 +10181,8 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_str(klass, "perf", ppc_mac_gpu_get_perf, NULL);
+    object_class_property_add_str(klass, "trace", ppc_mac_gpu_get_trace,
+                                  ppc_mac_gpu_set_trace);
 }
 
 static const TypeInfo ppc_mac_gpu_type_info = {
