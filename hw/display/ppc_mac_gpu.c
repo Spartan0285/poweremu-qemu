@@ -39,6 +39,7 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
+#include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
 /* UniNorth AGP bridge GART base — defined in hw/pci-host/uninorth.c */
@@ -784,6 +785,18 @@ static bool gpu_debug_enabled(void)
     return enabled;
 }
 
+/* PPCGPU_VP=0 puts vertex programs aside, for comparing against the
+ * fixed-function path when a program draws something unexpected. */
+static bool gpu_vp_disabled(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("PPCGPU_VP");
+        off = e && e[0] == '0';
+    }
+    return off;
+}
+
 static void gpu_debug_log(const char *fmt, ...)
 {
     /* Per-access debug log: opt-in (PPCGPU_DEBUG_LOG=1).  It writes and
@@ -886,6 +899,7 @@ static void ppc_mac_gpu_vblank(void *opaque)
 
     /* Set VBlank interrupt status */
     s->regs.gen_int_status |= R200_CRTC_VBLANK_INT;
+    s->regs.stall_irqs++;
 
     /* Toggle VBLANK_SAVE in CRTC_STATUS */
     s->regs.crtc_status ^= R200_CRTC_VBLANK_SAVE;
@@ -1582,6 +1596,40 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
     }
 }
 
+/*
+ * Keep the copy of the ring's read pointer that lives in memory.
+ *
+ * Mac OS X's ATI driver can read the read pointer either from the card or
+ * from a copy the card keeps in memory, and it chooses at start-up.  When
+ * it reads the copy and nothing ever writes it, the driver finds the ring
+ * permanently full: it then waits a millisecond and looks again, a
+ * thousand times, for every batch of commands it wants to send.  Halo
+ * drew its first frames and then crawled, with its sound looping, because
+ * of this.
+ */
+static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
+{
+    uint32_t addr = s->regs.cp_rb_rptr_addr & ~3u;
+    hwaddr phys;
+
+    if (!addr || (s->regs.cp_rb_cntl & (1u << 27))) {
+        return;                       /* nowhere to write, or the guest said not to */
+    }
+    if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
+        !ppc_mac_gpu_agp_translate(s, addr, &phys)) {
+        if (addr + 4 > s->vram_size) {
+            return;
+        }
+        stl_be_p((uint8_t *)memory_region_get_ram_ptr(&s->vram) + addr,
+                 s->regs.cp_rb_rptr);
+        memory_region_set_dirty(&s->vram, addr, 4);
+        return;
+    }
+    uint32_t be_val = cpu_to_be32(s->regs.cp_rb_rptr);
+    address_space_write(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
+                        &be_val, 4);
+}
+
 static void ppc_mac_gpu_scratch_writeback(PPCMacGPUState *s, int reg_idx)
 {
     if (reg_idx >= 0 && reg_idx <= 5) {
@@ -2129,6 +2177,17 @@ static uint32_t r200_datatype_bpp(uint32_t dt)
 
 static inline uint32_t gmc_dst_bpp(uint32_t gmc)
 {
+    /* POWEREMU_TEX_TRACE: each 2D pixel format the guest asks for, once,
+     * to find where a program's video frames really go (Halo's logos come
+     * out green and magenta, and they are not 3D textures). */
+    if (getenv("POWEREMU_TEX_TRACE")) {
+        static uint32_t seen_2d;
+        uint32_t dt = (gmc >> 8) & 0xF;
+        if (!(seen_2d & (1u << dt))) {
+            seen_2d |= 1u << dt;
+            fprintf(stderr, "ppc-mac-gpu 2d: datatype %u (gmc=0x%08x)\n", dt, gmc);
+        }
+    }
     return r200_datatype_bpp(gmc >> 8);
 }
 
@@ -4069,6 +4128,29 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
      * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
      * byte order, which is what 16/32-bit texel decoding expects. */
     t->swap = offset & 3;
+    if (getenv("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
+        static uint32_t seen_tex;
+        if (t->format < 32 && !(seen_tex & (1u << t->format))) {
+            seen_tex |= 1u << t->format;
+            fprintf(stderr, "ppc-mac-gpu tex: format %u (0x%08x) %ux%u offset=0x%08x\n",
+                    t->format, format, t->width, t->height, offset);
+        }
+    }
+    /* POWEREMU_YUV_TRACE: what a YUV texture really holds, to tell the
+     * 4:2:2 orderings apart (Tiger's welcome movie vs Halo's logos). */
+    if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+        static int yuv_raw_logged;
+        if (yuv_raw_logged++ < 12) {
+            uint32_t o = offset & ~0x1Fu;
+            const uint8_t *b = (o >= fb_base && o - fb_base < s->vram_size)
+                               ? (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + (o - fb_base) : NULL;
+            fprintf(stderr, "ppc-mac-gpu yuv raw: unit %d format=0x%08x fmt=%d swap=%d offset=0x%08x "
+                     "filter=0x%08x in_vram=%d size=%dx%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     n, format, t->format, t->swap, offset, filter, b != NULL, t->width, t->height,
+                     b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0,
+                     b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0);
+        }
+    }
     offset &= ~0x1Fu;
     if (offset < fb_base || offset - fb_base >= s->vram_size) {
         /*
@@ -4112,6 +4194,27 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
             qemu_log("ppc-mac-gpu r200: AGP texture %ux%u fmt %u at 0x%08x\n",
                      t->width, t->height, t->format, offset);
         }
+        /* POWEREMU_YUV_TRACE: the frame's own bytes, from the middle row,
+         * which say which 4:2:2 order a program really uses. */
+        if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+            /* Log each new kind of frame, not just the first ones: a game
+             * plays several videos and only some come out wrong. */
+            static uint64_t last_kind;
+            static int agp_yuv_logged;
+            uint64_t kind = ((uint64_t)t->format << 40) | ((uint64_t)t->swap << 36)
+                          | ((uint64_t)t->width << 20) | ((uint64_t)t->height << 4);
+            if (kind != last_kind && agp_yuv_logged++ < 40) {
+                last_kind = kind;
+                uint64_t mid = (uint64_t)t->pitch * (t->height / 2);
+                const uint8_t *m = (mid + 16 <= len) ? buf + mid : buf;
+                fprintf(stderr, "ppc-mac-gpu yuv agp: fmt %u swap %u %ux%u pitch %u "
+                        "mid=%02x %02x %02x %02x %02x %02x %02x %02x  "
+                        "first=%02x %02x %02x %02x\n",
+                        t->format, t->swap, t->width, t->height, t->pitch,
+                        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                        buf[0], buf[1], buf[2], buf[3]);
+            }
+        }
         t->host_data = buf;
         t->offset = 0;
         return;
@@ -4122,7 +4225,7 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
 /* TCL constant memory accessors (vector address, component). */
 static inline float r200_vf(PPCMacGPUState *s, uint32_t addr, int c)
 {
-    return r200_f32(s->regs.tcl_vec[addr & 0x1ff][c]);
+    return r200_f32(s->regs.tcl_vec[addr & 0x7ff][c]);
 }
 
 /* 4x4 matrix N lives at vector address 0x80 + 4N, one row per vector. */
@@ -4361,29 +4464,43 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     uint32_t fmt0 = R3D(0x2088), fmt1 = R3D(0x208C);
     enum { A_POS, A_NORMAL, A_COLOR0, A_COLOR1, A_SKIP, A_TEX0 };
     int attr_kind[20], attr_extra[20], attr_comps[20], nattr = 0;
-#define ADD_ATTR(k, e, c) do { attr_kind[nattr] = (k); attr_extra[nattr] = (e); \
-                               attr_comps[nattr++] = (c); } while (0)
-    ADD_ATTR(A_POS, 0, 2 + (fmt0 & 1) + ((fmt0 >> 1) & 1));
+    /*
+     * The chip's own slot number for each attribute (0 position, 1 blend
+     * weights, 2 normal, 3 fog, 4-7 colours, 8-13 texture coordinates).
+     * A vertex program reads its inputs by slot, including the ones the
+     * fixed-function path throws away, so every attribute is kept.
+     */
+    int attr_slot[20];
+#define ADD_ATTR(k, e, c, sl) do { attr_kind[nattr] = (k); attr_extra[nattr] = (e); \
+                                   attr_slot[nattr] = (sl); \
+                                   attr_comps[nattr++] = (c); } while (0)
+    ADD_ATTR(A_POS, 0, 2 + (fmt0 & 1) + ((fmt0 >> 1) & 1), 0);
     if ((fmt0 >> 2) & 7) {
-        ADD_ATTR(A_SKIP, 0, (fmt0 >> 2) & 7);          /* blend weights */
+        ADD_ATTR(A_SKIP, 0, (fmt0 >> 2) & 7, 1);       /* blend weights */
     }
     if (fmt0 & (1u << 6)) {
-        ADD_ATTR(A_NORMAL, 0, 3);
+        ADD_ATTR(A_NORMAL, 0, 3, 2);
     }
     if (fmt0 & (1u << 7)) {
-        ADD_ATTR(A_SKIP, 0, 1);                        /* point size */
+        ADD_ATTR(A_SKIP, 0, 1, 15);                    /* point size */
+    }
+    if (fmt0 & (1u << 8)) {
+        /* Fog, one float, in the stream between the normal and the
+         * colours. It was missing here, and a vertex that carries it
+         * shifted every attribute after it by one word. */
+        ADD_ATTR(A_SKIP, 0, 1, 3);
     }
     for (int c = 0; c < 8; c++) {
         uint32_t cf = (fmt0 >> (11 + 2 * c)) & 3;
         if (cf) {
             ADD_ATTR(c == 0 ? A_COLOR0 : c == 1 ? A_COLOR1 : A_SKIP, cf,
-                     cf == 1 ? 1 : cf == 2 ? 3 : 4);
+                     cf == 1 ? 1 : cf == 2 ? 3 : 4, 4 + c);
         }
     }
     for (int t = 0; t < R200_MAX_TEX; t++) {
         uint32_t n = (fmt1 >> (3 * t)) & 7;
         if (n) {
-            ADD_ATTR(A_TEX0 + t, 0, n);
+            ADD_ATTR(A_TEX0 + t, 0, n, 8 + t);
         }
     }
 #undef ADD_ATTR
@@ -4445,15 +4562,53 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     }
 
     /* ---- Transform state ---- */
-    bool tcl = R3D(0x2080) & 1;                     /* SE_VAP_CNTL */
+    uint32_t vap = R3D(0x2080);                     /* SE_VAP_CNTL */
+    bool tcl = vap & 1;
+    /*
+     * Bit 2 puts the chip in vertex-program mode: each vertex is
+     * transformed by a program the guest uploaded, not by the matrices and
+     * lights below -- which share the same memory, so they hold program
+     * instructions now and must not be read.  The programs themselves are
+     * not run yet, so such a draw is skipped rather than drawn wrongly.
+     */
+    bool vertex_program = (vap & 4) != 0;
+    if (vertex_program) {
+        static uint32_t last_cntl[2];
+        uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
+        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && getenv("POWEREMU_VP_TRACE")) {
+            uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
+            last_cntl[0] = c1; last_cntl[1] = c2;
+            fprintf(stderr, "ppc-mac-gpu vp inputs: fmt0=0x%08x fmt1=0x%08x arrays=%u "
+                    "route=%08x %08x %08x %08x vte=0x%08x\n",
+                    R3D(0x2088), R3D(0x208C), narrays,
+                    R3D(0x2254), R3D(0x2258), R3D(0x225C), R3D(0x2260), R3D(0x20B0));
+            for (int a = 0; a < nattr; a++) {
+                fprintf(stderr, "    attribute %d: slot %2d, %d words\n",
+                        a, attr_slot[a], attr_comps[a]);
+            }
+            fprintf(stderr, "ppc-mac-gpu vp program: vap=0x%08x instructions %u..%u "
+                    "(position settled at %u), constants from %u, up to %u\n", vap,
+                    first, last, (c1 >> 10) & 0x3FF, c2 & 0xFF, (c2 >> 16) & 0xFF);
+            for (uint32_t i = first; i <= last && i < 128; i++) {
+                const uint32_t *w = s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(i)];
+                PPCMacGPUVPInst in;
+                char text[128];
+                ppc_mac_gpu_vp_decode(w, &in);
+                ppc_mac_gpu_vp_disasm(&in, text, sizeof(text));
+                fprintf(stderr, "  %3u: %08x %08x %08x %08x  %s\n",
+                        i, w[0], w[1], w[2], w[3], text);
+            }
+        }
+    }
     uint32_t mvp_n = R3D(0x2238) & 0x1F;            /* MODELPROJECT_0 */
     float mvp[4][4];
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 4; c++) {
-            mvp[r][c] = r200_f32(s->regs.tcl_vec[(0x80 + 4 * mvp_n + r) & 0x1ff][c]);
+            mvp[r][c] = vertex_program ? (r == c ? 1.0f : 0.0f)
+                : r200_f32(s->regs.tcl_vec[(0x80 + 4 * mvp_n + r) & 0x7ff][c]);
         }
     }
-    bool lighting = tcl && (R3D(0x2268) & 1);
+    bool lighting = tcl && !vertex_program && (R3D(0x2268) & 1);
     uint32_t tcl_fog = tcl ? (R3D(0x22C0) >> 8) & 3 : 0;
     uint32_t texproc0 = tcl ? R3D(0x22B0) : 0, texproc1 = R3D(0x22B4);
     float mv[4][4], itmv[4][4], texmat[R200_MAX_TEX][4][4];
@@ -4521,6 +4676,91 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
         }
     }
 
+    /*
+     * A vertex program, if one is in charge: decoded once for the draw,
+     * with the constants it reads.  Which input register sees which
+     * attribute slot is fixed in the hardware.
+     */
+    /* Decoded once and kept: the same program runs for draw after draw. */
+    static PPCMacGPUVPInst vp_prog[PPC_MAC_GPU_VP_MAX_INST];
+    static uint32_t vp_decoded_for[2];
+    static uint32_t vp_decoded_head[4];
+    static float vp_consts[PPC_MAC_GPU_VP_CONSTS][4];
+    uint32_t vp_count = 0;
+    /*
+     * Which program input each vertex slot feeds.  Fixed in the hardware
+     * for the named attributes; the colour slots carry a program's own
+     * attributes (Halo keeps bone indices and weights there) and which
+     * input each lands in is the driver's business, not the format's.
+     * PPCGPU_VP_MAP picks between the orders while that is settled:
+     * 0 (default) 2,3,4,5 -- what the Linux driver documents
+     * 1           4,5,2,3      2  5,4,2,3      3  3,2,5,4
+     */
+    int vp_slot_to_input[16] = {
+        /* 0 pos */ 0, /* 1 weights */ 12, /* 2 normal */ 1, /* 3 fog */ 15,
+        /* 4-7 colours */ 2, 3, 4, 5,
+        /* 8-13 texture coordinates */ 6, 7, 8, 9, 10, 11,
+        /* 14 second position */ 13, /* 15 point size */ 14,
+    };
+    /*
+     * The colour slots carry a program's own attributes, and which input
+     * each lands in depends on how many the draw declares -- the driver
+     * does not use one fixed arrangement.  Measured in Halo: the last two
+     * colour slots always feed inputs 2 and 3 (its bone indices and
+     * weights), and any earlier slots feed 5 and 4, highest first.  With
+     * two slots that is the plain 2, 3 its interface draws want.
+     * PPCGPU_VP_MAP=0 goes back to the plain order throughout.
+     */
+    {
+        int colour_slot[4], ncolour = 0;
+        for (int c = 0; c < 4; c++) {
+            if ((fmt0 >> (11 + 2 * c)) & 3) {
+                colour_slot[ncolour++] = 4 + c;
+            }
+        }
+        const char *e = getenv("PPCGPU_VP_MAP");
+        /* 0 plain, 1 highest slot first, 2 lowest first -- 2 is what makes
+         * Halo's sky come out right, and is the default. */
+        int mode = e ? atoi(e) : 2;
+        if (mode && ncolour >= 2) {
+            for (int i = 0; i < ncolour - 2; i++) {
+                /* The slots left over after the last two carry the normal
+                 * and the texture coordinates; which is which is the one
+                 * thing the draw doesn't say, so it can be swapped here. */
+                vp_slot_to_input[colour_slot[i]] = mode == 1 ? 5 - i : 4 + i;
+            }
+            vp_slot_to_input[colour_slot[ncolour - 2]] = 2;
+            vp_slot_to_input[colour_slot[ncolour - 1]] = 3;
+        }
+    }
+    if (vertex_program && !gpu_vp_disabled()) {
+        uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
+        uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
+        uint32_t cbase = c2 & 0xFF;
+        if (last >= first && last < PPC_MAC_GPU_VP_MAX_INST) {
+            const uint32_t *head = s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(first)];
+            vp_count = last - first + 1;
+            if (vp_decoded_for[0] != c1 || vp_decoded_for[1] != first ||
+                memcmp(vp_decoded_head, head, sizeof(vp_decoded_head)) != 0) {
+                for (uint32_t i = 0; i < vp_count; i++) {
+                    ppc_mac_gpu_vp_decode(s->regs.tcl_vec[ppc_mac_gpu_vp_inst_addr(first + i)],
+                                          &vp_prog[i]);
+                }
+                vp_decoded_for[0] = c1;
+                vp_decoded_for[1] = first;
+                memcpy(vp_decoded_head, head, sizeof(vp_decoded_head));
+            }
+        }
+        for (uint32_t i = 0; i < PPC_MAC_GPU_VP_CONSTS; i++) {
+            const uint32_t *v = s->regs.tcl_vec[ppc_mac_gpu_vp_const_addr(cbase + i) & 0x7ff];
+            for (int c = 0; c < 4; c++) {
+                vp_consts[i][c] = r200_f32(v[c]);
+            }
+        }
+    }
+
+    s->regs.stall_draws++;
+
     /* ---- Fetch and transform vertices ---- */
     R200Vertex *verts = r200_draw_verts(s, nverts);
     memset(verts, 0, sizeof(R200Vertex) * nverts);
@@ -4528,6 +4768,14 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
         R200Vertex *o = &verts[v];
         float pos[4] = { 0, 0, 0, 1 };
         float nrm[3] = { 0, 0, 1 };
+        /* What a vertex program would read: every attribute, by slot. */
+        float slot[16][4];
+        if (vp_count) {
+            for (int i = 0; i < 16; i++) {
+                slot[i][0] = slot[i][1] = slot[i][2] = 0.0f;
+                slot[i][3] = 1.0f;
+            }
+        }
         o->color[0] = o->color[1] = o->color[2] = o->color[3] = 1.0f;
         for (int t = 0; t < R200_MAX_TEX; t++) {
             o->tex[t][3] = 1.0f;
@@ -4621,6 +4869,22 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 }
                 iv += have;
             }
+            if (vp_count) {
+                int sl = attr_slot[a] & 15;
+                uint32_t have = MIN(n, 4u);
+                for (uint32_t i = 0; i < have; i++) {
+                    slot[sl][i] = r200_f32(raw[i]);
+                }
+                /* A packed colour is four bytes, not four floats. */
+                if ((attr_kind[a] == A_COLOR0 || attr_kind[a] == A_COLOR1 ||
+                     attr_kind[a] == A_SKIP) && attr_extra[a] == 1 && sl >= 4 && sl <= 7) {
+                    uint32_t c = raw[0];
+                    slot[sl][0] = ((c >> 16) & 0xFF) / 255.0f;
+                    slot[sl][1] = ((c >> 8) & 0xFF) / 255.0f;
+                    slot[sl][2] = (c & 0xFF) / 255.0f;
+                    slot[sl][3] = (c >> 24) / 255.0f;
+                }
+            }
             switch (attr_kind[a]) {
             case A_POS:
                 for (uint32_t i = 0; i < n && i < 4; i++) {
@@ -4685,7 +4949,61 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
         }
 
         float clip[4];
-        if (tcl) {
+        if (vp_count) {
+            PPCMacGPUVPState st;
+            memset(st.temp, 0, sizeof(st.temp));
+            memset(st.out_pos, 0, sizeof(st.out_pos));
+            memset(st.out_color0, 0, sizeof(st.out_color0));
+            memset(st.out_color1, 0, sizeof(st.out_color1));
+            memset(st.out_tex, 0, sizeof(st.out_tex));
+            memset(st.out_fog, 0, sizeof(st.out_fog));
+            memset(st.out_psize, 0, sizeof(st.out_psize));
+            st.constant = (const float (*)[4])vp_consts;
+            st.wrote_pos = false;
+            st.unknown_op = 0;
+            for (int i = 0; i < 16; i++) {
+                memcpy(st.in[vp_slot_to_input[i]], slot[i], sizeof(slot[i]));
+            }
+            st.out_color0[3] = st.out_color1[3] = 1.0f;
+            for (int t = 0; t < 6; t++) {
+                st.out_tex[t][3] = 1.0f;
+            }
+            ppc_mac_gpu_vp_run(&st, vp_prog, vp_count);
+            if (getenv("POWEREMU_VP_TRACE")) {
+                static int shown; static uint32_t shown_for;
+                if (vp_count != shown_for) { shown_for = vp_count; shown = 0; }
+                if (shown++ < 3) {
+                    fprintf(stderr, "ppc-mac-gpu vp vertex (%u instructions):\n"
+                            "   v0=%.3f %.3f %.3f %.3f\n"
+                            "   v2=%.3f %.3f %.3f %.3f\n"
+                            "   v3=%.3f %.3f %.3f %.3f\n"
+                            "   v4=%.3f %.3f %.3f %.3f\n"
+                            "   v5=%.3f %.3f %.3f %.3f\n"
+                            "   c5=%.3f %.3f %.3f %.3f  c9=%.3f %.3f %.3f %.3f\n"
+                            "   -> pos=%.3f %.3f %.3f %.3f\n",
+                            vp_count,
+                            st.in[0][0], st.in[0][1], st.in[0][2], st.in[0][3],
+                            st.in[2][0], st.in[2][1], st.in[2][2], st.in[2][3],
+                            st.in[3][0], st.in[3][1], st.in[3][2], st.in[3][3],
+                            st.in[4][0], st.in[4][1], st.in[4][2], st.in[4][3],
+                            st.in[5][0], st.in[5][1], st.in[5][2], st.in[5][3],
+                            vp_consts[5][0], vp_consts[5][1], vp_consts[5][2], vp_consts[5][3],
+                            vp_consts[9][0], vp_consts[9][1], vp_consts[9][2], vp_consts[9][3],
+                            st.out_pos[0], st.out_pos[1], st.out_pos[2], st.out_pos[3]);
+                }
+            }
+            memcpy(clip, st.out_pos, sizeof(clip));
+            memcpy(o->color, st.out_color0, sizeof(o->color));
+            memcpy(o->spec, st.out_color1, sizeof(o->spec));
+            for (int t = 0; t < R200_MAX_TEX && t < 6; t++) {
+                memcpy(o->tex[t], st.out_tex[t], sizeof(o->tex[t]));
+            }
+            if (st.unknown_op) {
+                r200_warn_once(&r200_warned, 1024,
+                               "vertex program opcode %u not modelled",
+                               st.unknown_op);
+            }
+        } else if (tcl) {
             for (int r = 0; r < 4; r++) {
                 clip[r] = mvp[r][0] * pos[0] + mvp[r][1] * pos[1] +
                           mvp[r][2] * pos[2] + mvp[r][3] * pos[3];
@@ -6768,6 +7086,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
                                     uint32_t ib_size_dw)
 {
     if (ib_size_dw == 0 || ib_size_dw > 0x100000) {
+        s->regs.stall_ib_lost++;
         return;
     }
 
@@ -6781,6 +7100,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         uint64_t ib_end = (uint64_t)ib_base + (uint64_t)ib_size_dw * 4;
         if (ib_end > s->vram_size) {
             gpu_debug_log("IB_EXEC: neither GART nor VRAM (base=0x%x)", ib_base);
+            s->regs.stall_ib_lost++;
             return;
         }
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -6790,6 +7110,8 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         }
     }
 
+    s->regs.stall_ib_done++;
+    s->regs.stall_ib_dwords += ib_size_dw;
     ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
     g_free(ib_data);
 }
@@ -6870,8 +7192,21 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     g_free(rb_data);
 }
 
+/* The last command packets pushed in by hand, for the stall report. */
+static struct { uint32_t hdr, type, opcode, count; } pm4_recent[32];
+static unsigned pm4_recent_n;
+
 static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
 {
+    s->regs.stall_pio_dwords++;
+    s->regs.csq_just_submitted = true;
+    if (s->pm4_pkt_count == 0) {
+        unsigned k = pm4_recent_n++ & 31;
+        pm4_recent[k].hdr = val;
+        pm4_recent[k].type = (val >> 30) & 3;
+        pm4_recent[k].opcode = (val >> 8) & 0xFF;
+        pm4_recent[k].count = ((val >> 16) & 0x3FFF) + 1;
+    }
     if (s->pm4_pkt_count == 0) {
         /* New packet header */
         uint32_t type = (val >> 30) & 3;
@@ -6918,7 +7253,7 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
         }
     } else {
         /* Data word for current packet */
-        if (s->pm4_fifo_idx < 64) {
+        if (s->pm4_fifo_idx < ARRAY_SIZE(s->pm4_fifo)) {
             s->pm4_fifo[s->pm4_fifo_idx++] = val;
         }
         s->pm4_pkt_count--;
@@ -7054,6 +7389,125 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
     uint64_t val = 0;
+
+    /*
+     * POWEREMU_STALL_TRACE: the last register accesses before the guest
+     * stops drawing.  A game that renders and then sits there is waiting
+     * for something; this says what it touched on the way in, and what it
+     * keeps touching while stuck.
+     */
+    if (getenv("POWEREMU_STALL_TRACE")) {
+        static struct { uint32_t addr, val; bool wr; } ring[256];
+        static unsigned n;
+        static int64_t last_draw_seen;
+        static bool dumped;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        ring[n & 255].addr = addr;
+        ring[n & 255].val = 0;
+        ring[n & 255].wr = false;
+        n++;
+        if (s->regs.stall_draws != s->regs.stall_draws_seen) {
+            s->regs.stall_draws_seen = s->regs.stall_draws;
+            last_draw_seen = now;
+            dumped = false;
+        }
+        if (!dumped && last_draw_seen && now - last_draw_seen > 4000) {
+            dumped = true;
+            fprintf(stderr, "ppc-mac-gpu stalled: no drawing for 4 s.\n"
+                    "  fences: reg0=%u reg1=%u reg2=%u reg3=%u "
+                    "(copy at 0x%08x, enabled 0x%x)\n"
+                    "  ring: rptr=%u wptr=%u, copy kept at 0x%08x; "
+                    "commands by hand: %llu dwords, through the ring: %llu\n"
+                    "  buffers fetched from memory: %llu carried out (%llu dwords), "
+                    "%llu not found\n"
+                    "  interrupts: asked for 0x%08x, pending 0x%08x, "
+                    "%llu raised\n"
+                    "  the fence copy lands in %s\n"
+                    "  the last %u registers the guest touched:\n",
+                    s->regs.scratch_reg[0], s->regs.scratch_reg[1],
+                    s->regs.scratch_reg[2], s->regs.scratch_reg[3],
+                    s->regs.scratch_addr, s->regs.scratch_umsk,
+                    s->regs.cp_rb_rptr, s->regs.cp_rb_wptr,
+                    s->regs.cp_rb_rptr_addr,
+                    (unsigned long long)s->regs.stall_pio_dwords,
+                    (unsigned long long)s->regs.stall_ring_dwords,
+                    (unsigned long long)s->regs.stall_ib_done,
+                    (unsigned long long)s->regs.stall_ib_dwords,
+                    (unsigned long long)s->regs.stall_ib_lost,
+                    s->regs.gen_int_cntl, s->regs.gen_int_status,
+                    (unsigned long long)s->regs.stall_irqs,
+                    ({
+                        hwaddr ph;
+                        ppc_mac_gpu_gart_translate(s, s->regs.scratch_addr, &ph) ? "memory the guest shares (through GART)"
+                            : ppc_mac_gpu_agp_translate(s, s->regs.scratch_addr, &ph) ? "memory the guest shares (through AGP)"
+                            : s->regs.scratch_addr + 4 <= s->vram_size ? "the card's own memory -- the guest cannot see it there"
+                            : "nowhere at all";
+                    }), 256u);
+            fprintf(stderr, "  the last commands it pushed:\n");
+            for (unsigned i = 0; i < 32; i++) {
+                unsigned k = (pm4_recent_n + i) & 31;
+                if (!pm4_recent[k].hdr) {
+                    continue;
+                }
+                if (pm4_recent[k].type == 0) {
+                    fprintf(stderr, "    write %u register(s) from %s(0x%03x)\n",
+                            pm4_recent[k].count,
+                            ppc_mac_gpu_reg_name((pm4_recent[k].hdr & 0x7FFF) * 4),
+                            (pm4_recent[k].hdr & 0x7FFF) * 4);
+                } else {
+                    fprintf(stderr, "    type %u opcode 0x%02x, %u word(s)\n",
+                            pm4_recent[k].type, pm4_recent[k].opcode,
+                            pm4_recent[k].count);
+                }
+            }
+            fprintf(stderr, "  the last %u registers the guest touched:\n", 32u);
+            for (unsigned i = 224; i < 256; i++) {
+                unsigned k = (n + i) & 255;
+                fprintf(stderr, "    %s %s(0x%03x)\n", ring[k].wr ? "wrote" : "read",
+                        ppc_mac_gpu_reg_name(ring[k].addr), ring[k].addr);
+            }
+        }
+    }
+
+    /*
+     * POWEREMU_POLL_TRACE: which registers the guest reads over and over.
+     * A program waiting on the card sits in a loop reading one of them, and
+     * this says which -- Halo's title screen draws and then stops, with its
+     * sound looping, so something it waits for never arrives.
+     */
+    if (getenv("POWEREMU_POLL_TRACE")) {
+        static uint32_t count[0x4000 / 4];
+        static int64_t next_report;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (addr < 0x4000) {
+            count[addr / 4]++;
+        }
+        if (now > next_report) {
+            if (next_report) {
+                uint32_t top[5] = { 0 }, topi[5] = { 0 };
+                for (uint32_t i = 0; i < 0x4000 / 4; i++) {
+                    for (int k = 0; k < 5; k++) {
+                        if (count[i] > top[k]) {
+                            for (int j = 4; j > k; j--) {
+                                top[j] = top[j - 1]; topi[j] = topi[j - 1];
+                            }
+                            top[k] = count[i]; topi[k] = i;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "ppc-mac-gpu polled most:");
+                for (int k = 0; k < 5 && top[k]; k++) {
+                    fprintf(stderr, " %s(0x%03x)x%u", ppc_mac_gpu_reg_name(topi[k] * 4),
+                            topi[k] * 4, top[k]);
+                }
+                fprintf(stderr, "\n");
+                memset(count, 0, sizeof(count));
+            }
+            next_report = now + 5000;
+        }
+    }
 
     if (addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END) {
         return size == 4 ? ppc_mac_gpu_hwc_read(s, addr - PPC_MAC_GPU_HWC_BASE) : 0;
@@ -7253,15 +7707,19 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = 0;
         break;
     case R200_CRTC_VLINE_CRNT_VLINE: {
-        /* Return a cycling scanline position based on virtual time.
-         * bits[11:0] = current vertical line position (CRNT_VLINE).
-         * The kext polls this for VSync timing. */
+        /*
+         * A scanline that walks with time.  The line the beam is on is
+         * reported in bits [26:16]; bits [10:0] are the line the guest
+         * asked to be told about, which it wrote here.  The current line
+         * used to be returned in the low bits, where nothing reads it, so
+         * anything waiting for a scanline saw zero for ever.
+         */
         uint32_t vtotal = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
         if (vtotal == 0) vtotal = 628; /* safety */
         int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         uint64_t frame_ns = NANOSECONDS_PER_SECOND / 60;
         uint32_t line = (uint32_t)((now_ns % frame_ns) * vtotal / frame_ns);
-        val = line & 0xFFF;
+        val = (s->regs.crtc_vline & 0x7FF) | ((line & 0x7FF) << 16);
         break;
     }
     case R200_CRTC_CRNT_FRAME:
@@ -7421,7 +7879,45 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * When mode enables indirect queues (mode 7 = PRIBM+INDBM),
          * the kext checks ALL enabled queue counts.
          */
-        val = (s->regs.cp_csq_cntl & 0xFF000000) | 0x202040;
+        /*
+         * How much is still queued.  Everything the guest submits is
+         * carried out before the write returns, so in truth nothing ever
+         * is -- but reporting zero here stops Mac OS X booting: the
+         * driver's engine bring-up waits for these counts to become
+         * non-zero, and hangs at the grey Apple with no spinner if they
+         * never do.  So the counts stay as they were, and PPCGPU_CSQ_IDLE=1
+         * reports an empty queue for anyone chasing a driver that waits
+         * for the queue to drain instead.
+         */
+        /*
+         * How much is still queued.  Everything submitted is carried out
+         * before the write returns, so the honest answer is "nothing" --
+         * but a driver bringing the engine up wants to see the queue
+         * non-empty at least once, and reporting zero from the start left
+         * Mac OS X hanging at the grey Apple.  So: busy on the first read
+         * after something is submitted, empty on the reads after that.
+         * A driver waiting for the queue to drain now gets its answer,
+         * which is what left Halo waiting for ever.
+         * PPCGPU_CSQ=busy keeps the old always-busy reply, =idle always
+         * reports empty.
+         */
+        {
+            static int mode = -1;
+            if (mode < 0) {
+                const char *e = getenv("PPCGPU_CSQ");
+                mode = (e && !strcmp(e, "busy")) ? 1
+                     : (e && !strcmp(e, "idle")) ? 2 : 0;
+            }
+            uint32_t top = s->regs.cp_csq_cntl & 0xFF000000;
+            if (mode == 1) {
+                val = top | 0x202040;
+            } else if (mode == 2) {
+                val = top;
+            } else {
+                val = s->regs.csq_just_submitted ? (top | 0x202040) : top;
+                s->regs.csq_just_submitted = false;
+            }
+        }
         break;
     case R200_SCRATCH_UMSK:
         val = s->regs.scratch_umsk;
@@ -7505,6 +8001,14 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
         int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
         val = s->regs.scratch_reg[scratch_idx];
+        if (getenv("POWEREMU_FENCE_TRACE")) {
+            static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
+            if (val != last[scratch_idx] && n++ < 40) {
+                last[scratch_idx] = val;
+                fprintf(stderr, "ppc-mac-gpu fence: guest reads reg%d = %u\n",
+                        scratch_idx, val);
+            }
+        }
         gpu_debug_log("STATUS_RD SCRATCH_REG%d -> 0x%08x",
                       scratch_idx, val);
         /*
@@ -7876,13 +8380,17 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
 {
     switch (addr) {
     case 0x2200:    /* SE_TCL_VECTOR_INDX_REG */
-        s->regs.tcl_vec_addr = val & 0x1ff;
+        s->regs.tcl_vec_addr = val & 0x7ff;
         s->regs.tcl_vec_stride = (val >> 16) & 0xff;
         s->regs.tcl_vec_comp = 0;
         break;
     case 0x2204:    /* SE_TCL_VECTOR_DATA_REG */
-        s->regs.tcl_vec[s->regs.tcl_vec_addr & 0x1ff][s->regs.tcl_vec_comp] = val;
+        s->regs.tcl_vec[s->regs.tcl_vec_addr & 0x7ff][s->regs.tcl_vec_comp] = val;
         if (++s->regs.tcl_vec_comp == 4) {
+            uint32_t a = s->regs.tcl_vec_addr & 0x7ff;
+            /* POWEREMU_VP_TRACE: the vertex programs the guest uploads.
+             * Instructions sit at 0x080-0x0BF and 0x180-0x1BF, four dwords
+             * each; everything else here is constants, matrices or lights. */
             s->regs.tcl_vec_comp = 0;
             s->regs.tcl_vec_addr += s->regs.tcl_vec_stride ? s->regs.tcl_vec_stride : 1;
         }
@@ -7892,6 +8400,14 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
         s->regs.tcl_scalar_stride = (val >> 16) & 0xff;
         break;
     case 0x220C:    /* SE_TCL_SCALAR_DATA_REG */
+        if (getenv("POWEREMU_VP_TRACE")) {
+            static uint8_t seen_scalar[0x200];
+            uint32_t sa = s->regs.tcl_scalar_addr & 0x1ff;
+            if (!seen_scalar[sa]) {
+                seen_scalar[sa] = 1;
+                fprintf(stderr, "ppc-mac-gpu scalar[%03x] %08x\n", sa, val);
+            }
+        }
         s->regs.tcl_scalar[s->regs.tcl_scalar_addr & 0x1ff] = val;
         s->regs.tcl_scalar_addr += s->regs.tcl_scalar_stride ? s->regs.tcl_scalar_stride : 1;
         break;
@@ -8319,12 +8835,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         gpu_debug_log("CP_SETUP RB_BASE=0x%08x", val);
         trace_ppc_mac_gpu_cp_ring_setup(val, s->regs.cp_rb_cntl);
         break;
+    case R200_CP_RB_RPTR_ADDR:
+        s->regs.cp_rb_rptr_addr = val;
+        ppc_mac_gpu_rptr_writeback(s);
+        break;
     case R200_CP_RB_CNTL:
         s->regs.cp_rb_cntl = val;
         gpu_debug_log("CP_SETUP RB_CNTL=0x%08x (log2size=%u)", val, val & 0x3f);
         break;
     case R200_CP_RB_RPTR:
         s->regs.cp_rb_rptr = val;
+        ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
         break;
     case R200_CP_RB_WPTR: {
@@ -8339,13 +8860,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
          */
         if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
+            s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
             r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
                                                           : val;
             ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
         }
 
-        /* Mark all consumed */
+        /* Everything is carried out here, so the ring is empty again --
+         * in the card's own register and in the copy the driver may be
+         * reading from memory instead. */
         s->regs.cp_rb_rptr = val;
+        ppc_mac_gpu_rptr_writeback(s);
         /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
          * sees a different value after we process commands. */
         s->regs.cp_csq_stat_counter++;
@@ -8462,6 +8987,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* Scratch registers with writeback */
     case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
         int idx = (addr - R200_SCRATCH_REG0) / 4;
+
         s->regs.scratch_reg[idx] = val;
         r200_scratch_write(s, idx, val);
         break;
@@ -8514,7 +9040,12 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case R200_DAC_RANGE_CNTL:     /* 0x0484 */
     case R200_GENMO_WT:           /* 0x03C2 */
     case R200_CUR2_OFFSET:        /* 0x0360 */
-    case R200_CRTC_VLINE_CRNT_VLINE: /* 0x0210 - write target vline */
+        break;
+
+    case R200_CRTC_VLINE_CRNT_VLINE:
+        /* The line the guest wants to be told about; the line the beam is
+         * on is handed back in the upper bits when this is read. */
+        s->regs.crtc_vline = val & 0x7FF;
         break;
 
     /* 3D engine registers (0x1C00-0x3FFF) — store in shadow array

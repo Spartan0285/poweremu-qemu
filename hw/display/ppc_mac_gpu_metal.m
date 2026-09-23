@@ -6360,7 +6360,10 @@ static void r200_metal_warn(uint32_t bit, const char *msg, uint32_t a, uint32_t 
 {
     if (!(r200_metal_warned & bit)) {
         r200_metal_warned |= bit;
-        qemu_log("ppc-mac-gpu r200: %s (0x%x, 0x%x)\n", msg, a, b);
+        /* Each of these once, where they can be seen: they say which part
+         * of a scene the renderer left out (a texture format it doesn't
+         * know yet shows up as a missing surface). */
+        fprintf(stderr, "ppc-mac-gpu r200: %s (0x%x, 0x%x)\n", msg, a, b);
     }
 }
 
@@ -6867,16 +6870,25 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             if (tu->format == 10 || tu->format == 11) {
                 /*
                  * YUV 4:2:2 (QuickTime movie frames: Warcraft III's
-                 * cinematics, Setup Assistant's welcome movie).  Undo the
-                 * TXOFFSET swap, then read the CPU byte order, which is
-                 * QuickTime's '2vuy' (Cb Y0 Cr Y1) for both formats: 11 was
-                 * verified on Warcraft III's opening movie, 10 on Tiger's
-                 * welcome movie (format 0xca, VRAM, no swap; first texels
-                 * a8 58 62 59 = Cb 168, Y 88, Cr 98, the movie's blue).  The
-                 * R200 names describe the GPU's little-endian view.  BT.601
-                 * video range into a BGRA texture.
+                 * cinematics, Tiger's welcome movie, Halo's opening logos).
+                 * Undo the TXOFFSET swap, then read the bytes as they lie.
+                 *
+                 * Which comes first, chroma or luma, is not the format
+                 * number alone.  Frames the driver has put in VRAM are
+                 * always '2vuy' (Cb Y0 Cr Y1): Tiger's welcome movie
+                 * (format 0xca, first texels a8 58 62 59) and Warcraft
+                 * III's cinematics both decode correctly that way.  A frame
+                 * the program keeps in its own memory and lets the card
+                 * read over AGP (client storage, as video players do) is
+                 * laid out as the program wrote it, and format 10 there is
+                 * 'yuvs' (Y0 Cb Y1 Cr): Halo's second logo reads
+                 * e6 7f e6 80, which is near-white as 'yuvs' and the
+                 * magenta we used to show as '2vuy'.  Its first logo, in
+                 * format 11 over AGP, is '2vuy' and was always right.
+                 * BT.601 video range into a BGRA texture.
                  */
                 uint32_t w = tu->width, h = tu->height;
+                bool luma_first = tu->host_data && tu->format == 10;
                 if (!tu->host_data &&
                     (uint64_t)tu->offset + (uint64_t)tu->pitch * h > vram_size) {
                     r200_metal_warn(0x8000, "YUV texture outside VRAM", tu->offset, h);
@@ -6897,8 +6909,12 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                         case 3: g[0] = b[2]; g[1] = b[3]; g[2] = b[0]; g[3] = b[1]; break;
                         default: memcpy(g, b, 4); break;
                         }
-                        /* '2vuy': Cb Y0 Cr Y1 */
-                        int cb = g[0], y0 = g[1], cr = g[2], y1 = g[3];
+                        int cb, y0, cr, y1;
+                        if (luma_first) {       /* 'yuvs': Y0 Cb Y1 Cr */
+                            y0 = g[0]; cb = g[1]; y1 = g[2]; cr = g[3];
+                        } else {                /* '2vuy': Cb Y0 Cr Y1 */
+                            cb = g[0]; y0 = g[1]; cr = g[2]; y1 = g[3];
+                        }
                         for (int k = 0; k < 2 && x + k < w; k++) {
                             float yy = 1.164f * ((k ? y1 : y0) - 16);
                             float r = yy + 1.596f * (cr - 128);
@@ -6910,6 +6926,23 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                             p8[2] = (uint8_t)MIN(MAX(r, 0.0f), 255.0f);
                             p8[3] = 255;
                         }
+                    }
+                }
+                if (getenv("POWEREMU_TEX_TRACE")) {
+                    static uint64_t last_kind;
+                    static int yuv_drawn;
+                    uint64_t kind = ((uint64_t)tu->format << 40) | ((uint64_t)tu->swap << 36)
+                                  | ((uint64_t)w << 20) | ((uint64_t)h << 4)
+                                  | (tu->host_data ? 1 : 0);
+                    if (kind != last_kind && yuv_drawn++ < 40) {
+                        last_kind = kind;
+                        fprintf(stderr, "ppc-mac-gpu yuv draw: fmt %u %ux%u swap %u%s "
+                                "src=%02x %02x %02x %02x -> bgra=%02x %02x %02x %02x\n",
+                                tu->format, w, h, tu->swap,
+                                luma_first ? " (AGP, luma first)" :
+                                tu->host_data ? " (AGP)" : " (VRAM)",
+                                src[0], src[1], src[2], src[3],
+                                out[0], out[1], out[2], out[3]);
                     }
                 }
                 MTLTextureDescriptor *yd = [MTLTextureDescriptor
@@ -6932,25 +6965,38 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 u.texsize[t][2] = 1.0f / w;
                 u.texsize[t][3] = 1.0f / h;
                 u.texfilt[t][0] = tu->filter;
-                static int yuv_logged;
-                if (yuv_logged++ < 3) {
-                    qemu_log("ppc-mac-gpu r200: YUV%s texture %ux%u swap %u%s\n",
-                             tu->format == 11 ? " YVYU" : " VYUY", w, h, tu->swap,
-                             tu->host_data ? " (AGP)" : "");
-                }
+
                 continue;
             }
             if (tu->format == 12 || tu->format == 14 || tu->format == 15) {
                 /*
                  * DXT1/3/5.  Compressed textures cannot be linear views of
                  * the VRAM buffer, so copy the blocks into a BC texture.
-                 * VRAM holds the CPU (big-endian) view; the GPU reads
-                 * little-endian, so each 32-bit word is byte-swapped back.
+                 *
+                 * The blocks are copied as they lie, wherever they live.
+                 * They used to be byte-swapped on the reasoning that VRAM
+                 * holds the big-endian CPU's view, and that turned every
+                 * surface in Halo into coloured speckle.  Reading one of
+                 * its textures straight out of VRAM settles it: decoded
+                 * untouched it is a metal hull with panels and a hatch,
+                 * while swapped by words, by halfwords, or reversed it is
+                 * noise.  The driver hands the card the blocks from the
+                 * game's files unchanged, and the card reads bytes.
                  */
                 uint32_t bs = tu->format == 12 ? 8 : 16;
                 uint32_t bw = (tu->width + 3) / 4, bh = (tu->height + 3) / 4;
                 uint32_t row = bw * bs;
-                if (tu->pitch >= row && tu->pitch < row * 8) {
+                /*
+                 * The blocks of one row, end to end.  The pitch register is
+                 * not it: for DXT1 the guest leaves the figure it would use
+                 * for 16-byte blocks, so it reads twice too large (Halo's
+                 * 2048x128 texture says 8192 where the rows are 4096 apart),
+                 * and following it skipped every other row of blocks and ran
+                 * off the end -- the whole title screen came out speckled.
+                 * A padded texture would say exactly what it means, so only
+                 * an exact match is taken.
+                 */
+                if (tu->pitch == row) {
                     row = tu->pitch;
                 }
                 if (!dev.supportsBCTextureCompression ||
@@ -6964,9 +7010,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                     const uint32_t *srow = (const uint32_t *)
                         ((tu->host_data ? tu->host_data : vram_ptr + tu->offset) +
                          (uint64_t)y * row);
-                    for (uint32_t i = 0; i < bw * bs / 4; i++) {
-                        blk[y * (bw * bs / 4) + i] = __builtin_bswap32(srow[i]);
-                    }
+                    memcpy(blk + y * (bw * bs / 4), srow, bw * bs);
                 }
                 MTLTextureDescriptor *cd = [MTLTextureDescriptor
                     texture2DDescriptorWithPixelFormat:
@@ -6991,10 +7035,12 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 u.texsize[t][3] = 1.0f / tu->height;
                 u.texfilt[t][0] = tu->filter;
                 static int dxt_logged;
-                if (dxt_logged++ < 3) {
-                    qemu_log("ppc-mac-gpu r200: DXT%u texture %ux%u at 0x%x\n",
-                             tu->format == 12 ? 1 : tu->format == 14 ? 3 : 5,
-                             tu->width, tu->height, tu->offset);
+                if (dxt_logged++ < 3 ||
+                    (getenv("POWEREMU_TEX_TRACE") && dxt_logged < 12)) {
+                    fprintf(stderr, "ppc-mac-gpu dxt: DXT%u %ux%u pitch %u at 0x%x%s\n",
+                            tu->format == 12 ? 1 : tu->format == 14 ? 3 : 5,
+                            tu->width, tu->height, row, tu->offset,
+                            tu->host_data ? " (AGP)" : " (VRAM)");
                 }
                 continue;
             }

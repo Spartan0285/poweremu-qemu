@@ -64,6 +64,7 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu.c',
   'ppc_mac_gpu_renderer_sw.c',
+  'ppc_mac_gpu_vp.c',
 ), pixman])
 
 system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])

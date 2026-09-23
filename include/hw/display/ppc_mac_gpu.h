@@ -233,8 +233,15 @@ struct R200Vertex;
 #define R200_CP_IB_BUFSZ              0x073C
 
 /* PM4 PIO FIFO data registers */
+/*
+ * Where a driver pushes command packets by hand (rather than through the
+ * ring): the primary queue fills 0x1000-0x12FF and the second 0x1300-0x13FF.
+ * Only the first eight words were accepted here, so every longer burst lost
+ * its tail -- including the write that says "this far is done", which Halo
+ * then waited on for ever while its sound looped.
+ */
 #define R200_PM4_FIFO_DATA_BASE       0x1000
-#define R200_PM4_FIFO_DATA_END        0x1020  /* exclusive */
+#define R200_PM4_FIFO_DATA_END        0x1400  /* exclusive */
 
 /* Scratch registers */
 #define R200_SCRATCH_REG0             0x15E0
@@ -423,6 +430,7 @@ typedef struct PPCMacGPURegs {
     uint32_t crtc_h_total_disp;
     uint32_t crtc_h_sync_strt_wid;
     uint32_t crtc_v_total_disp;
+    uint32_t crtc_vline;          /* the line the guest asked to be told about */
     uint32_t crtc_v_sync_strt_wid;
     uint32_t crtc_offset;
     uint32_t crtc_offset_cntl;
@@ -521,6 +529,18 @@ typedef struct PPCMacGPURegs {
     uint32_t scratch_reg[6];       /* SCRATCH_REG0-5 (0x15E0-0x15F4) */
     uint32_t scratch_umsk;         /* 0x0770: which scratch regs to writeback */
     uint32_t scratch_addr;         /* 0x0774: VRAM addr for writeback */
+    uint64_t stall_draws;          /* draws carried out, for the stall trace */
+    uint64_t stall_pio_dwords;     /* command words pushed in by hand */
+    uint64_t stall_ib_done;        /* command buffers fetched and carried out */
+    uint64_t stall_ib_dwords;
+    uint64_t stall_ib_lost;        /* ones whose memory could not be found */
+    bool csq_just_submitted;       /* something was pushed since the last look */
+    uint64_t stall_irqs;           /* display interrupts raised */
+    uint64_t stall_ring_dwords;    /* command words taken from the ring */
+    uint64_t stall_draws_seen;
+    uint32_t cp_rb_rptr_addr;      /* 0x070C: where to keep the ring read
+                                    * pointer's copy in memory, for a driver
+                                    * that reads it from there */
 
     /* Clock (stub) */
     uint32_t clock_cntl_index;
@@ -555,7 +575,13 @@ typedef struct PPCMacGPURegs {
     /* R200 TCL constant memory, written through the SE_TCL_VECTOR_INDX/DATA
      * (0x2200/0x2204) and SCALAR_INDX/DATA (0x2208/0x220C) ports.  Vector
      * address 0x80 + 4*N holds 4x4 matrix N as four row vectors. */
-    uint32_t tcl_vec[0x200][4];
+    /* TCL vector memory.  Fixed-function matrices and lights live here,
+     * and so do vertex programs (instructions at 0x080 and 0x180,
+     * their constants at 0x000 and 0x100), which is why the two must
+     * never be read at the same time.  Wider than the 0x1C0 the chip
+     * documents, so a driver writing higher can't quietly land on a
+     * matrix. */
+    uint32_t tcl_vec[0x800][4];
     uint32_t tcl_vec_addr, tcl_vec_stride, tcl_vec_comp;
     uint32_t tcl_scalar[0x200];
     uint32_t tcl_scalar_addr, tcl_scalar_stride;
@@ -642,7 +668,14 @@ struct PPCMacGPUState {
     bool display_invalid;       /* Display needs full redraw */
 
     /* PM4 PIO FIFO for CP command processing */
-    uint32_t pm4_fifo[64];     /* small PM4 packet buffer */
+    /*
+     * One command packet pushed in by hand, gathered before it is carried
+     * out.  A packet's length field is 14 bits, so this has to hold 16384
+     * words; it held 64, and every longer packet quietly lost its tail --
+     * which for Halo meant losing the write that marks a frame complete,
+     * leaving the game waiting for a number that never came.
+     */
+    uint32_t pm4_fifo[16384];
     uint32_t pm4_fifo_idx;     /* current write index */
     uint32_t pm4_pkt_count;    /* remaining dwords for current packet */
     uint32_t pm4_pkt_reg;      /* base register for type 0 packet */
