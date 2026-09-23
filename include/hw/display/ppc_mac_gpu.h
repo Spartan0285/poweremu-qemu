@@ -663,6 +663,9 @@ struct PPCMacGPUState {
     /* Device state */
     uint8_t mode;               /* VGA or extended mode */
     PPCMacGPURegs regs;         /* Register file */
+    /* How big that register file is, saved with the machine so a state
+     * written by another build cannot be poured into a different layout. */
+    uint32_t regs_size;
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
     bool display_invalid;       /* Display needs full redraw */

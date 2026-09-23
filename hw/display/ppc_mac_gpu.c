@@ -31,6 +31,7 @@
 #include "qemu/datadir.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
@@ -9548,6 +9549,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
     Object *obj = OBJECT(dev);
 
+    s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
+
     /* Compute VRAM size from MB property */
     s->vram_size = (uint64_t)s->vram_size_mb * MiB;
 
@@ -9579,6 +9582,13 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         /* Zero-copy path: QEMU uses the MTLBuffer's memory directly */
         memory_region_init_ram_ptr(&s->vram, obj, "ppc-mac-gpu-vram",
                                    s->vram_size, s->metal_vram_ptr);
+        /*
+         * This memory belongs to Metal, not to QEMU, so it is not part of
+         * the machine's memory unless it is named here.  Without this,
+         * saving the machine leaves video memory behind and it comes back
+         * to a black screen -- everything Mac OS X had drawn lived here.
+         */
+        vmstate_register_ram(&s->vram, DEVICE(obj));
     } else {
         /* Fallback: normal QEMU-managed RAM */
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
@@ -9962,6 +9972,104 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                            s->regs.config_memsize);
 }
 
+/* ========================================================================
+ * Saving the card with the machine
+ *
+ * PowerEmu's sleep writes a whole machine into its disk and starts it
+ * again later.  The card took no part in that: the guest came back
+ * believing its windows were still in video memory, on a card that had
+ * been reset underneath it, and the screen stayed black although Mac OS X
+ * was running perfectly well behind it.
+ *
+ * The register block is saved whole rather than field by field.  It is
+ * plain data with several hundred members, and a hand-written list of
+ * them would be wrong within a week.  Its size travels with it, so a
+ * machine saved by one build refuses to load into a build whose registers
+ * have moved, instead of restoring nonsense.  Nothing outside it needs
+ * saving: the display mode, the scanout address and the rest are worked
+ * out again from the registers on the next screen update, and the command
+ * buffers are refilled by the driver.
+ * ======================================================================== */
+
+static int ppc_mac_gpu_post_load(void *opaque, int version_id)
+{
+    PPCMacGPUState *s = opaque;
+
+    /* Ask for one full screen update; everything derived follows from it. */
+    s->display_invalid = true;
+    /* Force the mode -- and the surface handed to the window -- to be
+     * built again from the restored registers. */
+    s->disp.width = 0;
+    s->disp.height = 0;
+    s->surface_width = 0;
+    s->surface_height = 0;
+    s->surface_stride = 0;
+    memory_region_set_dirty(&s->vram, 0, s->vram_size);
+    if (s->con) {
+        dpy_gfx_update_full(s->con);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_ppc_mac_gpu = {
+    .name = "ppc-mac-gpu",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = ppc_mac_gpu_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_PCI_DEVICE(pci, PPCMacGPUState),
+        VMSTATE_UINT32_EQUAL(regs_size, PPCMacGPUState,
+                             "this machine was saved by a build whose "
+                             "graphics registers were laid out differently"),
+        VMSTATE_BUFFER_UNSAFE(regs, PPCMacGPUState, 1, sizeof(PPCMacGPURegs)),
+        VMSTATE_BOOL(display_invalid, PPCMacGPUState),
+        /*
+         * What the card has learned rather than been told: Mac OS X's
+         * driver sets the scanline length by drawing at it, not by writing
+         * CRTC_PITCH, so this is not in the registers.  Left behind, a
+         * woken machine reads its own screen with the wrong line length
+         * and shows a sheared picture of the desktop.
+         */
+        VMSTATE_BOOL(disp_stride_override_active, PPCMacGPUState),
+        VMSTATE_UINT32(disp_stride_override_value, PPCMacGPUState),
+        /*
+         * Where Quartz Extreme composites, which the display path follows
+         * instead of the framebuffer.  Learned from the blits that go
+         * there, so a woken machine would scan out of the wrong place
+         * until the next one.
+         */
+        VMSTATE_UINT32(compositor_base, PPCMacGPUState),
+        VMSTATE_UINT32(compositor_pitch, PPCMacGPUState),
+        VMSTATE_BOOL(compositor_valid, PPCMacGPUState),
+        /*
+         * Which stretches of video memory are macro-tiled.  This is
+         * gathered from PITCH_OFFSET writes as the guest runs, and a blit
+         * into a surface registered before the machine slept would
+         * otherwise be written as though it were linear -- the same fault
+         * as the window-drag bug, but only after waking.
+         */
+        VMSTATE_BUFFER_UNSAFE(tiled_surfaces, PPCMacGPUState, 1,
+                              sizeof(((PPCMacGPUState *)0)->tiled_surfaces)),
+        /*
+         * The hardware cursor's picture.  The guest sends it once and only
+         * sends it again when it changes, so without this a woken machine
+         * can sit with no pointer at all.
+         */
+        VMSTATE_BUFFER_UNSAFE(hwc_pix, PPCMacGPUState, 1,
+                              sizeof(((PPCMacGPUState *)0)->hwc_pix)),
+        VMSTATE_UINT32(hwc_w, PPCMacGPUState),
+        VMSTATE_UINT32(hwc_h, PPCMacGPUState),
+        VMSTATE_UINT32(hwc_idx, PPCMacGPUState),
+        VMSTATE_INT32(hwc_x, PPCMacGPUState),
+        VMSTATE_INT32(hwc_y, PPCMacGPUState),
+        VMSTATE_BOOL(hwc_visible, PPCMacGPUState),
+        /* Registers the 9700 kext writes and reads back later. */
+        VMSTATE_BUFFER_UNSAFE(r300_shadow, PPCMacGPUState, 1,
+                              sizeof(((PPCMacGPUState *)0)->r300_shadow)),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -9976,6 +10084,7 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     k->config_write = ppc_mac_gpu_config_write;
 
     device_class_set_legacy_reset(dc, ppc_mac_gpu_reset);
+    dc->vmsd = &vmstate_ppc_mac_gpu;
     device_class_set_props(dc, ppc_mac_gpu_properties);
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
