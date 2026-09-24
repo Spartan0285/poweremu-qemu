@@ -538,14 +538,17 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
     (uint64_t)(off) + (uint64_t)(y) * (pitch), \
     (uint64_t)(off) + ((uint64_t)(y) + (h)) * (pitch)
 
+/* -1 until asked; reset to -1 when the trace property changes it, so a log
+ * can be turned on in a machine that is already running. */
+static int g_seq_log_enabled = -1;
+
 static void G_GNUC_PRINTF(1, 2) seq_log(const char *fmt, ...)
 {
-    static int enabled = -1;          /* opt-in: PPCGPU_SEQ_LOG=1 */
-    if (enabled < 0) {
+    if (g_seq_log_enabled < 0) {
         const char *e = getenv("PPCGPU_SEQ_LOG");
-        enabled = e && e[0] == '1';
+        g_seq_log_enabled = e && e[0] != '0';
     }
-    if (!enabled) {
+    if (!g_seq_log_enabled) {
         return;
     }
     if (!g_seq_log) {
@@ -4543,11 +4546,18 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
          * shifted every attribute after it by one word. */
         ADD_ATTR(A_SKIP, 0, 1, 3);
     }
+    /*
+     * Colours.  The first two are the primary and the secondary; the rest
+     * are consumed but unused, while still being handed to a vertex
+     * program by their own slot number.
+     */
+    int colours_seen = 0;
     for (int c = 0; c < 8; c++) {
         uint32_t cf = (fmt0 >> (11 + 2 * c)) & 3;
         if (cf) {
-            ADD_ATTR(c == 0 ? A_COLOR0 : c == 1 ? A_COLOR1 : A_SKIP, cf,
-                     cf == 1 ? 1 : cf == 2 ? 3 : 4, 4 + c);
+            int kind = colours_seen == 0 ? A_COLOR0 : colours_seen == 1 ? A_COLOR1 : A_SKIP;
+            colours_seen++;
+            ADD_ATTR(kind, cf, cf == 1 ? 1 : cf == 2 ? 3 : 4, 4 + c);
         }
     }
     for (int t = 0; t < R200_MAX_TEX; t++) {
@@ -4713,6 +4723,73 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
      * inner loop over the preceding attributes -- O(attributes squared) per
      * vertex, for an answer that never changed.
      */
+    /*
+     * An attribute the vertex declares but does not stream must not eat an
+     * array.
+     *
+     * With one array per attribute, the arrays line up with the attributes
+     * in order.  Mac OS X 10.5's compositor declares fog in SE_VTX_FMT_0 --
+     * a single float between the position and the colours -- but supplies
+     * only two arrays, position and colour: the fog comes from a register,
+     * not from the vertex.  Lining those up naively gave the fog the
+     * colour's array and left the colour with none, so every vertex kept
+     * whatever colour the previous draw had left.  For the Dock, whose
+     * colour comes straight from the vertex, that was a red slab.
+     *
+     * Only the attributes that contribute nothing to the result are
+     * dropped, last first, and only enough of them to make the counts
+     * agree -- so a vertex that really does stream its fog is untouched.
+     */
+    if (src != R200_SRC_IMMD && narrays > 0 && narrays < (uint32_t)nattr) {
+        for (int a = nattr - 1; a >= 0 && narrays < (uint32_t)nattr; a--) {
+            if (attr_kind[a] != A_SKIP) {
+                continue;
+            }
+            for (int k = a; k < nattr - 1; k++) {
+                attr_kind[k] = attr_kind[k + 1];
+                attr_extra[k] = attr_extra[k + 1];
+                attr_comps[k] = attr_comps[k + 1];
+                attr_slot[k] = attr_slot[k + 1];
+            }
+            nattr--;
+        }
+    }
+
+    /*
+     * The arrays say how wide each attribute really is.
+     *
+     * SE_VTX_FMT_0 says what kind of thing each attribute is; the array's
+     * own count says how many dwords of it the vertex carries.  They can
+     * disagree, and when they do the array is right -- it is what was
+     * actually written.  Mac OS X 10.5's compositor declares its colour as
+     * four floats and then streams it as one dword of packed bytes; read
+     * as four floats that gave an impossible colour and swallowed the two
+     * texture coordinates that followed it, which is why the Dock arrived
+     * as a red slab with 0xffffffff and 0xcccccccc -- opaque white and
+     * translucent grey, perfectly ordinary colours -- in the red channel.
+     *
+     * Only narrowing is honoured, and only per attribute: an array that
+     * carries more than the format asks for is left alone, since the extra
+     * words belong to whatever comes next.
+     */
+    if (narrays == (uint32_t)nattr) {
+        for (int a = 0; a < nattr; a++) {
+            uint32_t have = arr_count[a];
+            if (!have || (int)have >= attr_comps[a]) {
+                continue;
+            }
+            if ((attr_kind[a] == A_COLOR0 || attr_kind[a] == A_COLOR1 ||
+                 attr_kind[a] == A_SKIP) && have == 1) {
+                attr_extra[a] = 1;            /* packed, 0xAARRGGBB */
+            }
+            attr_comps[a] = have;
+        }
+        vtx_dw = 0;
+        for (int a = 0; a < nattr; a++) {
+            vtx_dw += attr_comps[a];
+        }
+    }
+
     uint32_t attr_start[20];          /* matches attr_comps[] above */
     if (narrays == (uint32_t)nattr) {
         /*
@@ -10009,8 +10086,9 @@ static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
         off = true;
         name++;
     }
-    if (!name || !g_str_has_prefix(name, "POWEREMU_")) {
-        error_setg(errp, "trace names must begin with POWEREMU_");
+    if (!name || (!g_str_has_prefix(name, "POWEREMU_") &&
+                  !g_str_has_prefix(name, "PPCGPU_"))) {
+        error_setg(errp, "trace names must begin with POWEREMU_ or PPCGPU_");
         return;
     }
     if (off) {
@@ -10018,6 +10096,8 @@ static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
     } else {
         g_setenv(name, "1", true);
     }
+    /* Logs that remember whether they were switched on have to be told. */
+    g_seq_log_enabled = -1;
     fprintf(stderr, "ppc-mac-gpu: %s %s\n", name, off ? "off" : "on");
 }
 
@@ -10027,6 +10107,8 @@ static char *ppc_mac_gpu_get_trace(Object *obj, Error **errp)
     static const char *const names[] = {
         "POWEREMU_STALL_TRACE", "POWEREMU_FENCE_TRACE", "POWEREMU_TEX_TRACE",
         "POWEREMU_VP_TRACE", "POWEREMU_POLL_TRACE",
+        /* The direct R200 path logs per draw only under these. */
+        "PPCGPU_SEQ_LOG", "PPCGPU_DIAG",
     };
     GString *out = g_string_new(NULL);
     int i;
