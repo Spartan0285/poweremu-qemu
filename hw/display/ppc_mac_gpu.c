@@ -542,6 +542,99 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
  * can be turned on in a machine that is already running. */
 static int g_seq_log_enabled = -1;
 
+
+/* ========================================================================
+ * Seeing the guest's windows
+ *
+ * Coherence mode -- showing a virtual Mac's windows on this Mac's desktop
+ * rather than its whole screen -- needs to know what the windows are.  The
+ * compositor never says; what it does is copy each window's contents to the
+ * screen, piece by piece, every time anything changes.  A window therefore
+ * shows up as a run of copies that share a source surface, and its frame is
+ * the rectangle those copies cover.
+ *
+ * This watches those copies and keeps a list.  It is only a reader: nothing
+ * here changes what is drawn.  PPCGPU_WINDOWS=1 turns it on, and the list
+ * is printed whenever it settles.
+ *
+ * Known limits, measured on 10.4 and 10.5 alike: a surface is sometimes
+ * reused for more than one window (the same address turns up with two
+ * different scanline lengths), so a surface is not an identity.  Grouping
+ * by surface *and* scanline length is closer, and the guest agent will have
+ * to supply the real identity in the end.
+ * ======================================================================== */
+#define PE_WINDOW_MAX 32
+typedef struct {
+    uint32_t surface, pitch;
+    uint32_t x0, y0, x1, y1;        /* the rectangle its pieces cover */
+    uint64_t pieces;
+    int64_t last_us;
+    bool live;
+} PEWindow;
+
+static PEWindow pe_windows[PE_WINDOW_MAX];
+static int64_t pe_windows_printed_us;
+
+static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
+                               uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!getenv("PPCGPU_WINDOWS") || !w || !h) {
+        return;
+    }
+    int64_t now = g_get_monotonic_time();
+    PEWindow *slot = NULL;
+    for (int i = 0; i < PE_WINDOW_MAX; i++) {
+        PEWindow *e = &pe_windows[i];
+        if (e->live && e->surface == surface && e->pitch == pitch) {
+            slot = e;
+            break;
+        }
+    }
+    if (!slot) {
+        /* A free slot, or the one nobody has drawn to for longest. */
+        int64_t oldest = now;
+        for (int i = 0; i < PE_WINDOW_MAX; i++) {
+            if (!pe_windows[i].live) { slot = &pe_windows[i]; break; }
+            if (pe_windows[i].last_us <= oldest) {
+                oldest = pe_windows[i].last_us;
+                slot = &pe_windows[i];
+            }
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->live = true;
+        slot->surface = surface;
+        slot->pitch = pitch;
+        slot->x0 = x; slot->y0 = y; slot->x1 = x + w; slot->y1 = y + h;
+    }
+    slot->x0 = MIN(slot->x0, x);
+    slot->y0 = MIN(slot->y0, y);
+    slot->x1 = MAX(slot->x1, x + w);
+    slot->y1 = MAX(slot->y1, y + h);
+    slot->pieces++;
+    slot->last_us = now;
+
+    /*
+     * Print every couple of seconds.  Printing "once the copies settle"
+     * cannot work from here: this is only called *by* a copy, so the
+     * moment things go quiet is the moment nothing calls it again.
+     */
+    if (now - pe_windows_printed_us < 2 * G_TIME_SPAN_SECOND) {
+        return;
+    }
+    pe_windows_printed_us = now;
+    fprintf(stderr, "PEWINDOWS ----\n");
+    for (int i = 0; i < PE_WINDOW_MAX; i++) {
+        PEWindow *e = &pe_windows[i];
+        if (!e->live || now - e->last_us > 5 * G_TIME_SPAN_SECOND) {
+            continue;
+        }
+        fprintf(stderr, "PEWINDOW surface=%06x pitch=%u frame=(%u,%u)-(%u,%u) "
+                "%ux%u pieces=%" PRIu64 "\n",
+                e->surface, e->pitch, e->x0, e->y0, e->x1, e->y1,
+                e->x1 - e->x0, e->y1 - e->y0, e->pieces);
+    }
+}
+
 static void G_GNUC_PRINTF(1, 2) seq_log(const char *fmt, ...)
 {
     if (g_seq_log_enabled < 0) {
@@ -3226,6 +3319,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 bpp * 8);
         }
         if (dst_offset == s->regs.crtc_offset) {
+            pe_window_saw_blit(src_offset, src_pitch, dst_x, dst_y, blit_w, blit_h);
             frame_tracker_record_2d_event(PASS_EVENT_FALLBACK_2D,
                                           src_offset, src_pitch,
                                           src_offset, dst_offset,
@@ -10108,7 +10202,7 @@ static char *ppc_mac_gpu_get_trace(Object *obj, Error **errp)
         "POWEREMU_STALL_TRACE", "POWEREMU_FENCE_TRACE", "POWEREMU_TEX_TRACE",
         "POWEREMU_VP_TRACE", "POWEREMU_POLL_TRACE",
         /* The direct R200 path logs per draw only under these. */
-        "PPCGPU_SEQ_LOG", "PPCGPU_DIAG",
+        "PPCGPU_SEQ_LOG", "PPCGPU_DIAG", "PPCGPU_WINDOWS",
     };
     GString *out = g_string_new(NULL);
     int i;
