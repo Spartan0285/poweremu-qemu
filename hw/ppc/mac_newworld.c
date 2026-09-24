@@ -457,12 +457,17 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    /*
+     * 16 KB of byte-addressed storage: an Open Firmware bank and a Mac OS X
+     * bank, laid out by pmac_format_nvram_partition, which explains why the
+     * chip is addressed this way rather than with a stride.
+     */
+    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE * 2);
+    qdev_prop_set_uint32(dev, "it_shift", 0);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    pmac_format_nvram_banks(nvr, MACIO_NVRAM_SIZE);
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
