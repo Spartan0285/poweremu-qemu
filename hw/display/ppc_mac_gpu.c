@@ -22,6 +22,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "ui/poweremu-coherence.h"
 #include <math.h>
 #include <sched.h>
 #include "qemu/log.h"
@@ -605,16 +606,18 @@ static int64_t pe_windows_printed_us;
  * three runs of the same machine.  What the guest *does* with a surface
  * is the same on both systems.
  */
-static const char *pe_window_kind(const PEWindow *e)
+static PECoherenceArea pe_area_of(uint32_t x0, uint32_t y0,
+                                  uint32_t x1, uint32_t y1,
+                                  uint32_t scr_w, uint32_t scr_h)
 {
-    uint32_t w = e->x1 - e->x0, h = e->y1 - e->y0;
+    uint32_t w = x1 - x0, h = y1 - y0;
 
-    if (!e->scr_w || !e->scr_h) {
-        return "unknown";
+    if (!scr_w || !scr_h) {
+        return PE_AREA_UNKNOWN;
     }
-    if (e->x0 == 0 && e->x1 >= e->scr_w) {
-        if (e->y1 >= e->scr_h) {
-            return "desktop";          /* full width, down to the bottom */
+    if (x0 == 0 && x1 >= scr_w) {
+        if (y1 >= scr_h) {
+            return PE_AREA_DESKTOP;    /* full width, down to the bottom */
         }
         /*
          * The menu bar is 22 points on both systems, but the copy that
@@ -622,14 +625,186 @@ static const char *pe_window_kind(const PEWindow *e)
          * 10.5.  Anything full-width and this shallow at the top of the
          * screen is the menu bar and nothing else.
          */
-        if (e->y0 == 0 && h <= 48) {
-            return "menubar";
+        if (y0 == 0 && h <= 48) {
+            return PE_AREA_MENUBAR;
         }
     }
-    if (w >= e->scr_w && h >= e->scr_h) {
-        return "desktop";
+    if (w >= scr_w && h >= scr_h) {
+        return PE_AREA_DESKTOP;
     }
-    return "window";
+    return PE_AREA_WINDOW;
+}
+
+static const char *pe_area_name(PECoherenceArea a)
+{
+    switch (a) {
+    case PE_AREA_DESKTOP: return "desktop";
+    case PE_AREA_MENUBAR: return "menubar";
+    case PE_AREA_WINDOW:  return "window";
+    default:              return "unknown";
+    }
+}
+
+static uint32_t pe_desktop_surface;       /* whose copy last covered the screen */
+static int64_t pe_desktop_surface_us;     /* and when */
+
+/*
+ * The fill-ins arrive with the desktop, not minutes later.  Two seconds is
+ * long enough to cover one repaint and short enough that the surface being
+ * handed to a window afterwards -- which happens; the same address drew the
+ * wallpaper in one run and a Finder window in the next -- does not make that
+ * window vanish.
+ */
+#define PE_DESKTOP_SURFACE_US (2 * G_TIME_SPAN_SECOND)
+
+/* What a copy out of `surface` covering this rectangle is. */
+static PECoherenceArea pe_area_of_copy(uint32_t surface,
+                                       uint32_t x0, uint32_t y0,
+                                       uint32_t x1, uint32_t y1,
+                                       uint32_t scr_w, uint32_t scr_h)
+{
+    PECoherenceArea a = pe_area_of(x0, y0, x1, y1, scr_w, scr_h);
+    int64_t now = g_get_monotonic_time();
+
+    if (a == PE_AREA_DESKTOP) {
+        pe_desktop_surface = surface;
+        pe_desktop_surface_us = now;
+    } else if (a == PE_AREA_WINDOW && surface == pe_desktop_surface &&
+               now - pe_desktop_surface_us < PE_DESKTOP_SURFACE_US) {
+        /*
+         * Part of the desktop repaint that is going on right now.  When the
+         * screen changes size the compositor fills the newly uncovered
+         * strips from the wallpaper's own surface -- (1024,0) 656x768 and
+         * (0,768) 1680x282, going from 1024x768 to 1680x1050 -- and by
+         * shape alone those are windows.  Coherence mode would leave two
+         * slabs of wallpaper lying on this Mac's desktop.
+         */
+        a = PE_AREA_DESKTOP;
+    }
+    return a;
+}
+
+static const char *pe_window_kind(const PEWindow *e)
+{
+    return pe_area_name(pe_area_of_copy(e->surface, e->x0, e->y0, e->x1, e->y1,
+                                        e->scr_w, e->scr_h));
+}
+
+/* ---- the tile grid ---------------------------------------------------- */
+
+static bool pe_coh_on;
+static uint8_t *pe_coh_tiles;
+static int pe_coh_cols, pe_coh_rows;
+static uint32_t pe_coh_gen;
+static int64_t pe_coh_resized_us;
+
+/*
+ * The grid is kept whether coherence mode is on or not, because it has to
+ * be right the instant it is switched on: it is a shadow of the screen,
+ * saying what last covered each part of it, and there is no way to work
+ * that out after the fact.  A window nobody has touched for ten minutes is
+ * still on the screen, and a menu that was closed an hour ago is not.
+ * Keeping it costs a few bytes written per copy.
+ */
+void ppc_mac_gpu_coherence_enable(bool on)
+{
+    pe_coh_on = on;
+    pe_coh_gen++;
+}
+
+bool ppc_mac_gpu_coherence_tiles(const uint8_t **tiles, int *cols, int *rows,
+                                 uint32_t *generation)
+{
+    if (!pe_coh_on || !pe_coh_tiles) {
+        return false;
+    }
+    *tiles = pe_coh_tiles;
+    *cols = pe_coh_cols;
+    *rows = pe_coh_rows;
+    *generation = pe_coh_gen;
+    return true;
+}
+
+/*
+ * Remember what covered each tile.  A window marks every tile it touches,
+ * a desktop or menu bar only the tiles it covers completely: the bias is
+ * towards showing a little too much of the guest rather than cutting the
+ * edge off one of its windows.
+ */
+static void pe_coherence_mark(uint32_t surface,
+                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                              uint32_t scr_w, uint32_t scr_h)
+{
+    if (!scr_w || !scr_h) {
+        return;
+    }
+    int cols = (scr_w + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+    int rows = (scr_h + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+    if (cols != pe_coh_cols || rows != pe_coh_rows) {
+        g_free(pe_coh_tiles);
+        pe_coh_tiles = g_malloc0((size_t)cols * rows);
+        pe_coh_cols = cols;
+        pe_coh_rows = rows;
+        pe_coh_resized_us = g_get_monotonic_time();
+    }
+
+    /*
+     * Changing resolution, the compositor fills the newly uncovered strips
+     * from the wallpaper's own surface -- (1024,0) 656x768 and (0,768)
+     * 1680x282, going from 1024x768 to 1680x1050 -- before it puts up a
+     * whole screen.  By shape those are windows, and taking them for
+     * windows leaves a slab of wallpaper lying on this Mac's desktop for
+     * the rest of the session.  Nothing drawn in the moment after a resize
+     * is worth believing; whatever is really there is drawn again directly
+     * afterwards.
+     */
+    int64_t now = g_get_monotonic_time();
+    bool settling = now - pe_coh_resized_us < G_TIME_SPAN_SECOND * 3 / 2;
+    if (settling && ((uint64_t)w * h * 10 < (uint64_t)scr_w * scr_h * 9)) {
+        return;
+    }
+
+    PECoherenceArea a = pe_area_of_copy(surface, x, y, x + w, y + h,
+                                        scr_w, scr_h);
+    int tx0, ty0, tx1, ty1;
+    if (a == PE_AREA_WINDOW) {
+        tx0 = x / PE_COHERENCE_TILE;
+        ty0 = y / PE_COHERENCE_TILE;
+        tx1 = (x + w + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+        ty1 = (y + h + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+    } else {
+        tx0 = (x + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+        ty0 = (y + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+        tx1 = (x + w) / PE_COHERENCE_TILE;
+        ty1 = (y + h) / PE_COHERENCE_TILE;
+    }
+    tx1 = MIN(tx1, cols);
+    ty1 = MIN(ty1, rows);
+
+    /*
+     * A copy that covers nearly the whole screen is the compositor putting
+     * the finished picture up -- wallpaper and windows together -- not the
+     * wallpaper alone.  It says nothing about which part is which, so it
+     * only fills in ground nothing has been seen on yet; taking it for
+     * desktop everywhere wipes out every window that has been found so far,
+     * and they come back only as they happen to be redrawn.  Measured: the
+     * menu bar's clock reappeared within the minute and the rest of the
+     * screen stayed empty.
+     */
+    bool whole_screen = (uint64_t)w * h * 10 >= (uint64_t)scr_w * scr_h * 9;
+
+    for (int ty = ty0; ty < ty1; ty++) {
+        uint8_t *row = pe_coh_tiles + (size_t)ty * cols;
+        for (int tx = tx0; tx < tx1; tx++) {
+            if (whole_screen && row[tx] != PE_AREA_UNKNOWN) {
+                continue;
+            }
+            if (row[tx] != (uint8_t)a) {
+                row[tx] = a;
+                pe_coh_gen++;
+            }
+        }
+    }
 }
 
 static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
@@ -637,11 +812,12 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
                                uint32_t scr_w, uint32_t scr_h)
 {
     const char *on = getenv("PPCGPU_WINDOWS");
-    if (!on || !w || !h) {
+    if (!w || !h) {
         return;
     }
+    pe_coherence_mark(surface, x, y, w, h, scr_w, scr_h);
     int64_t now = g_get_monotonic_time();
-    if (on[0] >= '2') {
+    if (on && on[0] >= '2') {
         /* Every copy, for working out what the compositor is doing. */
         fprintf(stderr, "PEBLIT surface=%06x pitch=%u at=(%u,%u) %ux%u "
                 "screen=%ux%u\n", surface, pitch, x, y, w, h, scr_w, scr_h);
@@ -694,7 +870,7 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
      * cannot work from here: this is only called *by* a copy, so the
      * moment things go quiet is the moment nothing calls it again.
      */
-    if (now - pe_windows_printed_us < 2 * G_TIME_SPAN_SECOND) {
+    if (!on || now - pe_windows_printed_us < 2 * G_TIME_SPAN_SECOND) {
         return;
     }
     pe_windows_printed_us = now;
