@@ -557,6 +557,12 @@ static int g_seq_log_enabled = -1;
  * here changes what is drawn.  PPCGPU_WINDOWS=1 turns it on, and the list
  * is printed whenever it settles.
  *
+ * A window is redrawn in bursts: a run of copies close together, then
+ * nothing until something changes again.  The frame is the rectangle one
+ * burst covers, and each new burst starts a new rectangle -- otherwise a
+ * window that moves reports the union of everywhere it has ever been,
+ * which is no use to anything that wants to draw it.
+ *
  * Known limits, measured on 10.4 and 10.5 alike: a surface is sometimes
  * reused for more than one window (the same address turns up with two
  * different scanline lengths), so a surface is not an identity.  Grouping
@@ -564,12 +570,19 @@ static int g_seq_log_enabled = -1;
  * to supply the real identity in the end.
  * ======================================================================== */
 #define PE_WINDOW_MAX 32
+/*
+ * Long enough that one redraw of a window stays one burst even when the
+ * guest is slow, short enough that dragging a window reports where it is
+ * rather than where it has been.  A drag redraws far faster than this.
+ */
+#define PE_WINDOW_BURST_US (200 * 1000)
 typedef struct {
     uint32_t surface, pitch;
-    uint32_t x0, y0, x1, y1;        /* the rectangle its pieces cover */
+    uint32_t x0, y0, x1, y1;        /* the rectangle this burst covers */
+    uint32_t fx0, fy0, fx1, fy1;    /* the last burst that finished */
     uint64_t pieces;
     int64_t last_us;
-    bool live;
+    bool live, settled;
 } PEWindow;
 
 static PEWindow pe_windows[PE_WINDOW_MAX];
@@ -604,12 +617,22 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
         slot->live = true;
         slot->surface = surface;
         slot->pitch = pitch;
-        slot->x0 = x; slot->y0 = y; slot->x1 = x + w; slot->y1 = y + h;
+        slot->last_us = now - PE_WINDOW_BURST_US - 1;   /* starts a burst */
     }
-    slot->x0 = MIN(slot->x0, x);
-    slot->y0 = MIN(slot->y0, y);
-    slot->x1 = MAX(slot->x1, x + w);
-    slot->y1 = MAX(slot->y1, y + h);
+    if (now - slot->last_us > PE_WINDOW_BURST_US) {
+        /* A new burst: keep what the last one worked out, and start over. */
+        if (slot->settled) {
+            slot->fx0 = slot->x0; slot->fy0 = slot->y0;
+            slot->fx1 = slot->x1; slot->fy1 = slot->y1;
+        }
+        slot->x0 = x; slot->y0 = y; slot->x1 = x + w; slot->y1 = y + h;
+        slot->settled = true;
+    } else {
+        slot->x0 = MIN(slot->x0, x);
+        slot->y0 = MIN(slot->y0, y);
+        slot->x1 = MAX(slot->x1, x + w);
+        slot->y1 = MAX(slot->y1, y + h);
+    }
     slot->pieces++;
     slot->last_us = now;
 
