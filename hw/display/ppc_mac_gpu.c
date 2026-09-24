@@ -580,6 +580,7 @@ typedef struct {
     uint32_t surface, pitch;
     uint32_t x0, y0, x1, y1;        /* the rectangle this burst covers */
     uint32_t fx0, fy0, fx1, fy1;    /* the last burst that finished */
+    uint32_t scr_w, scr_h;          /* the screen it was copied onto */
     uint64_t pieces;
     int64_t last_us;
     bool live, settled;
@@ -588,13 +589,63 @@ typedef struct {
 static PEWindow pe_windows[PE_WINDOW_MAX];
 static int64_t pe_windows_printed_us;
 
-static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
-                               uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+/*
+ * What a run of copies is, told from the copies alone.
+ *
+ * Nothing in the command stream says "this is the desktop" -- but the
+ * desktop is the only thing drawn the full width of the screen and down
+ * to the bottom of it, and the menu bar is the only thing drawn the full
+ * width and a couple of dozen pixels tall.  Everything else that reaches
+ * the screen is a window, or part of one.
+ *
+ * This replaces asking where a surface lives in video memory, which was
+ * how the old surface classifier worked.  Addresses are no use: they
+ * differ between Tiger and Leopard, and between one start and the next --
+ * the same Finder window came back at 0x9b6000, 0x9da000 and 0x16ac000 on
+ * three runs of the same machine.  What the guest *does* with a surface
+ * is the same on both systems.
+ */
+static const char *pe_window_kind(const PEWindow *e)
 {
-    if (!getenv("PPCGPU_WINDOWS") || !w || !h) {
+    uint32_t w = e->x1 - e->x0, h = e->y1 - e->y0;
+
+    if (!e->scr_w || !e->scr_h) {
+        return "unknown";
+    }
+    if (e->x0 == 0 && e->x1 >= e->scr_w) {
+        if (e->y1 >= e->scr_h) {
+            return "desktop";          /* full width, down to the bottom */
+        }
+        /*
+         * The menu bar is 22 points on both systems, but the copy that
+         * reaches the screen carries its shadow: 36 pixels, measured on
+         * 10.5.  Anything full-width and this shallow at the top of the
+         * screen is the menu bar and nothing else.
+         */
+        if (e->y0 == 0 && h <= 48) {
+            return "menubar";
+        }
+    }
+    if (w >= e->scr_w && h >= e->scr_h) {
+        return "desktop";
+    }
+    return "window";
+}
+
+static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
+                               uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                               uint32_t scr_w, uint32_t scr_h)
+{
+    const char *on = getenv("PPCGPU_WINDOWS");
+    if (!on || !w || !h) {
         return;
     }
     int64_t now = g_get_monotonic_time();
+    if (on[0] >= '2') {
+        /* Every copy, for working out what the compositor is doing. */
+        fprintf(stderr, "PEBLIT surface=%06x pitch=%u at=(%u,%u) %ux%u "
+                "screen=%ux%u\n", surface, pitch, x, y, w, h, scr_w, scr_h);
+    }
     PEWindow *slot = NULL;
     for (int i = 0; i < PE_WINDOW_MAX; i++) {
         PEWindow *e = &pe_windows[i];
@@ -635,6 +686,8 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
     }
     slot->pieces++;
     slot->last_us = now;
+    slot->scr_w = scr_w;
+    slot->scr_h = scr_h;
 
     /*
      * Print every couple of seconds.  Printing "once the copies settle"
@@ -652,9 +705,9 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
             continue;
         }
         fprintf(stderr, "PEWINDOW surface=%06x pitch=%u frame=(%u,%u)-(%u,%u) "
-                "%ux%u pieces=%" PRIu64 "\n",
+                "%ux%u kind=%s pieces=%" PRIu64 "\n",
                 e->surface, e->pitch, e->x0, e->y0, e->x1, e->y1,
-                e->x1 - e->x0, e->y1 - e->y0, e->pieces);
+                e->x1 - e->x0, e->y1 - e->y0, pe_window_kind(e), e->pieces);
     }
 }
 
@@ -3342,7 +3395,16 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 bpp * 8);
         }
         if (dst_offset == s->regs.crtc_offset) {
-            pe_window_saw_blit(src_offset, src_pitch, dst_x, dst_y, blit_w, blit_h);
+            /*
+             * The screen's size comes from the CRTC rather than from
+             * s->disp, which is only filled in when the console refreshes
+             * -- and with no display attached that is only when somebody
+             * asks for a screendump.
+             */
+            pe_window_saw_blit(src_offset, src_pitch, dst_x, dst_y,
+                               blit_w, blit_h,
+                               ((((s->regs.crtc_h_total_disp) >> 16) & 0xFF) + 1) * 8,
+                               (((s->regs.crtc_v_total_disp) >> 16) & 0x7FF) + 1);
             frame_tracker_record_2d_event(PASS_EVENT_FALLBACK_2D,
                                           src_offset, src_pitch,
                                           src_offset, dst_offset,
