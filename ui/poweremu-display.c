@@ -41,7 +41,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "system/system.h"
-#include "ui/poweremu-coherence.h"
+#include "ui/poweremu-harmony.h"
 #include <sys/mman.h>
 
 #define TYPE_POWEREMU_DISPLAY "poweremu-display"
@@ -50,7 +50,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PowerEmuDisplay, POWEREMU_DISPLAY)
 enum {
     PE_SURFACE = 1, PE_DAMAGE = 2, PE_CURSOR = 3, PE_MOUSE = 4,
     PE_KEY = 10, PE_MOTION = 11, PE_BUTTONS = 12, PE_WHEEL = 13, PE_POINT = 14,
-    PE_COHERENCE = 15,
+    PE_HARMONY = 15,
 };
 
 struct PowerEmuDisplay {
@@ -76,8 +76,8 @@ struct PowerEmuDisplay {
     bool dirty;
     int dx0, dy0, dx1, dy1;
 
-    /* Coherence mode: the guest's desktop is handed over transparent. */
-    bool coherence;
+    /* Harmony mode: the guest's desktop is handed over transparent. */
+    bool harmony;
 
     uint8_t in[256];
     size_t in_len;
@@ -85,7 +85,7 @@ struct PowerEmuDisplay {
     uint32_t buttons;
 };
 
-static void pe_coherence_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h);
+static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h);
 
 /* ---- sending ---- */
 
@@ -205,41 +205,41 @@ static void pe_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h
     /* Converts whatever depth the guest uses to BGRA. */
     pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
                            x, y, 0, 0, x, y, w, h);
-    pe_coherence_alpha(pd, x, y, w, h);
+    pe_harmony_alpha(pd, x, y, w, h);
     pe_damage(pd, x, y, w, h);
 }
 
 /*
- * Coherence mode: everything that is not one of the guest's windows is
+ * Harmony mode: everything that is not one of the guest's windows is
  * handed to PowerEmu transparent, so its windows can sit on this Mac's
  * desktop with nothing of the guest's own desktop behind them.
  *
  * The GPU model keeps a grid of tiles saying what last covered each part
  * of the screen.  Where that is a window the pixel is opaque; everywhere
  * else -- the wallpaper, the menu bar, anything never drawn -- it is
- * transparent.  Outside coherence mode this does nothing at all.
+ * transparent.  Outside harmony mode this does nothing at all.
  */
-static void pe_coherence_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h)
+static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h)
 {
     const uint8_t *tiles;
     int cols, rows;
     uint32_t gen;
 
-    if (!pd->coherence || !pd->shm) {
+    if (!pd->harmony || !pd->shm) {
         return;
     }
-    if (!ppc_mac_gpu_coherence_tiles(&tiles, &cols, &rows, &gen)) {
+    if (!ppc_mac_gpu_harmony_tiles(&tiles, &cols, &rows, &gen)) {
         return;
     }
     for (int row = y; row < y + h && row < pd->height; row++) {
-        int ty = row / PE_COHERENCE_TILE;
+        int ty = row / PE_HARMONY_TILE;
         if (ty >= rows) {
             break;
         }
         const uint8_t *trow = tiles + (size_t)ty * cols;
         uint8_t *px = (uint8_t *)pd->shm + (size_t)row * pd->stride + (size_t)x * 4;
         for (int col = x; col < x + w && col < pd->width; col++, px += 4) {
-            int tx = col / PE_COHERENCE_TILE;
+            int tx = col / PE_HARMONY_TILE;
             /* BGRA in memory: the alpha byte is the last of the four. */
             px[3] = (tx < cols && trow[tx] == PE_AREA_WINDOW) ? 0xff : 0x00;
         }
@@ -276,7 +276,7 @@ static void pe_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *ds)
     if (pd->shm_image && surface_width(ds) == pd->width && surface_height(ds) == pd->height) {
         pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
                                0, 0, 0, 0, 0, 0, pd->width, pd->height);
-        pe_coherence_alpha(pd, 0, 0, pd->width, pd->height);
+        pe_harmony_alpha(pd, 0, 0, pd->width, pd->height);
         pe_damage(pd, 0, 0, pd->width, pd->height);
         return;
     }
@@ -448,30 +448,30 @@ static void pe_input(PowerEmuDisplay *pd, uint32_t type, const uint8_t *p, uint3
             qemu_input_event_sync();
         }
         break;
-    case PE_COHERENCE:
+    case PE_HARMONY:
         /*
-         * PowerEmu turning coherence mode on or off.  The whole screen is
+         * PowerEmu turning harmony mode on or off.  The whole screen is
          * sent again either way: every pixel's alpha has just changed
          * meaning, and PowerEmu has only the damage we tell it about.
          */
         if (len >= 4) {
             bool on = v[0] != 0;
-            if (on != pd->coherence) {
+            if (on != pd->harmony) {
                 DisplaySurface *ds = qemu_console_surface(pd->dcl.con);
-                pd->coherence = on;
-                ppc_mac_gpu_coherence_enable(on);
+                pd->harmony = on;
+                ppc_mac_gpu_harmony_enable(on);
                 if (pd->shm_image && ds &&
                     surface_width(ds) == pd->width &&
                     surface_height(ds) == pd->height) {
                     /*
                      * Drawn again from the guest's own screen: turning
-                     * coherence off has to put back the alpha that turning
+                     * harmony off has to put back the alpha that turning
                      * it on wrote away.
                      */
                     pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL,
                                            pd->shm_image, 0, 0, 0, 0, 0, 0,
                                            pd->width, pd->height);
-                    pe_coherence_alpha(pd, 0, 0, pd->width, pd->height);
+                    pe_harmony_alpha(pd, 0, 0, pd->width, pd->height);
                     pe_damage(pd, 0, 0, pd->width, pd->height);
                 }
             }

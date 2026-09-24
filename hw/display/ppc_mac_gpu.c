@@ -22,7 +22,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "ui/poweremu-coherence.h"
+#include "ui/poweremu-harmony.h"
 #include <math.h>
 #include <sched.h>
 #include "qemu/log.h"
@@ -547,7 +547,7 @@ static int g_seq_log_enabled = -1;
 /* ========================================================================
  * Seeing the guest's windows
  *
- * Coherence mode -- showing a virtual Mac's windows on this Mac's desktop
+ * Harmony mode -- showing a virtual Mac's windows on this Mac's desktop
  * rather than its whole screen -- needs to know what the windows are.  The
  * compositor never says; what it does is copy each window's contents to the
  * screen, piece by piece, every time anything changes.  A window therefore
@@ -606,7 +606,7 @@ static int64_t pe_windows_printed_us;
  * three runs of the same machine.  What the guest *does* with a surface
  * is the same on both systems.
  */
-static PECoherenceArea pe_area_of(uint32_t x0, uint32_t y0,
+static PEHarmonyArea pe_area_of(uint32_t x0, uint32_t y0,
                                   uint32_t x1, uint32_t y1,
                                   uint32_t scr_w, uint32_t scr_h)
 {
@@ -635,7 +635,7 @@ static PECoherenceArea pe_area_of(uint32_t x0, uint32_t y0,
     return PE_AREA_WINDOW;
 }
 
-static const char *pe_area_name(PECoherenceArea a)
+static const char *pe_area_name(PEHarmonyArea a)
 {
     switch (a) {
     case PE_AREA_DESKTOP: return "desktop";
@@ -658,12 +658,12 @@ static int64_t pe_desktop_surface_us;     /* and when */
 #define PE_DESKTOP_SURFACE_US (2 * G_TIME_SPAN_SECOND)
 
 /* What a copy out of `surface` covering this rectangle is. */
-static PECoherenceArea pe_area_of_copy(uint32_t surface,
+static PEHarmonyArea pe_area_of_copy(uint32_t surface,
                                        uint32_t x0, uint32_t y0,
                                        uint32_t x1, uint32_t y1,
                                        uint32_t scr_w, uint32_t scr_h)
 {
-    PECoherenceArea a = pe_area_of(x0, y0, x1, y1, scr_w, scr_h);
+    PEHarmonyArea a = pe_area_of(x0, y0, x1, y1, scr_w, scr_h);
     int64_t now = g_get_monotonic_time();
 
     if (a == PE_AREA_DESKTOP) {
@@ -676,7 +676,7 @@ static PECoherenceArea pe_area_of_copy(uint32_t surface,
          * screen changes size the compositor fills the newly uncovered
          * strips from the wallpaper's own surface -- (1024,0) 656x768 and
          * (0,768) 1680x282, going from 1024x768 to 1680x1050 -- and by
-         * shape alone those are windows.  Coherence mode would leave two
+         * shape alone those are windows.  Harmony mode would leave two
          * slabs of wallpaper lying on this Mac's desktop.
          */
         a = PE_AREA_DESKTOP;
@@ -692,36 +692,36 @@ static const char *pe_window_kind(const PEWindow *e)
 
 /* ---- the tile grid ---------------------------------------------------- */
 
-static bool pe_coh_on;
-static uint8_t *pe_coh_tiles;
-static int pe_coh_cols, pe_coh_rows;
-static uint32_t pe_coh_gen;
-static int64_t pe_coh_resized_us;
+static bool pe_harm_on;
+static uint8_t *pe_harm_tiles;
+static int pe_harm_cols, pe_harm_rows;
+static uint32_t pe_harm_gen;
+static int64_t pe_harm_resized_us;
 
 /*
- * The grid is kept whether coherence mode is on or not, because it has to
+ * The grid is kept whether harmony mode is on or not, because it has to
  * be right the instant it is switched on: it is a shadow of the screen,
  * saying what last covered each part of it, and there is no way to work
  * that out after the fact.  A window nobody has touched for ten minutes is
  * still on the screen, and a menu that was closed an hour ago is not.
  * Keeping it costs a few bytes written per copy.
  */
-void ppc_mac_gpu_coherence_enable(bool on)
+void ppc_mac_gpu_harmony_enable(bool on)
 {
-    pe_coh_on = on;
-    pe_coh_gen++;
+    pe_harm_on = on;
+    pe_harm_gen++;
 }
 
-bool ppc_mac_gpu_coherence_tiles(const uint8_t **tiles, int *cols, int *rows,
+bool ppc_mac_gpu_harmony_tiles(const uint8_t **tiles, int *cols, int *rows,
                                  uint32_t *generation)
 {
-    if (!pe_coh_on || !pe_coh_tiles) {
+    if (!pe_harm_on || !pe_harm_tiles) {
         return false;
     }
-    *tiles = pe_coh_tiles;
-    *cols = pe_coh_cols;
-    *rows = pe_coh_rows;
-    *generation = pe_coh_gen;
+    *tiles = pe_harm_tiles;
+    *cols = pe_harm_cols;
+    *rows = pe_harm_rows;
+    *generation = pe_harm_gen;
     return true;
 }
 
@@ -731,21 +731,21 @@ bool ppc_mac_gpu_coherence_tiles(const uint8_t **tiles, int *cols, int *rows,
  * towards showing a little too much of the guest rather than cutting the
  * edge off one of its windows.
  */
-static void pe_coherence_mark(uint32_t surface,
+static void pe_harmony_mark(uint32_t surface,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                               uint32_t scr_w, uint32_t scr_h)
 {
     if (!scr_w || !scr_h) {
         return;
     }
-    int cols = (scr_w + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
-    int rows = (scr_h + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
-    if (cols != pe_coh_cols || rows != pe_coh_rows) {
-        g_free(pe_coh_tiles);
-        pe_coh_tiles = g_malloc0((size_t)cols * rows);
-        pe_coh_cols = cols;
-        pe_coh_rows = rows;
-        pe_coh_resized_us = g_get_monotonic_time();
+    int cols = (scr_w + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
+    int rows = (scr_h + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
+    if (cols != pe_harm_cols || rows != pe_harm_rows) {
+        g_free(pe_harm_tiles);
+        pe_harm_tiles = g_malloc0((size_t)cols * rows);
+        pe_harm_cols = cols;
+        pe_harm_rows = rows;
+        pe_harm_resized_us = g_get_monotonic_time();
     }
 
     /*
@@ -759,24 +759,24 @@ static void pe_coherence_mark(uint32_t surface,
      * afterwards.
      */
     int64_t now = g_get_monotonic_time();
-    bool settling = now - pe_coh_resized_us < G_TIME_SPAN_SECOND * 3 / 2;
+    bool settling = now - pe_harm_resized_us < G_TIME_SPAN_SECOND * 3 / 2;
     if (settling && ((uint64_t)w * h * 10 < (uint64_t)scr_w * scr_h * 9)) {
         return;
     }
 
-    PECoherenceArea a = pe_area_of_copy(surface, x, y, x + w, y + h,
+    PEHarmonyArea a = pe_area_of_copy(surface, x, y, x + w, y + h,
                                         scr_w, scr_h);
     int tx0, ty0, tx1, ty1;
     if (a == PE_AREA_WINDOW) {
-        tx0 = x / PE_COHERENCE_TILE;
-        ty0 = y / PE_COHERENCE_TILE;
-        tx1 = (x + w + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
-        ty1 = (y + h + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
+        tx0 = x / PE_HARMONY_TILE;
+        ty0 = y / PE_HARMONY_TILE;
+        tx1 = (x + w + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
+        ty1 = (y + h + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
     } else {
-        tx0 = (x + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
-        ty0 = (y + PE_COHERENCE_TILE - 1) / PE_COHERENCE_TILE;
-        tx1 = (x + w) / PE_COHERENCE_TILE;
-        ty1 = (y + h) / PE_COHERENCE_TILE;
+        tx0 = (x + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
+        ty0 = (y + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
+        tx1 = (x + w) / PE_HARMONY_TILE;
+        ty1 = (y + h) / PE_HARMONY_TILE;
     }
     tx1 = MIN(tx1, cols);
     ty1 = MIN(ty1, rows);
@@ -794,14 +794,14 @@ static void pe_coherence_mark(uint32_t surface,
     bool whole_screen = (uint64_t)w * h * 10 >= (uint64_t)scr_w * scr_h * 9;
 
     for (int ty = ty0; ty < ty1; ty++) {
-        uint8_t *row = pe_coh_tiles + (size_t)ty * cols;
+        uint8_t *row = pe_harm_tiles + (size_t)ty * cols;
         for (int tx = tx0; tx < tx1; tx++) {
             if (whole_screen && row[tx] != PE_AREA_UNKNOWN) {
                 continue;
             }
             if (row[tx] != (uint8_t)a) {
                 row[tx] = a;
-                pe_coh_gen++;
+                pe_harm_gen++;
             }
         }
     }
@@ -815,7 +815,7 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
     if (!w || !h) {
         return;
     }
-    pe_coherence_mark(surface, x, y, w, h, scr_w, scr_h);
+    pe_harmony_mark(surface, x, y, w, h, scr_w, scr_h);
     int64_t now = g_get_monotonic_time();
     if (on && on[0] >= '2') {
         /* Every copy, for working out what the compositor is doing. */
