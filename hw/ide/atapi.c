@@ -1302,10 +1302,70 @@ static const struct AtapiCmd {
     /* [1] handler detects and reports not ready condition itself */
 };
 
+/*
+ * Every packet the guest sends the drive, named, with POWEREMU_ATAPI set.
+ *
+ * QEMU's ATAPI drive can only be read from, and teaching it to be written
+ * to means knowing what Mac OS X asks a burner for -- which is not the same
+ * as what the MMC specification allows it to ask.  The names below cover
+ * the commands a writer needs as well as the ones already answered, so an
+ * unimplemented one shows up by name rather than as a number, and the
+ * "unimplemented" line says what is missing and in what order it was
+ * wanted.
+ */
+static const char *atapi_cmd_name(uint8_t op)
+{
+    switch (op) {
+    case 0x00: return "TEST UNIT READY";
+    case 0x03: return "REQUEST SENSE";
+    case 0x12: return "INQUIRY";
+    case 0x1b: return "START/STOP UNIT";
+    case 0x1e: return "PREVENT/ALLOW REMOVAL";
+    case 0x23: return "READ FORMAT CAPACITIES";
+    case 0x25: return "READ CAPACITY";
+    case 0x28: return "READ(10)";
+    case 0x2a: return "WRITE(10)";
+    case 0x2b: return "SEEK";
+    case 0x2e: return "WRITE AND VERIFY(10)";
+    case 0x35: return "SYNCHRONIZE CACHE";
+    case 0x3b: return "WRITE BUFFER";
+    case 0x43: return "READ TOC/PMA/ATIP";
+    case 0x46: return "GET CONFIGURATION";
+    case 0x4a: return "GET EVENT STATUS NOTIFICATION";
+    case 0x51: return "READ DISC INFORMATION";
+    case 0x52: return "READ TRACK INFORMATION";
+    case 0x53: return "RESERVE TRACK";
+    case 0x54: return "SEND OPC INFORMATION";
+    case 0x55: return "MODE SELECT(10)";
+    case 0x5a: return "MODE SENSE(10)";
+    case 0x5b: return "CLOSE TRACK/SESSION";
+    case 0x5c: return "READ BUFFER CAPACITY";
+    case 0x5d: return "SEND CUE SHEET";
+    case 0xa1: return "BLANK";
+    case 0xa8: return "READ(12)";
+    case 0xaa: return "WRITE(12)";
+    case 0xad: return "READ DVD STRUCTURE";
+    case 0xbb: return "SET CD SPEED";
+    case 0xbd: return "MECHANISM STATUS";
+    case 0xbe: return "READ CD";
+    default:   return "?";
+    }
+}
+
 void ide_atapi_cmd(IDEState *s)
 {
     uint8_t *buf = s->io_buffer;
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
+
+    if (getenv("POWEREMU_ATAPI")) {
+        char pkt[ATAPI_PACKET_SIZE * 3 + 1];
+        int i;
+        for (i = 0; i < ATAPI_PACKET_SIZE; i++) {
+            snprintf(pkt + i * 3, 4, "%02x ", buf[i]);
+        }
+        fprintf(stderr, "ATAPI %02x %-30s %s%s\n", buf[0], atapi_cmd_name(buf[0]),
+                pkt, cmd->handler ? "" : "   <- unimplemented");
+    }
 
     trace_ide_atapi_cmd(s, s->io_buffer[0]);
 
