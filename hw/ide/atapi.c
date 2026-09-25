@@ -795,25 +795,43 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
 }
 
 /*
+ * While the write support is being built, POWEREMU_BURNER=1 makes the drive
+ * say it can write.  It is a switch rather than the default because a drive
+ * that claims to burn and then cannot is worse than one that never claimed
+ * it: Mac OS X will offer to burn, and fail in front of somebody.
+ */
+static bool atapi_is_burner(void)
+{
+    return getenv("POWEREMU_BURNER") != NULL;
+}
+
+/*
  * One feature descriptor at `p`, or 0 if this drive has no such feature.
  * `current` says whether it applies to what is in the drive now.
  */
 static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p, bool *current)
 {
     switch (feature) {
-    case 0x0000:                /* Profile List */
+    case 0x0000: {              /* Profile List */
+        int n = 4;
         stw_be_p(p, 0x0000);
         p[2] = 0x03;            /* version 0, persistent, current */
-        p[3] = 0;
-        stw_be_p(p + 4, MMC_PROFILE_DVD_ROM);
-        p[6] = media_is_dvd(s);
-        p[7] = 0;
-        stw_be_p(p + 8, MMC_PROFILE_CD_ROM);
-        p[10] = media_is_cd(s);
-        p[11] = 0;
-        p[3] = 8;               /* additional length */
+        stw_be_p(p + n, MMC_PROFILE_DVD_ROM);
+        p[n + 2] = media_is_dvd(s);
+        n += 4;
+        stw_be_p(p + n, MMC_PROFILE_CD_ROM);
+        p[n + 2] = media_is_cd(s);
+        n += 4;
+        if (atapi_is_burner()) {
+            stw_be_p(p + n, MMC_PROFILE_DVD_R_SR);
+            n += 4;
+            stw_be_p(p + n, MMC_PROFILE_CD_R);
+            n += 4;
+        }
+        p[3] = n - 4;           /* additional length */
         *current = true;
-        return 12;
+        return n;
+    }
 
     case 0x0001:                /* Core: what the drive is plugged into */
         stw_be_p(p, 0x0001);
@@ -845,6 +863,33 @@ static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p, bool *curren
         *current = media_present(s);
         return 12;
 
+    case 0x0021:                /* Incremental Streaming Writable */
+        if (!atapi_is_burner()) {
+            return 0;
+        }
+        stw_be_p(p, 0x0021);
+        p[2] = 0x03;
+        p[3] = 8;
+        stl_be_p(p + 4, 0x00000001);    /* data block types: mode 1 */
+        p[8] = 0x01;                    /* buffer underrun free */
+        p[9] = 1;                       /* one link size */
+        p[10] = 0;
+        p[11] = 0;
+        *current = true;
+        return 12;
+
+    case 0x002b:                /* DVD-R/-RW Write */
+        if (!atapi_is_burner()) {
+            return 0;
+        }
+        stw_be_p(p, 0x002b);
+        p[2] = 0x03;
+        p[3] = 4;
+        p[4] = 0x01;            /* buffer underrun free */
+        p[5] = p[6] = p[7] = 0;
+        *current = true;
+        return 8;
+
     default:
         return 0;
     }
@@ -852,7 +897,9 @@ static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p, bool *curren
 
 static void cmd_get_configuration(IDEState *s, uint8_t *buf)
 {
-    static const uint16_t features[] = { 0x0000, 0x0001, 0x0003, 0x0010 };
+    static const uint16_t features[] = {
+        0x0000, 0x0001, 0x0003, 0x0010, 0x0021, 0x002b,
+    };
     uint16_t start = lduw_be_p(buf + 2);
     int rt = buf[1] & 0x03;
     int max_len = lduw_be_p(buf + 7);
@@ -931,7 +978,11 @@ static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
         p[0] = MODE_PAGE_CAPABILITIES;
         p[1] = 20;
         p[2] = 0x3b;            /* reads CD-R/RW, DVD-ROM, DVD-R, DVD-RAM */
-        p[3] = 0x00;            /* writes nothing, yet */
+        /*
+         * bit 0 CD-R, bit 1 CD-RW, bit 4 DVD-R.  A drive whose page 2A says
+         * it cannot write is not asked to, whatever GET CONFIGURATION says.
+         */
+        p[3] = atapi_is_burner() ? 0x13 : 0x00;
         /*
          * Claim PLAY_AUDIO (0x01): some Linux code will not automount
          * without it.
@@ -1357,6 +1408,7 @@ static const char *atapi_cmd_name(uint8_t op)
     case 0x00: return "TEST UNIT READY";
     case 0x03: return "REQUEST SENSE";
     case 0x12: return "INQUIRY";
+    case 0x1a: return "MODE SENSE(6)";
     case 0x1b: return "START/STOP UNIT";
     case 0x1e: return "PREVENT/ALLOW REMOVAL";
     case 0x23: return "READ FORMAT CAPACITIES";
