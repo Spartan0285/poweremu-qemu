@@ -1315,12 +1315,35 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     }
     m->crtc_ext = true;
 
+    /* Non-zero when the visible width was snapped below the width the
+     * hardware lays a row out at (see host-native-width). */
+    uint32_t hw_row_width = 0;
+
     /* Extract display dimensions from CRTC timing registers */
     /* H_TOTAL_DISP: bits [7:0] = h_total/8-1, bits [23:16] = h_disp/8-1 */
     m->width = (((h_total_disp >> 16) & 0xFF) + 1) * 8;
 
     /* V_TOTAL_DISP: bits [10:0] = v_total-1, bits [26:16] = v_disp-1 */
     m->height = ((v_total_disp >> 16) & 0x7FF) + 1;
+
+    /* Harmony 1:1: the CRTC width is quantized to 8 px, so a host width like
+     * 1710 arrives as its 8-rounded neighbour (1712).  When the guest is in
+     * exactly that mode, present the true host width instead, so a guest pixel
+     * equals a host point.  Height is already exact, so it must match as-is.
+     * The stride path below keeps the padded (8-aligned) pitch, and the present
+     * loop copies only `width` px per row, so a width narrower than the stride
+     * is already handled. */
+    if (s->host_native_w && s->host_native_h &&
+        m->height == s->host_native_h &&
+        m->width == ((s->host_native_w + 7) & ~7u)) {
+        /* Keep the width the hardware actually lays its rows out at: the
+         * scan-out shows host_native_w columns, but a row is still the
+         * 8-aligned width wide, and a stride worked out from the narrower
+         * number would shear the picture -- which is what the grey Apple
+         * looked like while booting, before the driver programs CRTC_PITCH. */
+        hw_row_width = m->width;
+        m->width = s->host_native_w;
+    }
 
     /* Sanity check dimensions */
     if (m->width < 64 || m->width > 4096 ||
@@ -1371,7 +1394,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     if (pitch & 0x7FF) {
         m->stride = (pitch & 0x7FF) * 8 * ((m->bpp + 7) / 8);
     } else {
-        m->stride = m->width * ((m->bpp + 7) / 8);
+        m->stride = (hw_row_width ? hw_row_width : m->width) * ((m->bpp + 7) / 8);
     }
 
     /*
@@ -1476,6 +1499,51 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
 {
     for (int i = 0; i < width; i++) {
         dst[i] = bswap32(src[i]);
+    }
+}
+
+/*
+ * Note that something was written to VRAM, and remember where it lands on the
+ * screen.
+ *
+ * Everything that draws already says which bytes it touched -- a blit knows
+ * its destination rectangle, because that is what a blit is.  That answer used
+ * to be thrown away, the whole screen byte-swapped every tick, and the result
+ * compared against the previous one to rediscover what we had just been told.
+ * Keeping the rows instead is free and makes a frame cost what was drawn.
+ *
+ * Rows rather than rectangles: a byte range maps to a row range exactly,
+ * whereas its left and right edges depend on how the range wraps, and the
+ * saving from the extra precision is small next to not doing the whole screen.
+ */
+static void ppc_mac_gpu_dirty(PPCMacGPUState *s, ram_addr_t off, ram_addr_t len)
+{
+    memory_region_set_dirty(&s->vram, off, len);
+
+    if (s->disp.stride) {
+        ram_addr_t base = s->disp.offset;
+        ram_addr_t span = (ram_addr_t)s->disp.stride * s->disp.height;
+        ram_addr_t a = off < base ? base : off;
+        ram_addr_t b = off + len;
+        if (b > base + span) {
+            b = base + span;
+        }
+        if (a < b) {
+            int y0 = (int)((a - base) / s->disp.stride);
+            int y1 = (int)((b - 1 - base) / s->disp.stride);
+            if (!s->dmg_any) {
+                s->dmg_any = true;
+                s->dmg_y0 = y0;
+                s->dmg_y1 = y1;
+            } else {
+                if (y0 < s->dmg_y0) {
+                    s->dmg_y0 = y0;
+                }
+                if (y1 > s->dmg_y1) {
+                    s->dmg_y1 = y1;
+                }
+            }
+        }
     }
 }
 
@@ -1896,16 +1964,124 @@ static void ppc_mac_gpu_display_update(void *opaque)
         s->renderer->flush_drag_paste(s->renderer_opaque, vram_ptr);
     }
 
-    /* Bswap copy: VRAM (BE) → shadow buffer (LE) */
+    /*
+     * Bswap copy: VRAM (BE) -> shadow buffer (LE), and say what changed.
+     *
+     * This used to swap the whole screen every tick and then announce the
+     * whole screen as damaged, which left the display code downstream to work
+     * out what had actually changed by comparing the result against the last
+     * one, row by row.  Between them that was about 22 MB of traffic per tick,
+     * held under the big lock, and it was measured taking a sixth of the
+     * emulated processor's time away from the guest -- to notice changes that
+     * most of the time had not happened.
+     *
+     * The card already marks the pages it writes (every blit, every 3D draw,
+     * the PM4 paths and the MMIO window all call memory_region_set_dirty), so
+     * ask for that instead: swap only the rows the guest has drawn, and
+     * announce only those rows.
+     *
+     * A row missed here is a row that never reaches the screen, so anything
+     * that writes VRAM without marking it would show as a patch that never
+     * repaints.  The renderer writes through a shared Metal buffer, which is
+     * exactly the sort of path that could do that, so the whole screen is
+     * still swept now and then -- rarely enough to cost nothing, often enough
+     * that any such patch heals within half a second.  PE_GPU_DIRTY=0 turns
+     * the whole thing off and goes back to sweeping every tick.
+     */
     const uint32_t *src = (const uint32_t *)(vram_ptr + s->disp.offset);
     uint32_t *dst = (uint32_t *)s->shadow_buf;
     uint32_t stride_u32 = stride / 4;
     int y;
+
+    if (!s->dirty_scan_checked) {
+        /*
+         * Off unless asked for.  Measured, it *halves* the frames that reach
+         * the screen: the renderer writes VRAM through a shared Metal buffer
+         * and those pages are never marked, so most of the guest's drawing is
+         * invisible here and only the twice-a-second sweep below catches it.
+         * The idea is right and the saving is large, but it cannot be turned
+         * on until every path that writes VRAM marks what it wrote.
+         * PE_GPU_DIRTY=1 turns it on to work on that.
+         */
+        const char *e = getenv("PE_GPU_FULL");
+        s->dirty_scan_checked = true;
+        s->dirty_scan = (e && e[0] == '1');   /* sweep everything, every tick */
+    }
+    if (++s->dirty_sweep >= 15) {        /* about twice a second at 30 Hz */
+        s->dirty_sweep = 0;
+    }
+
+    /*
+     * Swap and send only the rows something drew into.  Every so often the
+     * whole screen goes anyway: a row missed here would otherwise never
+     * repaint, and anything that writes VRAM without saying so -- the renderer
+     * reaches it through a shared buffer -- would leave a patch of the screen
+     * frozen.  Twice a second costs almost nothing and bounds that to half a
+     * second.  PE_GPU_FULL=1 goes back to sweeping every tick.
+     */
+    /*
+     * What changed comes from two places, and either one alone is blind to
+     * half the screen.
+     *
+     * The card says where it drew -- every blit knows its destination -- but
+     * the renderer reaches VRAM through a shared buffer, and more to the point
+     * a great deal of Mac OS X is drawn by the processor writing pixels
+     * straight into video memory: all the text, for one.  None of that passes
+     * through the card's drawing paths at all.  Tracked on its own it showed
+     * as typing that only appeared twice a second.
+     *
+     * The other place is the dirty-page log the memory system already keeps
+     * for us, which catches exactly those processor writes and misses the
+     * renderer's.  So take both: the pages the processor wrote, and the rows
+     * the card says it drew.
+     */
+    if (!s->dirty_scan && s->dirty_sweep != 0) {
+        DirtyBitmapSnapshot *snap;
+        int y0 = s->dmg_any ? s->dmg_y0 : (int)height;
+        int y1 = s->dmg_any ? s->dmg_y1 : -1;
+        s->dmg_any = false;
+        snap = memory_region_snapshot_and_clear_dirty(&s->vram, s->disp.offset,
+                                                      (ram_addr_t)stride * height,
+                                                      DIRTY_MEMORY_VGA);
+        for (y = 0; y < (int)height; y++) {
+            if (!memory_region_snapshot_get_dirty(&s->vram, snap,
+                                                  s->disp.offset +
+                                                  (ram_addr_t)y * stride, stride)) {
+                continue;
+            }
+            if (y < y0) {
+                y0 = y;
+            }
+            if (y > y1) {
+                y1 = y;
+            }
+        }
+        g_free(snap);
+        if (y0 < 0) {
+            y0 = 0;
+        }
+        if (y1 >= (int)height) {
+            y1 = (int)height - 1;
+        }
+        if (y0 > y1) {
+            return;                     /* nothing was drawn */
+        }
+        for (y = y0; y <= y1; y++) {
+            ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
+                                      src + y * stride_u32, width);
+        }
+        dpy_gfx_update(s->con, 0, y0, width, y1 - y0 + 1);
+        return;
+    }
+
     for (y = 0; y < (int)height; y++) {
         ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
                                   src + y * stride_u32,
                                   width);
     }
+    s->dmg_any = false;
+    memory_region_reset_dirty(&s->vram, s->disp.offset,
+                              (ram_addr_t)stride * height, DIRTY_MEMORY_VGA);
 
     dpy_gfx_update_full(s->con);
 }
@@ -1979,7 +2155,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
         r200_vram_access(s, off, off + 4, true, 6);
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
         memcpy(vram + off, &wire_val, 4);
-        memory_region_set_dirty(&s->vram, off, 4);
+        ppc_mac_gpu_dirty(s, off, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> VRAM[0x%x]",
                       reg_idx, wb_val, off);
     } else {
@@ -2020,7 +2196,7 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
             uint32_t off = addr - fb_base;
             memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off,
                    &wire_val, 4);
-            memory_region_set_dirty(&s->vram, off, 4);
+            ppc_mac_gpu_dirty(s, off, 4);
         } else {
             address_space_write(&address_space_memory, addr,
                                 MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
@@ -2641,7 +2817,7 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
                              (uint64_t)s->host_data_dst_y * s->host_data_pitch;
             uint64_t len = (uint64_t)s->host_data_h * s->host_data_pitch;
             if (start + len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, start, len);
+                ppc_mac_gpu_dirty(s, start, len);
             }
             s->host_data_active = false;
             s->display_invalid = true;
@@ -2696,7 +2872,7 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
                   (uint64_t)s->host_data_w * bpp
                 : (uint64_t)s->host_data_w * bpp;
             if (dirty_start + dirty_len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+                ppc_mac_gpu_dirty(s, dirty_start, dirty_len);
             }
             if (g_frame_tracker) {
                 frame_tracker_record_detail(g_frame_tracker,
@@ -3350,7 +3526,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 uint64_t dirty_len = (blit_h > 1)
                     ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
                     : (uint64_t)blit_w * bpp;
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+                ppc_mac_gpu_dirty(s, dirty_start, dirty_len);
 
                 /* Phase A/C: stride override for shadow RT path */
                 if (dst_offset == s->regs.crtc_offset &&
@@ -3553,7 +3729,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         uint64_t dirty_len = (blit_h > 1)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+        ppc_mac_gpu_dirty(s, dirty_start, dirty_len);
 
         /*
          * SRT write-through: if this 2D BLIT wrote to a VRAM offset
@@ -3682,7 +3858,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         uint64_t fill_dirty_len = (blit_h > 1)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, fill_dirty_start, fill_dirty_len);
+        ppc_mac_gpu_dirty(s, fill_dirty_start, fill_dirty_len);
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
     }
@@ -3982,7 +4158,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
         if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+            ppc_mac_gpu_dirty(s, dirty_start, dirty_len);
         }
         s->display_invalid = true;
 
@@ -4042,7 +4218,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
             : (uint64_t)blit_w * bpp;
         if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+            ppc_mac_gpu_dirty(s, dirty_start, dirty_len);
         }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
@@ -5948,7 +6124,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                        pkt.rt_offset, pkt.rt_pitch, pkt.rt_height);
     } else if (r200_rate.draws++,
                r200_render_draw(s, vram, &pkt) == 0) {
-        memory_region_set_dirty(&s->vram, pkt.rt_offset,
+        ppc_mac_gpu_dirty(s, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
         r200_perf.draws++;
         r200_traffic.draws++;
@@ -6267,7 +6443,7 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
         uint64_t dirty_len = (uint64_t)state.screen_height *
                              (uint64_t)state.screen_width * 4;
         if (color_offset + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, color_offset, dirty_len);
+            ppc_mac_gpu_dirty(s, color_offset, dirty_len);
         }
         s->display_invalid = true;
 
@@ -6823,7 +6999,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            ppc_mac_gpu_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         }
@@ -7108,7 +7284,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            ppc_mac_gpu_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         r200_fill_notify(s, offset, pitch, dst_x, dst_y,
@@ -7235,7 +7411,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                               (uint64_t)blit_w * bpp
                             : (uint64_t)blit_w * bpp;
                         if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
+                            ppc_mac_gpu_dirty(s,
                                                     dirty_start, dirty_len);
                         }
                         s->display_invalid = true;
@@ -9883,7 +10059,7 @@ static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
     default:
         break;
     }
-    memory_region_set_dirty(&s->vram, addr, size);
+    ppc_mac_gpu_dirty(s, addr, size);
 }
 
 static const MemoryRegionOps ppc_mac_gpu_vram_bswap_ops = {
@@ -10209,7 +10385,16 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         e[50] = 0x01; e[51] = 0x01;
         e[52] = 0x01; e[53] = 0x01;
 
-        /* Detailed Timing Descriptor #1: 1024x768@60Hz (preferred) */
+        /* Detailed Timing Descriptor #1: 1024x768@60Hz (preferred).
+         *
+         * The host-native mode deliberately does NOT go here.  Marking it
+         * preferred made the firmware choose it to boot in, and it rounds the
+         * width down to the CRTC's 8-pixel step (1704 for a 1710-wide screen)
+         * while the framebuffer is still laid out for the mode it was started
+         * with -- which sheared the grey Apple on the way up.  The mode is
+         * offered through the patched NDRV's table instead, so nothing picks it
+         * until Harmony asks for it. */
+        {
         /* Pixel clock: 65.00 MHz = 6500 in 10kHz units */
         e[54] = 0x64; e[55] = 0x19; /* pixel clock low/high (6500 = 0x1964) */
         e[56] = 0x00; /* H active low 8 bits (1024 & 0xFF = 0x00) */
@@ -10228,6 +10413,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         e[69] = 0x00; /* H border */
         e[70] = 0x00; /* V border */
         e[71] = 0x18; /* flags: non-interlaced, normal, digital separate */
+        }
 
         /* Descriptor #2: Monitor name */
         e[72] = 0x00; e[73] = 0x00; e[74] = 0x00;
@@ -10413,6 +10599,8 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
+    DEFINE_PROP_UINT32("host-native-width", PPCMacGPUState, host_native_w, 0),
+    DEFINE_PROP_UINT32("host-native-height", PPCMacGPUState, host_native_h, 0),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
 };
 
@@ -10522,7 +10710,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     s->surface_width = 0;
     s->surface_height = 0;
     s->surface_stride = 0;
-    memory_region_set_dirty(&s->vram, 0, s->vram_size);
+    ppc_mac_gpu_dirty(s, 0, s->vram_size);
     /*
      * The pointer has to be handed to the window again.  Its picture and
      * position are restored above, but they reached the window in the first

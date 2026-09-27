@@ -210,14 +210,16 @@ static void pe_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h
 }
 
 /*
- * Harmony mode: everything that is not one of the guest's windows is
- * handed to PowerEmu transparent, so its windows can sit on this Mac's
- * desktop with nothing of the guest's own desktop behind them.
+ * Harmony mode: everything that is not one of the guest's windows is handed
+ * to PowerEmu transparent, so its windows sit on this Mac's desktop with the
+ * guest's own wallpaper and menu bar gone -- the menu bar is surfaced in this
+ * Mac's own menu bar instead (see the agent's window/menu reporting), not
+ * left as a strip on the guest's screen.
  *
- * The GPU model keeps a grid of tiles saying what last covered each part
- * of the screen.  Where that is a window the pixel is opaque; everywhere
- * else -- the wallpaper, the menu bar, anything never drawn -- it is
- * transparent.  Outside harmony mode this does nothing at all.
+ * The GPU model keeps a grid of tiles saying what last covered each part of
+ * the screen.  A window pixel is opaque; the wallpaper, the menu bar, and
+ * anything never drawn are transparent.  Outside harmony mode this does
+ * nothing at all.
  */
 static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h)
 {
@@ -546,7 +548,19 @@ static void pe_attach(Notifier *n, void *data)
     pd->dcl.ops = &pe_ops;
     pd->dcl.con = con;
     register_displaychangelistener(&pd->dcl);
-    update_displaychangelistener(&pd->dcl, 16);        /* about 60 Hz */
+    /*
+     * Thirty times a second, not sixty.
+     *
+     * Every tick byte-swaps the whole of VRAM into the shadow buffer and then
+     * compares it row by row against the shared frame -- about 22 MB of
+     * traffic -- and it does all of that holding the big lock.  Measured, that
+     * was 17% of wall time on the main loop and the emulated processor spent
+     * 16.6% of its own time waiting for the lock it was holding, to notice
+     * changes that in that sample never came.  The machinery for spotting the
+     * guest painting was a sixth of the reason it painted slowly.  Thirty is
+     * the rate the host wants anyway.
+     */
+    update_displaychangelistener(&pd->dcl, 33);        /* about 30 Hz */
     pd->registered = true;
 }
 

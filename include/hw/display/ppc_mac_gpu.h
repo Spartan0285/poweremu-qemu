@@ -705,6 +705,15 @@ struct PPCMacGPUState {
      * Cocoa backend expects little-endian XRGB: bytes [B,G,R,X].
      * We bswap32 each pixel from VRAM into this buffer. */
     uint8_t *shadow_buf;
+    /* Swapping and announcing only the rows the card marked as written.
+     * See ppc_mac_gpu_display_update. */
+    bool dirty_scan;
+    bool dirty_scan_checked;
+    unsigned dirty_sweep;
+    /* The rows drawn since the screen was last sent.  See
+     * ppc_mac_gpu_dirty. */
+    bool dmg_any;
+    int dmg_y0, dmg_y1;
     /* What the UI's current surface describes, so it is replaced only when
      * it would actually differ (see ppc_mac_gpu_display_update). */
     uint32_t surface_width, surface_height, surface_stride;
@@ -784,6 +793,12 @@ struct PPCMacGPUState {
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
+    /* Harmony 1:1: the host screen's exact point size.  The CRTC can only
+     * encode a visible width that is a multiple of 8, so when the guest selects
+     * the 8-rounded neighbour of this width at this height, the scanout width
+     * is snapped back to exactly host_native_w -- letting a guest pixel equal a
+     * host point with no scaling.  0 = off. */
+    uint32_t host_native_w, host_native_h;
     int32_t hwc_x, hwc_y;
     bool hwc_visible;
     /* A woken machine's window has never been told what the pointer looks
