@@ -30,6 +30,10 @@
 #include "scsi/constants.h"
 #include "ide-internal.h"
 #include "trace.h"
+#include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define ATAPI_SECTOR_BITS (2 + BDRV_SECTOR_BITS)
 #define ATAPI_SECTOR_SIZE (1 << ATAPI_SECTOR_BITS)
@@ -115,6 +119,11 @@ cd_read_sector_sync(IDEState *s)
     }
 
     if (ret < 0) {
+        if (getenv("POWEREMU_ATAPI")) {
+            fprintf(stderr, "ATAPI    sync read of lba %d (%d-byte sectors) "
+                    "failed: %s\n", (int)s->lba, s->cd_sector_size,
+                    strerror(-ret));
+        }
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
     } else {
         block_acct_done(blk_get_stats(s->blk), &s->acct);
@@ -132,6 +141,10 @@ static void cd_read_sector_cb(void *opaque, int ret)
     trace_cd_read_sector_cb(s->lba, ret);
 
     if (ret < 0) {
+        if (getenv("POWEREMU_ATAPI")) {
+            fprintf(stderr, "ATAPI    read of lba %d failed: %s\n",
+                    (int)s->lba, strerror(-ret));
+        }
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
         ide_atapi_io_error(s, ret);
         return;
@@ -185,6 +198,10 @@ void ide_atapi_cmd_ok(IDEState *s)
 
 void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
 {
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    -> CHECK CONDITION sense=%d asc=0x%02x\n",
+                sense_key, asc);
+    }
     trace_ide_atapi_cmd_error(s, sense_key, asc);
     s->error = sense_key << 4;
     s->status = READY_STAT | ERR_STAT;
@@ -197,6 +214,10 @@ void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
 
 void ide_atapi_io_error(IDEState *s, int ret)
 {
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    I/O error at lba %d: %s (%d)\n",
+                (int)s->lba, strerror(ret < 0 ? -ret : ret), ret);
+    }
     /* XXX: handle more errors */
     if (ret == -ENOMEDIUM) {
         ide_atapi_cmd_error(s, NOT_READY,
@@ -806,6 +827,147 @@ static bool atapi_is_burner(void)
 }
 
 /*
+ * PowerEmu Option B: stream the guest's burn to the host's physical drive in
+ * real time.  When POWEREMU_BURN_STREAM names a Unix socket, the recordable
+ * drive reports the burn lifecycle to PowerEmu, which runs the physical burn
+ * through DiscRecording, reading the data from the disc-image backing this
+ * drive writes to.  Newline-delimited events:
+ *   "TRACK <blocks>\n"          a burn of that many 2048-byte blocks begins
+ *   "WROTE <lba> <blocks>\n"    the guest has written that range
+ *   "CLOSE\n"                   the session is closed; finalise the disc
+ * The data itself travels through the shared backing file, not the socket.
+ */
+static int pe_burn_fd = -1;
+/*
+ * Lockstep (Option B): PowerEmu writes "CONSUMED <blocks>\n" back as the
+ * physical burn eats data, and we hold the guest's WRITE(10) completions until
+ * the burn is no longer more than PE_BURN_MARGIN blocks behind.  That paces
+ * the guest to the real burn speed, so its own progress bar tracks the disc.
+ */
+#define PE_BURN_MARGIN 512          /* let the guest run 1 MB ahead (drive buffer) */
+static void pe_burn_send(const char *fmt, ...);
+static uint32_t pe_burn_consumed;
+static QEMUTimer *pe_burn_timer;
+static IDEState *pe_burn_pending;
+
+static void pe_burn_try_complete(void)
+{
+    IDEState *s = pe_burn_pending;
+    if (!s) {
+        return;
+    }
+    if (s->recordable_nwa <= pe_burn_consumed + PE_BURN_MARGIN) {
+        pe_burn_pending = NULL;
+        ide_atapi_cmd_ok(s);
+    } else {
+        timer_mod(pe_burn_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5 * SCALE_MS);
+    }
+}
+
+static void pe_burn_timer_cb(void *opaque)
+{
+    pe_burn_try_complete();
+}
+
+static void pe_burn_read_cb(void *opaque)
+{
+    char buf[512];
+    char *p;
+    int n = read(pe_burn_fd, buf, sizeof(buf) - 1);
+
+    if (n <= 0) {
+        qemu_set_fd_handler(pe_burn_fd, NULL, NULL, NULL);
+        close(pe_burn_fd);
+        pe_burn_fd = -1;
+        pe_burn_pending = NULL;
+        return;
+    }
+    buf[n] = 0;
+    for (p = buf; (p = strstr(p, "CONSUMED ")); p += 9) {
+        uint32_t v = (uint32_t)strtoul(p + 9, NULL, 10);
+        if (v > pe_burn_consumed) {
+            pe_burn_consumed = v;
+        }
+    }
+    pe_burn_try_complete();
+}
+
+/*
+ * Called at the completion of a WRITE(10) instead of ide_atapi_cmd_ok when a
+ * physical burn is streaming: throttle the guest to the burn's pace.
+ */
+void ide_atapi_write_complete(IDEState *s)
+{
+    /* The DMA has flushed this chunk to the backing file: the data up to
+     * recordable_nwa is now durable and safe for PowerEmu to read. */
+    pe_burn_send("WROTE %u\n", s->recordable_nwa);
+    if (pe_burn_fd >= 0 && getenv("POWEREMU_BURN_STREAM") &&
+        s->recordable_nwa > pe_burn_consumed + PE_BURN_MARGIN) {
+        if (!pe_burn_timer) {
+            pe_burn_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pe_burn_timer_cb, NULL);
+        }
+        pe_burn_pending = s;
+        timer_mod(pe_burn_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5 * SCALE_MS);
+        return;
+    }
+    ide_atapi_cmd_ok(s);
+}
+
+static void pe_burn_send(const char *fmt, ...)
+{
+    const char *path = getenv("POWEREMU_BURN_STREAM");
+    va_list ap;
+    char buf[128];
+    int n;
+
+    if (!path) {
+        return;
+    }
+    if (pe_burn_fd < 0) {
+        struct sockaddr_un addr = { .sun_family = AF_UNIX };
+        pe_burn_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (pe_burn_fd < 0) {
+            return;
+        }
+        pstrcpy(addr.sun_path, sizeof(addr.sun_path), path);
+        if (connect(pe_burn_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(pe_burn_fd);
+            pe_burn_fd = -1;
+            return;
+        }
+        pe_burn_consumed = 0;
+        qemu_set_fd_handler(pe_burn_fd, pe_burn_read_cb, NULL, NULL);
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        if (write(pe_burn_fd, buf, n) < 0) {
+            close(pe_burn_fd);
+            pe_burn_fd = -1;
+        }
+    }
+}
+
+/*
+ * A recordable disc: the burner switch is on and the drive's backing was
+ * opened writable (ide-cd recordable=on).  A pressed disc, or a burner with
+ * a read-only backing, is not recordable.
+ */
+static bool atapi_recordable(IDEState *s)
+{
+    return atapi_is_burner() && media_present(s) && blk_is_writable(s->blk);
+}
+
+/* Recordable and not yet finalised: the guest may still write to it. */
+static bool atapi_disc_blank(IDEState *s)
+{
+    return atapi_recordable(s) && !s->recordable_closed;
+}
+
+/*
  * One feature descriptor at `p`, or 0 if this drive has no such feature.
  * `current` says whether it applies to what is in the drive now.
  */
@@ -824,8 +986,10 @@ static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p, bool *curren
         n += 4;
         if (atapi_is_burner()) {
             stw_be_p(p + n, MMC_PROFILE_DVD_R_SR);
+            p[n + 2] = atapi_disc_blank(s) && media_is_dvd(s);
             n += 4;
             stw_be_p(p + n, MMC_PROFILE_CD_R);
+            p[n + 2] = atapi_disc_blank(s) && media_is_cd(s);
             n += 4;
         }
         p[3] = n - 4;           /* additional length */
@@ -919,7 +1083,18 @@ static void cmd_get_configuration(IDEState *s, uint8_t *buf)
     }
     memset(buf, 0, BDRV_SECTOR_SIZE);
 
-    if (media_is_dvd(s)) {
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    [cfg] burner=%d writable=%d present=%d "
+                "nb_sectors=%d dvd=%d blank=%d closed=%d\n",
+                atapi_is_burner(), blk_is_writable(s->blk), media_present(s),
+                (int)s->nb_sectors, media_is_dvd(s), atapi_disc_blank(s),
+                s->recordable_closed);
+    }
+    if (atapi_disc_blank(s) && media_is_dvd(s)) {
+        stw_be_p(buf + 6, MMC_PROFILE_DVD_R_SR);
+    } else if (atapi_disc_blank(s) && media_is_cd(s)) {
+        stw_be_p(buf + 6, MMC_PROFILE_CD_R);
+    } else if (media_is_dvd(s)) {
         stw_be_p(buf + 6, MMC_PROFILE_DVD_ROM);
     } else if (media_is_cd(s)) {
         stw_be_p(buf + 6, MMC_PROFILE_CD_ROM);
@@ -972,6 +1147,24 @@ static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
         p[0] = MODE_PAGE_AUDIO_CTL;
         p[1] = 14;
         return 16;
+
+    case 0x05:                  /* Write Parameters (MMC) */
+        /*
+         * The burn engine reads this before a write to learn the drive's
+         * write parameters, then MODE SELECTs its own choices back.  A drive
+         * that cannot answer it fails the burn at "opening session".  We
+         * report a DAO write of 2048-byte Mode-1 blocks, which is what a data
+         * DVD-R burn uses; the host overrides fields it cares about.
+         */
+        memset(p, 0, 52);
+        p[0] = 0x05;
+        p[1] = 0x32;            /* page length: 50 (total page 52) */
+        p[2] = 0x02;            /* BUFE off, write type 2 = DAO/SAO */
+        p[3] = 0x00;            /* no multisession, track mode 0 */
+        p[4] = 0x08;            /* data block type 8 = Mode 1, 2048 bytes */
+        p[8] = 0x00;            /* session format: data */
+        stl_be_p(p + 10, 16);  /* packet size */
+        return 52;
 
     case MODE_PAGE_CAPABILITIES:
         memset(p, 0, 22);
@@ -1053,8 +1246,14 @@ static void cmd_mode_sense_6(IDEState *s, uint8_t *buf)
 
 static void cmd_test_unit_ready(IDEState *s, uint8_t *buf)
 {
-    /* Not Ready Conditions are already handled in ide_atapi_cmd(), so if we
-     * come here, we know that it's ready. */
+    /*
+     * Not Ready conditions are handled in ide_atapi_cmd(), so the media is
+     * present.  But a completely blank recordable disc must answer TEST UNIT
+     * READY with a BLANK CHECK (0x08 / 0x64 / 0x00): that is the sense Mac OS
+     * X's PollForMedia looks for to recognise blank media and keep the disc
+     * instead of probing it for a filesystem and ejecting it.  Once anything
+     * has been written the disc is readable and answers normally.
+     */
     ide_atapi_cmd_ok(s);
 }
 
@@ -1085,6 +1284,26 @@ static void cmd_read(IDEState *s, uint8_t* buf)
     lba = ldl_be_p(buf + 2);
     if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+        return;
+    }
+
+    /*
+     * A blank recordable disc is not a disc of zeroes: reading an unwritten
+     * block must fail, exactly as a real drive fails on an unrecorded area.
+     * Without this the host reads sector 0 as zeroes, tries to mount a
+     * filesystem that is not there, fails, and ejects the disc -- which is
+     * why a blank disc silently disappeared instead of offering to burn.
+     * Blocks below the next writable address have been written and read back.
+     */
+    if (atapi_disc_blank(s) && lba + nb_sectors > s->recordable_nwa) {
+        /*
+         * Sense key BLANK CHECK with ASC 0x64/ASCQ 0x00 is exactly what Mac
+         * OS X's optical driver looks for to recognise a blank disc and NOT
+         * eject it (IOSCSIMultimediaCommandsDevice::PollForMedia).  Any other
+         * sense here -- ILLEGAL REQUEST, MEDIUM ERROR -- makes it treat the
+         * disc as unreadable and eject it.
+         */
+        ide_atapi_cmd_error(s, BLANK_CHECK, ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
         return;
     }
 
@@ -1173,9 +1392,35 @@ static void cmd_start_stop_unit(IDEState *s, uint8_t* buf)
             return;
         }
 
+        /*
+         * Mac OS X's autodiskmount ejects a freshly inserted blank recordable
+         * disc within a couple of seconds because it cannot mount a
+         * filesystem on it -- which would make the disc vanish before anyone
+         * could burn to it.  A real burner holds blank media until the user
+         * ejects it, so we refuse the automatic eject while the disc is still
+         * blank.  Once anything has been written (nwa > 0) the disc is a
+         * normal readable disc and ejects normally, and the app can always
+         * force an eject through the monitor.
+         */
+        if (!start && atapi_disc_blank(s) && s->recordable_nwa == 0) {
+            if (getenv("POWEREMU_ATAPI")) {
+                fprintf(stderr, "ATAPI    [noeject] holding blank recordable "
+                        "disc against autodiskmount eject\n");
+            }
+            ide_atapi_cmd_ok(s);
+            return;
+        }
         if (s->tray_open != !start) {
             blk_eject(s->blk, !start);
             s->tray_open = !start;
+            /*
+             * The guest ejected (or loaded) the disc.  Tell PowerEmu so a
+             * physical drive bridged to this one can follow -- ejecting in the
+             * guest ejects the real disc too.
+             */
+            if (!start) {
+                pe_burn_send("EJECT\n");
+            }
         }
     }
 
@@ -1239,6 +1484,13 @@ static void cmd_read_cdvd_capacity(IDEState *s, uint8_t* buf)
 {
     uint64_t total_sectors = s->nb_sectors >> 2;
 
+    /*
+     * READ CAPACITY returns the last readable block.  On a blank recordable
+     * disc only what has been written is readable, so a fully blank disc has
+     * no last block: report zero readable capacity.  If we reported the full
+     * disc, the host would probe it for a filesystem, fail, and eject it
+     * instead of recognising a blank disc ready to burn.
+     */
     /* NOTE: it is really the number of sectors minus 1 */
     stl_be_p(buf, total_sectors - 1);
     stl_be_p(buf + 4, 2048);
@@ -1259,13 +1511,31 @@ static void cmd_read_disc_information(IDEState *s, uint8_t* buf)
 
     memset(buf, 0, 34);
     buf[1] = 32;
-    buf[2] = 0xe; /* last session complete, disc finalized */
-    buf[3] = 1;   /* first track on disc */
-    buf[4] = 1;   /* # of sessions */
-    buf[5] = 1;   /* first track of last session */
-    buf[6] = 1;   /* last track of last session */
-    buf[7] = 0x20; /* unrestricted use */
-    buf[8] = 0x00; /* CD-ROM or DVD-ROM */
+    if (atapi_disc_blank(s)) {
+        /*
+         * Disc status bits 0-1: 00 empty, 01 incomplete/appendable, 10
+         * finalised.  A blank recordable disc that has not been written is
+         * empty; once the guest has written a track but not closed it, it is
+         * appendable.  Last-session status (bits 2-3) tracks the same.
+         */
+        int written = s->recordable_nwa > 0;
+        buf[2] = written ? 0x01 : 0x00;         /* disc status: empty/append */
+        buf[2] |= written ? 0x04 : 0x00;        /* last session: incomplete */
+        buf[3] = 1;   /* first track on disc */
+        buf[4] = 1;   /* # of sessions (lsb) */
+        buf[5] = 1;   /* first track of last session (lsb) */
+        buf[6] = 1;   /* last track of last session (lsb) */
+        buf[7] = 0x20; /* unrestricted use, not erasable (DVD-R) */
+        buf[8] = 0x00; /* disc type: CD-DA/data or DVD */
+    } else {
+        buf[2] = 0xe; /* last session complete, disc finalized */
+        buf[3] = 1;   /* first track on disc */
+        buf[4] = 1;   /* # of sessions */
+        buf[5] = 1;   /* first track of last session */
+        buf[6] = 1;   /* last track of last session */
+        buf[7] = 0x20; /* unrestricted use */
+        buf[8] = 0x00; /* CD-ROM or DVD-ROM */
+    }
     /* 9-10-11: most significant byte corresponding bytes 4-5-6 */
     /* 12-23: not meaningful for CD-ROM or DVD-ROM */
     /* 24-31: disc bar code */
@@ -1365,6 +1635,328 @@ enum {
     CONDDATA = 0x08,
 };
 
+/*
+ * ATAPI data-out (host-to-device) PIO transfer.  Receive `len` bytes from the
+ * host into io_buffer, then call `cb`.  This is the mirror of
+ * ide_atapi_cmd_reply for writes: the interrupt reason is set to data-out
+ * (CD=0, IO=0) so the host drives the data register the other way, and the
+ * byte-count registers advertise how much the drive will take.
+ */
+static void ide_atapi_cmd_write_pio(IDEState *s, uint8_t op, int len)
+{
+    s->atapi_write_op = op;
+    s->lba = -1;
+    s->packet_transfer_size = len;
+    s->elementary_transfer_size = 0;
+    s->io_buffer_index = 0;
+    s->io_buffer_size = len;
+    s->nsector = (s->nsector & ~7);     /* CD=0, IO=0: host -> device */
+    s->lcyl = len & 0xff;
+    s->hcyl = (len >> 8) & 0xff;
+    s->status = READY_STAT | SEEK_STAT;
+    ide_bus_set_irq(s->bus);
+    /* macio has no pio_transfer op, so this returns having armed the data
+     * register path; the guest now writes `len` bytes and the ATA layer
+     * calls ide_atapi_cmd_write_end when the buffer is full. */
+    ide_transfer_start(s, s->io_buffer, len, ide_atapi_cmd_write_end);
+}
+
+/*
+ * Completion of an ATAPI data-out (host-to-device) PIO transfer.  The bytes
+ * the host sent are in io_buffer; dispatch on the opcode that started it.
+ * This function is registered in core.c's transfer_end_table and
+ * ide_is_pio_out so the ATA data register accepts the write.
+ */
+void ide_atapi_cmd_write_end(IDEState *s)
+{
+    uint8_t *buf = s->io_buffer;
+
+    switch (s->atapi_write_op) {
+    case GPCMD_SEND_CUE_SHEET: {
+        /* Each descriptor is 8 bytes; the lead-out has track number 0xAA and
+         * its MSF gives the total length.  LBA = (min*60+sec)*75 + frame - 150. */
+        int i;
+        uint32_t blocks = 0;
+        for (i = 0; i + 8 <= s->io_buffer_size; i += 8) {
+            if (buf[i + 1] == 0xAA) {   /* lead-out */
+                int mn = buf[i + 5], sc = buf[i + 6], fr = buf[i + 7];
+                int lba = (mn * 60 + sc) * 75 + fr - 150;
+                if (lba > 0) {
+                    blocks = lba;
+                }
+            }
+        }
+        if (getenv("POWEREMU_ATAPI")) {
+            fprintf(stderr, "ATAPI    [cue sheet] %d bytes, lead-out -> %u blocks\n",
+                    s->io_buffer_size, blocks);
+        }
+        if (blocks) {
+            pe_burn_send("TRACK %u\n", blocks);
+        }
+        ide_atapi_cmd_ok(s);
+        break;
+    }
+    case GPCMD_MODE_SELECT_10: {
+        /*
+         * The parameter list carries the Write Parameters page (0x05).  We
+         * write mode-1 2048-byte blocks whatever the host selects, so we only
+         * need to accept it -- but the command must succeed or the burn stops
+         * at "opening session".
+         */
+        int blk_desc_len = lduw_be_p(buf + 6);
+        int off = 8 + blk_desc_len;
+        if (getenv("POWEREMU_ATAPI") && off + 4 < s->io_buffer_size &&
+            (buf[off] & 0x3f) == 0x05) {
+            fprintf(stderr, "ATAPI    [mode select] write type %d, "
+                    "block type %d\n", buf[off + 2] & 0x0f,
+                    buf[off + 4] & 0x0f);
+        }
+        ide_atapi_cmd_ok(s);
+        break;
+    }
+    default:
+        ide_atapi_cmd_ok(s);
+        break;
+    }
+}
+
+/*
+ * RESERVE TRACK (0x53): the burn engine reserves space for the track it is
+ * about to write.  CDB bytes 5-8 are the reservation size in blocks.  We keep
+ * a plain file, so there is nothing to physically reserve -- accept it.
+ */
+static void cmd_reserve_track(IDEState *s, uint8_t *buf)
+{
+    uint32_t blocks = ldl_be_p(buf + 5);
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    [reserve track] %u blocks\n", blocks);
+    }
+    pe_burn_send("TRACK %u\n", blocks);
+    ide_atapi_cmd_ok(s);
+}
+
+/* SEND OPC INFORMATION (0x54), SET STREAMING (0xb6): calibration/speed setup
+ * a real drive does before writing.  Nothing to do on a file -- accept. */
+static void cmd_nop_ok(IDEState *s, uint8_t *buf)
+{
+    ide_atapi_cmd_ok(s);
+}
+
+/*
+ * SYNCHRONIZE CACHE (0x35): flush written data to the backing file.
+ */
+static void cmd_synchronize_cache(IDEState *s, uint8_t *buf)
+{
+    blk_flush(s->blk);
+    ide_atapi_cmd_ok(s);
+}
+
+/*
+ * CLOSE TRACK/SESSION (0x5b): finalise.  Byte 2 bits 2-0 select what to close
+ * (1 = track, 2 = session).  After the session is closed the disc reads back
+ * as a finished DVD-ROM.
+ */
+static void cmd_close_track(IDEState *s, uint8_t *buf)
+{
+    int func = buf[2] & 0x07;
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    [close] function %d, nwa now %u\n",
+                func, s->recordable_nwa);
+    }
+    if (func == 1 || func == 2) {       /* close track or session: finalise */
+        if (func == 2) {
+            s->recordable_closed = true;
+        }
+        blk_flush(s->blk);
+        pe_burn_send("CLOSE\n");
+    }
+    ide_atapi_cmd_ok(s);
+}
+
+/*
+ * SEND CUE SHEET (0x5d): the guest describes a Disc-At-Once (DAO) session --
+ * the write mode Mac OS X uses for CD-R.  The cue sheet is a list of 8-byte
+ * descriptors ending in a lead-out (track number 0xAA) whose MSF address is
+ * the end of the user data.  We accept the sheet and, from that lead-out,
+ * learn the track size to announce the burn (there is no RESERVE TRACK in
+ * DAO).  The user data itself arrives next as WRITE(10)s.
+ */
+static void cmd_send_cue_sheet(IDEState *s, uint8_t *buf)
+{
+    int len = (buf[6] << 16) | (buf[7] << 8) | buf[8];   /* cue sheet size */
+
+    if (len == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (len > s->io_buffer_total_len) {
+        len = s->io_buffer_total_len;
+    }
+    ide_atapi_cmd_write_pio(s, GPCMD_SEND_CUE_SHEET, len);
+}
+
+static void cmd_mode_select(IDEState *s, uint8_t *buf)
+{
+    int len = lduw_be_p(buf + 7);       /* parameter list length */
+
+    if (len == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (len > s->io_buffer_total_len) {
+        len = s->io_buffer_total_len;
+    }
+    ide_atapi_cmd_write_pio(s, GPCMD_MODE_SELECT_10, len);
+}
+
+/*
+ * READ TRACK INFORMATION (0x52).  A blank recordable disc has one invisible
+ * track waiting to be written; the burn engine reads this to learn where it
+ * may start (the Next Writable Address) and how much room there is.
+ */
+static void cmd_read_track_information(IDEState *s, uint8_t *buf)
+{
+    uint32_t max_len = lduw_be_p(buf + 7);
+    uint64_t total = s->nb_sectors >> 2;
+    uint32_t nwa = s->recordable_nwa;
+
+    uint32_t free = total > nwa ? (total - nwa) : 0;
+
+    memset(buf, 0, 48);
+    stw_be_p(buf, 46 - 2);      /* data length */
+    buf[2] = 1;                 /* track number (LSB) */
+    buf[3] = 1;                 /* session number (LSB) */
+    /*
+     * MMC READ TRACK INFORMATION data.  Byte 5 bits 3-0 are the track mode
+     * (0x04 = data, uninterrupted).  Byte 6: bit6 Blank, bit4 FP (fixed
+     * packet), bits3-0 data mode (1).  Byte 7: bit1 LRA_V, bit0 NWA_V.
+     */
+    buf[5] = 0x04;                                  /* data track */
+    if (atapi_disc_blank(s)) {
+        buf[6] = (nwa == 0 ? 0x40 : 0x00) | 0x01;   /* Blank if untouched */
+        buf[7] = 0x01;                              /* NWA valid */
+    } else {
+        buf[6] = 0x01;
+    }
+    stl_be_p(buf + 8, 0);              /* track start address */
+    stl_be_p(buf + 12, nwa);          /* next writable address */
+    stl_be_p(buf + 16, free);         /* free blocks */
+    stl_be_p(buf + 20, 16);           /* fixed packet size (blocking) */
+    stl_be_p(buf + 24, total);        /* track size */
+    stl_be_p(buf + 28, nwa ? nwa - 1 : 0); /* last recorded address */
+    ide_atapi_cmd_reply(s, 48, max_len);
+}
+
+/*
+ * READ FORMAT CAPACITIES (0x23).  For a blank disc the burn engine asks how
+ * large a track it may format; we report the whole disc as the current and
+ * only usable capacity.
+ */
+static void cmd_read_format_capacities(IDEState *s, uint8_t *buf)
+{
+    uint32_t max_len = lduw_be_p(buf + 7);
+    uint64_t total = s->nb_sectors >> 2;
+
+    memset(buf, 0, 12);
+    buf[3] = 8;                        /* capacity list length: one descriptor */
+    stl_be_p(buf + 4, total);          /* number of blocks */
+    /*
+     * Current/maximum capacity descriptor.  Byte 8 is the descriptor type in
+     * bits 1-0: 01 unformatted, 10 formatted, 11 no media.  Bytes 9-11 are the
+     * block length (2048).  A blank recordable disc reports unformatted.
+     */
+    buf[8] = atapi_disc_blank(s) ? 0x01 : 0x02;
+    buf[9] = 0x00;
+    buf[10] = 0x08;                    /* 2048 = 0x000800 */
+    buf[11] = 0x00;
+    ide_atapi_cmd_reply(s, 12, max_len);
+}
+
+/*
+ * WRITE(10) (0x2a): the actual burn payload.  For now this only reports how
+ * the host is driving the transfer (DMA or PIO) so the data-out path can be
+ * built to match; it does not yet accept the data.
+ */
+static void cmd_write(IDEState *s, uint8_t *buf)
+{
+    uint64_t total = s->nb_sectors >> 2;
+    int32_t slba = (int32_t)ldl_be_p(buf + 2);      /* LBA is signed for DAO */
+    unsigned int lba;
+    unsigned int nb = (buf[0] == GPCMD_WRITE_10) ? lduw_be_p(buf + 7)
+                                                 : ldl_be_p(buf + 6);
+
+    if (!atapi_recordable(s)) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_ILLEGAL_OPCODE);
+        return;
+    }
+    if (nb == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    /*
+     * Disc-At-Once (CD-R) writes the lead-in at negative addresses and the
+     * lead-out past the end of the data.  Those are session metadata the host
+     * burn generates itself, so consume the data (so the guest's transfer
+     * completes) and discard it -- do not touch the backing or the NWA.
+     */
+    if (slba < 0 || (uint64_t)slba + nb > total) {
+        /*
+         * Consume the lead-in/lead-out data through the normal block-write DMA
+         * (which handles multi-chunk transfers) but aim it at a scratch region
+         * at the very end of the image that the producer never reads (the
+         * track is far smaller than the disc).  Do not advance the NWA, so the
+         * host burn is never told this metadata is user data.
+         */
+        if (getenv("POWEREMU_ATAPI")) {
+            fprintf(stderr, "ATAPI    [write10] lead-in/out slba=%d nb=%u "
+                    "-> scratch\n", slba, nb);
+        }
+        if (nb > total) {
+            nb = total;
+        }
+        s->atapi_write_op = buf[0];
+        s->lba = (int)(total - nb);                 /* scratch tail */
+        s->cd_sector_size = 2048;
+        s->packet_transfer_size = nb * 2048;
+        s->io_buffer_index = 0;
+        if (s->atapi_dma) {
+            s->status = READY_STAT | SEEK_STAT | DRQ_STAT | BUSY_STAT;
+            ide_start_dma(s, ide_atapi_cmd_read_dma_cb);
+        } else {
+            ide_atapi_cmd_ok(s);
+        }
+        return;
+    }
+    lba = (unsigned int)slba;
+    if (getenv("POWEREMU_ATAPI")) {
+        fprintf(stderr, "ATAPI    [write10] lba=%u nb=%u atapi_dma=%d\n",
+                lba, nb, s->atapi_dma);
+    }
+
+    s->atapi_write_op = buf[0];
+    s->lba = lba;
+    s->cd_sector_size = 2048;
+    s->packet_transfer_size = nb * 2048;
+    s->io_buffer_index = 0;
+    /*
+     * The written area becomes readable; advance the next writable address so
+     * reads below it succeed and READ TRACK INFORMATION reports the right free
+     * space.  Done up front: the macio DMA path signals completion with a
+     * plain OK and there is no per-command write callback to hook.
+     */
+    if (lba + nb > s->recordable_nwa) {
+        s->recordable_nwa = lba + nb;
+    }
+
+    if (s->atapi_dma) {
+        s->status = READY_STAT | SEEK_STAT | DRQ_STAT | BUSY_STAT;
+        ide_start_dma(s, ide_atapi_cmd_read_dma_cb);
+    } else {
+        /* Every burn seen so far writes by DMA; PIO write is not built yet. */
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_ILLEGAL_OPCODE);
+    }
+}
+
 static const struct AtapiCmd {
     void (*handler)(IDEState *s, uint8_t *buf);
     int flags;
@@ -1381,7 +1973,17 @@ static const struct AtapiCmd {
     [ 0x43 ] = { cmd_read_toc_pma_atip,             CHECK_READY },
     [ 0x46 ] = { cmd_get_configuration,             ALLOW_UA },
     [ 0x4a ] = { cmd_get_event_status_notification, ALLOW_UA },
+    [ 0x23 ] = { cmd_read_format_capacities,        CHECK_READY },
     [ 0x51 ] = { cmd_read_disc_information,         CHECK_READY },
+    [ 0x52 ] = { cmd_read_track_information,        CHECK_READY },
+    [ 0x2a ] = { cmd_write,                         CHECK_READY },
+    [ 0x35 ] = { cmd_synchronize_cache,             CHECK_READY | NONDATA },
+    [ 0x53 ] = { cmd_reserve_track,                 CHECK_READY | NONDATA },
+    [ 0x54 ] = { cmd_nop_ok,                        CHECK_READY | NONDATA },
+    [ 0x55 ] = { cmd_mode_select,                   0 },
+    [ 0x5b ] = { cmd_close_track,                   CHECK_READY | NONDATA },
+    [ 0x5d ] = { cmd_send_cue_sheet,                CHECK_READY },
+    [ 0xb6 ] = { cmd_nop_ok,                        NONDATA },
     [ 0x5a ] = { cmd_mode_sense, /* (10) */         0 },
     [ 0xa8 ] = { cmd_read, /* (12) */               CHECK_READY },
     [ 0xad ] = { cmd_read_dvd_structure,            CHECK_READY },
@@ -1446,6 +2048,9 @@ void ide_atapi_cmd(IDEState *s)
 {
     uint8_t *buf = s->io_buffer;
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
+
+    /* No data-out is in flight until a write command starts one. */
+    s->atapi_write_op = 0;
 
     if (getenv("POWEREMU_ATAPI")) {
         char pkt[ATAPI_PACKET_SIZE * 3 + 1];

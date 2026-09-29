@@ -1199,6 +1199,29 @@ static void ide_cd_change_cb(void *opaque, bool load, Error **errp)
     s->nb_sectors = nb_sectors;
 
     /*
+     * PowerEmu: raise the backend's write permission only while an actually
+     * writable disc is loaded.  The drive is born read-only (see ide-dev.c) so
+     * that a pressed, read-only disc -- a physical CD passed through, or a
+     * mounted ISO/Toast image -- can be inserted at all.  A blank for burning
+     * is the one medium the app loads read-write; when it appears we add
+     * BLK_PERM_WRITE so the burn path (and atapi_recordable, which tests
+     * blk_is_writable) can write to it, and when the disc leaves we drop the
+     * write permission again so the next pressed disc still fits.  Failure to
+     * raise it is not fatal: the disc is simply not treated as recordable.
+     */
+    {
+        BlockDriverState *bs = load ? blk_bs(s->blk) : NULL;
+        uint64_t perm = BLK_PERM_CONSISTENT_READ;
+        Error *perr = NULL;
+
+        if (bs && !bdrv_is_read_only(bs)) {
+            perm |= BLK_PERM_WRITE;
+        }
+        blk_set_perm(s->blk, perm, BLK_PERM_ALL, &perr);
+        error_free(perr);
+    }
+
+    /*
      * First indicate to the guest that a CD has been removed.  That's
      * done on the next command the guest sends us.
      *
@@ -2381,7 +2404,8 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 static bool ide_is_pio_out(IDEState *s)
 {
     if (s->end_transfer_func == ide_sector_write ||
-        s->end_transfer_func == ide_atapi_cmd) {
+        s->end_transfer_func == ide_atapi_cmd ||
+        s->end_transfer_func == ide_atapi_cmd_write_end) {
         return false;
     } else if (s->end_transfer_func == ide_sector_read ||
                s->end_transfer_func == ide_transfer_stop ||
@@ -2834,6 +2858,7 @@ static EndTransferFunc* transfer_end_table[] = {
         ide_atapi_cmd_reply_end,
         ide_atapi_cmd,
         ide_dummy_transfer_stop,
+        ide_atapi_cmd_write_end,
 };
 
 static int transfer_end_table_idx(EndTransferFunc *fn)

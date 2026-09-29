@@ -102,6 +102,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 {
     MacIOGPIOState *s = opaque;
     uint8_t ibit;
+    bool driven_low;
 
     trace_macio_gpio_write(addr, value);
 
@@ -121,6 +122,13 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
         }
 
         s->gpio_regs[addr] = value | ibit;
+        driven_low = (value & OUT_ENABLE) && !(value & OUT_DATA);
+        /* Registers 0x5b/0x5c and 0x73 in the MacIO BAR. */
+        if (addr == 3 || addr == 4) {
+            qemu_set_irq(s->cpu_sreset[addr - 3], driven_low);
+        } else if (addr == 27) {
+            qemu_set_irq(s->timebase_enable, !driven_low);
+        }
     }
 }
 
@@ -164,6 +172,10 @@ static void macio_gpio_init(Object *obj)
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
 
+    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_sreset, "sreset", 2);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->timebase_enable,
+                             "timebase-enable", 1);
+
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
     sysbus_init_mmio(sbd, &s->gpiomem);
@@ -183,6 +195,12 @@ static const VMStateDescription vmstate_macio_gpio = {
 static void macio_gpio_reset(DeviceState *dev)
 {
     MacIOGPIOState *s = MACIO_GPIO(dev);
+
+    /* Release the CPU reset and timebase open-collector outputs. */
+    s->gpio_regs[3] = s->gpio_regs[4] = s->gpio_regs[27] = 0;
+    qemu_set_irq(s->cpu_sreset[0], 0);
+    qemu_set_irq(s->cpu_sreset[1], 0);
+    qemu_set_irq(s->timebase_enable, 1);
 
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);

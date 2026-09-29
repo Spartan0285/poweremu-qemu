@@ -257,6 +257,7 @@
 #define GPCMD_SEND_EVENT                    0xa2
 #define GPCMD_SEND_KEY                      0xa3
 #define GPCMD_SEND_OPC                      0x54
+#define GPCMD_SEND_CUE_SHEET                0x5d
 #define GPCMD_SET_READ_AHEAD                0xa7
 #define GPCMD_SET_STREAMING                 0xb6
 #define GPCMD_START_STOP_UNIT               0x1b
@@ -296,6 +297,7 @@
 #define ASC_SAVING_PARAMETERS_NOT_SUPPORTED  0x39
 #define ASC_DATA_PHASE_ERROR                 0x4b
 #define ASC_MEDIA_REMOVAL_PREVENTED          0x53
+#define ASC_ILLEGAL_MODE_FOR_THIS_TRACK      0x64
 
 #define CFA_NO_ERROR            0x00
 #define CFA_MISC_ERROR          0x09
@@ -442,6 +444,8 @@ void ide_cancel_dma_sync(IDEState *s);
 /* hw/ide/atapi.c */
 void ide_atapi_cmd(IDEState *s);
 void ide_atapi_cmd_reply_end(IDEState *s);
+void ide_atapi_cmd_write_end(IDEState *s);
+void ide_atapi_write_complete(IDEState *s);
 
 int ide_handle_rw_error(IDEState *s, int error, int op);
 

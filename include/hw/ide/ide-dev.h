@@ -98,6 +98,16 @@ struct IDEState {
     bool tray_open;
     bool tray_locked;
     uint8_t cdrom_changed;
+    /*
+     * PowerEmu recordable-disc state (a burner with a writable backing).
+     * recordable_nwa is the next writable 2048-byte address; recordable_closed
+     * is set once the guest closes the last session, after which the disc
+     * reads back as a finalised DVD-ROM.  Not migrated: a burn in flight is
+     * not expected to survive a snapshot.
+     */
+    uint32_t recordable_nwa;
+    bool recordable_closed;
+    uint8_t atapi_write_op;     /* opcode of an in-flight ATAPI data-out */
     int packet_transfer_size;
     int elementary_transfer_size;
     int32_t io_buffer_index;
@@ -165,6 +175,12 @@ struct IDEDevice {
      */
     uint16_t rotation_rate;
     bool win2k_install_hack;
+    /*
+     * PowerEmu: a recordable optical drive.  A plain ide-cd opens its
+     * backing read-only; with recordable=on the backing is opened writable
+     * and the ATAPI layer presents a blank DVD-R the guest can burn to.
+     */
+    bool recordable;
 };
 
 typedef struct IDEDrive {

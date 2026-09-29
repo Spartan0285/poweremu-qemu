@@ -113,7 +113,17 @@ void ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind, Error **errp)
             return;
         }
     }
-    if (!blkconf_apply_backend_options(&dev->conf, kind == IDE_CD,
+    /*
+     * PowerEmu: a recordable drive is still born read-only, exactly like a
+     * plain CD.  A burner in the real world holds a pressed, read-only disc
+     * perfectly well, and the guest inserts those far more often than a blank;
+     * a backend forced writable at realize pins BLK_PERM_WRITE on the backend
+     * and makes every read-only medium refuse to load ("Block node is
+     * read-only").  The write permission is instead raised per-medium in
+     * ide_cd_change_cb when an actual writable blank is loaded.
+     */
+    if (!blkconf_apply_backend_options(&dev->conf,
+                                       kind == IDE_CD,
                                        kind != IDE_CD, errp)) {
         return;
     }
@@ -218,6 +228,7 @@ static const TypeInfo ide_hd_info = {
 
 static const Property ide_cd_properties[] = {
     DEFINE_IDE_DEV_PROPERTIES(),
+    DEFINE_PROP_BOOL("recordable", IDEDrive, dev.recordable, false),
 };
 
 static void ide_cd_class_init(ObjectClass *klass, void *data)

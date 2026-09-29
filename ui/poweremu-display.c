@@ -42,6 +42,7 @@
 #include "ui/input.h"
 #include "system/system.h"
 #include "ui/poweremu-harmony.h"
+#include "poweremu-activity.h"
 #include <sys/mman.h>
 
 #define TYPE_POWEREMU_DISPLAY "poweremu-display"
@@ -63,6 +64,8 @@ struct PowerEmuDisplay {
 
     DisplayChangeListener dcl;
     bool registered;
+    uint32_t mask_gen;          /* the window mask last published */
+    unsigned mask_only;         /* frames published for a mask change alone */
     Notifier machine_done;
 
     /* The shared copy of the screen. */
@@ -83,6 +86,7 @@ struct PowerEmuDisplay {
     size_t in_len;
     int64_t last_try_ms;        /* when we last tried to reach PowerEmu */
     uint32_t buttons;
+    void *host_activity;
 };
 
 static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h);
@@ -197,10 +201,33 @@ static void pe_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h
             }
         }
         if (first < 0) {
-            return;
+            /*
+             * No colour changed -- but the mask may still have.
+             *
+             * The alpha published alongside the picture is what says which
+             * parts of the screen are a window, and PowerEmu uses it to decide
+             * whether it may read a window's pixels at all: a region whose
+             * alpha says "desktop" is skipped, and the window keeps the copy
+             * it already had.  Returning here whenever the colours matched
+             * meant a tile that had just become a window was never published
+             * as one, so the host went on believing that patch was desktop and
+             * went on declining to read it -- for as long as the pixels under
+             * it happened not to change.  A window covered by another, showing
+             * the selection it had when it was last in front, is exactly that.
+             *
+             * So a change in the mask publishes on its own account.
+             */
+            uint32_t gen = 0;
+            const uint8_t *t; int c, r;
+            if (!ppc_mac_gpu_harmony_tiles(&t, &c, &r, &gen) || gen == pd->mask_gen) {
+                return;
+            }
+            pd->mask_gen = gen;
+            pd->mask_only++;
+        } else {
+            y = first;
+            h = last - first + 1;
         }
-        y = first;
-        h = last - first + 1;
     }
     /* Converts whatever depth the guest uses to BGRA. */
     pixman_image_composite(PIXMAN_OP_SRC, ds->image, NULL, pd->shm_image,
@@ -243,7 +270,21 @@ static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h)
         for (int col = x; col < x + w && col < pd->width; col++, px += 4) {
             int tx = col / PE_HARMONY_TILE;
             /* BGRA in memory: the alpha byte is the last of the four. */
-            px[3] = (tx < cols && trow[tx] == PE_AREA_WINDOW) ? 0xff : 0x00;
+            if (tx < cols && trow[tx] == PE_AREA_WINDOW) {
+                px[3] = 0xff;
+            } else {
+                /*
+                 * The whole pixel goes, not only its alpha.
+                 *
+                 * What is handed over is premultiplied: the colour is expected
+                 * to have been scaled by the alpha already.  Clearing alpha and
+                 * leaving the wallpaper's colour behind describes a pixel that
+                 * contributes its full colour while claiming to be invisible,
+                 * and that is what it was drawn as -- the guest's wallpaper,
+                 * faintly, over this Mac's desktop.  Nothing means nothing.
+                 */
+                px[0] = px[1] = px[2] = px[3] = 0x00;
+            }
         }
     }
 }
@@ -362,6 +403,39 @@ static void pe_refresh(DisplayChangeListener *dcl)
         pe_try_reconnect(pd);
     }
     graphic_hw_update(dcl->con);
+    /*
+     * How often this runs, and how often it finds anything.
+     *
+     * The other Mac only hears about the screen from here, so if a window
+     * takes ten seconds to show a selection there are exactly two
+     * possibilities -- this is not being called, or it is being called and
+     * finding nothing -- and they want quite different fixes.  Nothing said
+     * which.  PPCGPU_REFRESH=1.
+     */
+    {
+        static int on = -1;
+        static int calls, found;
+        static int64_t said;
+        int64_t now;
+        if (on < 0) {
+            on = getenv("PPCGPU_REFRESH") != NULL;
+        }
+        if (on) {
+            calls++;
+            if (pd->dirty) {
+                found++;
+            }
+            now = g_get_monotonic_time();
+            if (now - said > 2 * G_TIME_SPAN_SECOND) {
+                said = now;
+                fprintf(stderr, "PEREFRESH calls=%d found=%d maskonly=%u in 2s\n",
+                        calls, found, pd->mask_only);
+                pd->mask_only = 0;
+                calls = 0;
+                found = 0;
+            }
+        }
+    }
     if (pd->dirty) {
         uint32_t msg[4] = { pd->dx0, pd->dy0, pd->dx1 - pd->dx0, pd->dy1 - pd->dy0 };
         pd->dirty = false;
@@ -581,6 +655,7 @@ static void pe_complete(UserCreatable *uc, Error **errp)
     if (qio_channel_socket_connect_sync(pd->sioc, &addr, errp) < 0) {
         return;
     }
+    pd->host_activity = poweremu_activity_begin();
     pd->connected = true;
     pd->watch = qio_channel_add_watch(QIO_CHANNEL(pd->sioc), G_IO_IN, pe_readable, pd, NULL);
     pd->machine_done.notify = pe_attach;
@@ -614,6 +689,7 @@ static void pe_finalize(Object *obj)
         object_unref(OBJECT(pd->sioc));
     }
     pe_free_shm(pd);
+    poweremu_activity_end(pd->host_activity);
     g_free(pd->path);
 }
 

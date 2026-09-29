@@ -618,6 +618,21 @@ typedef struct PPCMacGPUDisplayMode {
 #define TYPE_PPC_MAC_GPU "ppc-mac-gpu"
 OBJECT_DECLARE_SIMPLE_TYPE(PPCMacGPUState, PPC_MAC_GPU)
 
+/* Allocated only for the diagnostic card. Keep large trace/upload arrays
+ * out of the normal R200 state, which is copied into asynchronous draw jobs. */
+typedef struct R350ProbeData {
+    uint64_t pvs_dword;
+    uint32_t pvs[0x407][4];
+    uint8_t pvs_valid[0x407];
+    uint32_t reads[0x10000 / 4];
+    uint32_t writes[0x10000 / 4];
+    uint32_t draws_seen;
+    uint32_t linear_rendered, linear_rejected;
+    unsigned rejection_snapshots;
+    char rejection_reason[16][128];
+    void *renderer;
+} R350ProbeData;
+
 struct PPCMacGPUState {
     /* Parent */
     PCIDevice pci;
@@ -656,6 +671,13 @@ struct PPCMacGPUState {
     /* Full BIOS ROM path (separate from romfile which has the NDRV) */
     char *biosrom;
 
+    /* Explicitly selected R350 initialization probe; never a production GPU. */
+    bool r350_probe;
+    bool r350_bridge_aic;
+    bool r350_shader_snapshots;
+    bool r350_linear_render;
+    char *r350_capture_dir;
+    R350ProbeData *r350;
     /* Device configuration */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */

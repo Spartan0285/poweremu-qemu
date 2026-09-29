@@ -1,5 +1,8 @@
 /GNUmakefile
 /build/
+/build-smp/
+/build-prof/
+/build-r350/
 /.cache/
 /.vscode/
 *.pyc

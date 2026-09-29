@@ -123,8 +123,18 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
     DBDMA_io *io = &s->io;
     int samples;
 
-    samples = MIN(io->len >> s->shift, s->samples - (s->wpos - s->rpos));
-    samples = MIN(samples, max);
+    /* The guest hardware clock must not stop when the host output stalls.
+     * Retain the newest frames and discard only stale queued host audio. */
+    samples = MIN(MIN(io->len >> s->shift, max), s->samples);
+    int overflow = samples - (s->samples - (s->wpos - s->rpos));
+    if (overflow > 0) {
+        s->rpos += overflow;
+    }
+    if (s->rpos >= s->samples) {
+        int base = s->rpos - s->rpos % s->samples;
+        s->rpos -= base;
+        s->wpos -= base;
+    }
     for (int done = 0; done < samples;) {
         int at = (s->wpos + done) % s->samples;
         int n = MIN(samples - done, s->samples - at);
@@ -193,6 +203,10 @@ static void screamer_pace_cb(void *opaque)
         moved += n;
     }
     if (moved) {
+        /* DBDMA may defer the next descriptor to a bottom half. Preserve
+         * the unused budget across that boundary instead of losing a
+         * fraction of a timer tick on every descriptor completion. */
+        s->pace_frac += due * NANOSECONDS_PER_SECOND;
         s->pace_idle = 0;
     } else if (++s->pace_idle > 200) {      /* ~200 ms without DMA: stop */
         return;

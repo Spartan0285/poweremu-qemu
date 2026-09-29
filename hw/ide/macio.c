@@ -56,6 +56,12 @@ static const int debug_macio = 0;
 
 #define MACIO_PAGE_SIZE 4096
 
+static inline bool pmac_atapi_is_writing(IDEState *s)
+{
+    /* WRITE(10) / WRITE(12): the burn payload flows host -> drive. */
+    return s->atapi_write_op == 0x2a || s->atapi_write_op == 0xaa;
+}
+
 static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
 {
     DBDMA_io *io = opaque;
@@ -83,7 +89,11 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
     if (s->io_buffer_size <= 0) {
         MACIO_DPRINTF("End of IDE transfer\n");
         qemu_sglist_destroy(&s->sg);
-        ide_atapi_cmd_ok(s);
+        if (pmac_atapi_is_writing(s)) {
+            ide_atapi_write_complete(s);   /* throttled for a physical burn */
+        } else {
+            ide_atapi_cmd_ok(s);
+        }
         m->dma_active = false;
         goto done;
     }
@@ -94,10 +104,15 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
     }
 
     if (s->lba == -1) {
-        /* Non-block ATAPI transfer - just copy to RAM */
+        /* Non-block ATAPI transfer - copy between RAM and the drive buffer. */
         s->io_buffer_size = MIN(s->io_buffer_size, io->len);
-        dma_memory_write(&address_space_memory, io->addr, s->io_buffer,
-                         s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
+        if (pmac_atapi_is_writing(s)) {
+            dma_memory_read(&address_space_memory, io->addr, s->io_buffer,
+                            s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_write(&address_space_memory, io->addr, s->io_buffer,
+                             s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
+        }
         io->len = 0;
         ide_atapi_cmd_ok(s);
         m->dma_active = false;
@@ -114,8 +129,13 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
     s->io_buffer_index += io->len;
     io->len = 0;
 
-    s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset, 0x1,
-                                      pmac_ide_atapi_transfer_cb, io);
+    if (pmac_atapi_is_writing(s)) {
+        s->bus->dma->aiocb = dma_blk_write(s->blk, &s->sg, offset, 0x1,
+                                           pmac_ide_atapi_transfer_cb, io);
+    } else {
+        s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset, 0x1,
+                                          pmac_ide_atapi_transfer_cb, io);
+    }
     return;
 
 done:

@@ -40,6 +40,8 @@ struct MacIOGPIOState {
 
     MemoryRegion gpiomem;
     qemu_irq gpio_extirqs[10];
+    qemu_irq cpu_sreset[2];
+    qemu_irq timebase_enable;
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
 };

@@ -65,14 +65,17 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu.c',
   'ppc_mac_gpu_renderer_sw.c',
   'ppc_mac_gpu_vp.c',
+  'ppc_mac_gpu_r300_fp.c',
+  'ppc_mac_gpu_r300_vp.c',
+  'ppc_mac_gpu_r300_data.c',
 ), pixman])
 
 system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])
 
 if host_os == 'darwin'
-  metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)
+  metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore', 'Foundation'], required: false)
   if metal_fw.found()
-    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m'), metal_fw])
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m', 'ppc_mac_gpu_r300_metal.m'), metal_fw])
   endif
 endif
 

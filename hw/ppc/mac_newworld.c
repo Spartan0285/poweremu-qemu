@@ -51,6 +51,8 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/ppc/ppc.h"
+#include "helper_regs.h"
+#include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/boards.h"
@@ -131,7 +133,33 @@ static void ppc_core99_reset(void *opaque)
     cpu_ppc_tb_reset(&cpu->env);
     cpu_reset(CPU(cpu));
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
+    cpu->env.spr[SPR_PIR] = CPU(cpu)->cpu_index;
     cpu->env.nip = PROM_BASE + 0x100;
+    if (CPU(cpu)->cpu_index) {
+        /* Secondary CPUs wait for the guest's low-memory reset vector. */
+        hreg_store_msr(&cpu->env, 0, 1);
+        CPU(cpu)->halted = 1;
+    }
+    if (PPC_INPUT(&cpu->env) == PPC_FLAGS_INPUT_6xx) {
+        qemu_set_irq(qdev_get_gpio_in(DEVICE(cpu), PPC6xx_INPUT_TBEN), 1);
+    }
+}
+
+/* Latch SRESET: the GPIO strobe can end before the target CPU runs. */
+static void core99_sreset(void *opaque, int n, int level)
+{
+    if (level) {
+        ppc_set_irq(POWERPC_CPU(qemu_get_cpu(n)), PPC_INTERRUPT_RESET, 1);
+    }
+}
+
+static void core99_timebase(void *opaque, int n, int level)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        qemu_set_irq(qdev_get_gpio_in(DEVICE(cs), PPC6xx_INPUT_TBEN), level);
+    }
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -167,7 +195,7 @@ static void ppc_core99_init(MachineState *machine)
         cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
 
-        /* Set time-base frequency to 100 Mhz */
+        /* All CPUs use the same 25 MHz timebase. */
         cpu_ppc_tb_init(env, TBFREQ);
         qemu_register_reset(ppc_core99_reset, cpu);
     }
@@ -257,8 +285,10 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     openpic_irqs = g_new0(IrqLines, machine->smp.cpus);
-    dev = DEVICE(cpu);
     for (i = 0; i < machine->smp.cpus; i++) {
+        cpu = POWERPC_CPU(qemu_get_cpu(i));
+        env = &cpu->env;
+        dev = DEVICE(cpu);
         /* Mac99 IRQ connection between OpenPIC outputs pins
          * and PowerPC input pins
          */
@@ -356,6 +386,13 @@ static void ppc_core99_init(MachineState *machine)
     has_adb = (core99_machine->via_config == CORE99_VIA_CONFIG_CUDA ||
                core99_machine->via_config == CORE99_VIA_CONFIG_PMU_ADB);
 
+    if (machine->smp.cpus > 1 &&
+        (!has_pmu || PPC_INPUT(env) != PPC_FLAGS_INPUT_6xx ||
+         !(env->insns_flags & PPC_ALTIVEC))) {
+        error_report("mac99 SMP currently requires a G4 CPU and via=pmu");
+        exit(1);
+    }
+
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
@@ -370,7 +407,19 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
 
+    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
+    qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+    if (has_pmu && PPC_INPUT(env) == PPC_FLAGS_INPUT_6xx) {
+        DeviceState *gpio =
+            DEVICE(object_resolve_path_component(macio, "gpio"));
+        for (i = 0; i < machine->smp.cpus; i++) {
+            qemu_irq reset = qemu_allocate_irq(core99_sreset, NULL, i);
+            qdev_connect_gpio_out_named(gpio, "sreset", i, reset);
+        }
+        qdev_connect_gpio_out_named(gpio, "timebase-enable", 0,
+                                   qemu_allocate_irq(core99_timebase, NULL, 0));
+    }
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     for (i = 0; i < 4; i++) {
@@ -584,7 +633,7 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
     /* SMP is not supported currently */
-    mc->max_cpus = 1;
+    mc->max_cpus = 2;
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";
