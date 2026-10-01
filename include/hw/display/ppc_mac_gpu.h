@@ -676,6 +676,14 @@ struct PPCMacGPUState {
     bool r350_bridge_aic;
     bool r350_shader_snapshots;
     bool r350_linear_render;
+    bool r350_gated_routes;   /* lift the two routes held back by
+                               * live regressions, for A/B testing */
+    bool r350_direct_vram;    /* render into guest VRAM instead of
+                               * staging the target through the CPU */
+    bool r350_aa_resolve;     /* honour RB3D_AARESOLVE_CTL instead of
+                               * rendering the draw */
+    bool r350_decode_rs;      /* decode the rasterizer routing instead
+                               * of matching known register values */
     char *r350_capture_dir;
     R350ProbeData *r350;
     /* Device configuration */
@@ -685,6 +693,18 @@ struct PPCMacGPUState {
     /* Device state */
     uint8_t mode;               /* VGA or extended mode */
     PPCMacGPURegs regs;         /* Register file */
+
+    /*
+     * What the last full CNTL blit packet left behind.  The compact 0x1b
+     * blit carries no header and runs on this.  It is deliberately NOT the
+     * register file: ppc_mac_gpu_2d_blit() and the tiled-surface registry
+     * read the real SRC_/DST_PITCH_OFFSET, so letting a packet write them
+     * makes a surface get written at one pitch and read at another.
+     */
+    uint32_t pm4_blit_gmc;
+    uint32_t pm4_blit_src_po;
+    uint32_t pm4_blit_dst_po;
+    bool     pm4_blit_valid;
     /* How big that register file is, saved with the machine so a state
      * written by another build cannot be poured into a different layout. */
     uint32_t regs_size;
@@ -815,6 +835,20 @@ struct PPCMacGPUState {
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
+    /*
+     * Lay scan-out rows out at exactly width * bytes, with no rounding.
+     *
+     * Mac OS X's ATI drivers all compute rowBytes as (width * bytes + 255)
+     * & ~255, so CRTC_PITCH is seeded that way -- see
+     * r200_aligned_pitch_pixels().  Classic Mac OS does not use those
+     * drivers: it draws through qemu_vga.ndrv, which reports the unrounded
+     * row length to QuickDraw.  Where the two differ -- any width that is
+     * not a multiple of 64 at 32bpp, so 800 and 1440 but not 1024 or 1280 --
+     * every row is read back at the wrong offset and the screen shears into
+     * diagonal bands.  Measured on Mac OS 9.2.2 at 1440x900: the device
+     * seeded 5888 bytes where QuickDraw was drawing 5760.
+     */
+    bool exact_scanout_pitch;
     /* Harmony 1:1: the host screen's exact point size.  The CRTC can only
      * encode a visible width that is a multiple of 8, so when the guest selects
      * the 8-rounded neighbour of this width at this height, the scanout width
