@@ -483,6 +483,21 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
     s->codec_ctrl_regs[addr] = val;
 }
 
+/*
+ * SCREAMER_TRACE=1: every register access, in order, to stderr.  For
+ * chasing a guest driver that crashes on what the device told it.
+ */
+static int strace_on = -1;
+static void strace(const char *dir, uint32_t reg, uint32_t val)
+{
+    if (strace_on < 0) {
+        strace_on = getenv("SCREAMER_TRACE") != NULL;
+    }
+    if (strace_on) {
+        fprintf(stderr, "SCRTRACE %s reg=%u val=0x%08x\n", dir, reg, val);
+    }
+}
+
 static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
 {
     ScreamerState *s = opaque;
@@ -531,6 +546,7 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
 
     SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " -> %x\n", __func__, addr, val);
 
+    strace("RD", (uint32_t)addr, val);
     return val;
 }
 
@@ -543,6 +559,7 @@ static void screamer_write(void *opaque, hwaddr addr,
     addr = addr >> 4;
 
     SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " val %" PRIx64 "\n", __func__, addr, val);
+    strace("WR", (uint32_t)addr, (uint32_t)val);
 
     switch (addr) {
     case SND_CTRL_REG:
