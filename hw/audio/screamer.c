@@ -463,6 +463,11 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
 
 static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
 {
+    /* Register 3 is not a register (Apple: kInvalidRegNumber = 3). */
+    if (addr == 3 || addr >= ARRAY_SIZE(s->codec_ctrl_regs)) {
+        return;
+    }
+
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
     switch (addr) {
@@ -514,15 +519,27 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CODEC_STAT_REG:
         if (s->codec_ctrl_regs[7] & 1) {
-            /* Read back mode */
             /*
-             * Read-back selects one of the eight codec registers, so the
-             * select is three bits.  Masking with 0xe let it reach 8, 10, 12
-             * and 14 and read past codec_ctrl_regs[8], handing the guest
-             * whatever followed the array.  Mac OS X's driver never uses
-             * read-back; Mac OS 9's does, and crashed on what came back.
+             * Screamer read-back.  Codec register 7 bit 0 enables it and bits
+             * 3:1 select the register -- three bits, so eight registers.
+             * (Masking with 0xe reached 8, 10, 12 and 14 and read past the
+             * end of the array.)
+             *
+             * The value comes back at bits 15:4 of the status register, not
+             * at the bottom: Apple's driver reads it as (status >> 4) & 0xfff
+             * (AppleScreamerAudio, Screamer_readCodecControlReg) and Mac OS 9
+             * uses the same shift, kAWACsReadbackDataShift = 4.  Returning
+             * the bare value handed the driver a sixteenth of what it wrote.
+             *
+             * kValidData stays set in read-back mode too.  Every Screamer
+             * codec write is preceded by a wait on that bit -- including the
+             * write that turns read-back back off -- so clearing it here
+             * stalls the driver until its own timeout expires and it takes an
+             * error path.  Mac OS X never noticed: it spins on the bit with
+             * no timeout at all, where Mac OS 9's wait is bounded.
              */
-            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0x7];
+            val = CODEC_STAT_MASK_VALID |
+                  ((s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0x7] & 0xfff) << 4);
         } else {
             /* Return status register */
             val = s->regs[addr] & ~0xff00;
