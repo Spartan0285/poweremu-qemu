@@ -500,7 +500,14 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
     case CODEC_STAT_REG:
         if (s->codec_ctrl_regs[7] & 1) {
             /* Read back mode */
-            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0xe];
+            /*
+             * Read-back selects one of the eight codec registers, so the
+             * select is three bits.  Masking with 0xe let it reach 8, 10, 12
+             * and 14 and read past codec_ctrl_regs[8], handing the guest
+             * whatever followed the array.  Mac OS X's driver never uses
+             * read-back; Mac OS 9's does, and crashed on what came back.
+             */
+            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0x7];
         } else {
             /* Return status register */
             val = s->regs[addr] & ~0xff00;
