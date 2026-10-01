@@ -58,6 +58,7 @@
 #define CODEC_CTRL1_RECALIBRATE    0x4
 
 #define CODEC_STAT_MANUFACTURER_CRYSTAL    0x100
+#define CODEC_STAT_MANUFACTURER_NATIONAL   0x200
 #define CODEC_STAT_AWACS_REVISION          0x3000
 #define CODEC_STAT_MASK_VALID              (0x1 << 22) 
 
@@ -543,7 +544,7 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
         } else {
             /* Return status register */
             val = s->regs[addr] & ~0xff00;
-            val |= CODEC_STAT_MANUFACTURER_CRYSTAL | CODEC_STAT_AWACS_REVISION |
+            val |= CODEC_STAT_MANUFACTURER_NATIONAL | CODEC_STAT_AWACS_REVISION |
                    CODEC_STAT_MASK_VALID;
         }
         break;
