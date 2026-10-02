@@ -98,6 +98,14 @@ static uint32_t peau_queued(PowerEmuAudioState *s)
     if (!frames) {
         return 0;
     }
+    /*
+     * PEAU_LOOP=1: pretend the ring is always full, so it plays round and
+     * round for ever.  For measuring how fast the audio backend actually
+     * drains, with no guest code in the way.
+     */
+    if (getenv("PEAU_LOOP")) {
+        return frames;
+    }
     q = s->write_ptr - s->read_ptr;     /* wraps, which is the point */
     return q > frames ? frames : q;     /* the guest ran away: clamp */
 }
@@ -135,6 +143,19 @@ static void peau_callback(void *opaque, int avail)
 {
     PowerEmuAudioState *s = opaque;
     uint8_t buf[4096];
+    /*
+     * PEAU_CB_TRACE=1: one line per mixer callback.  How often this is
+     * called, and how much it is asked for, is the only way to tell the
+     * device apart from the audio backend when sound comes out slowly --
+     * the device cannot play faster than it is asked to.
+     */
+    static unsigned long calls, total;
+
+    calls++;
+    if (getenv("PEAU_CB_TRACE") && (calls % 50) == 1) {
+        fprintf(stderr, "PEAU CB #%lu avail=%d read_ptr=%u written=%lu\n",
+                calls, avail, s->read_ptr, total);
+    }
 
     while (avail > 0) {
         uint32_t queued = peau_queued(s);
@@ -165,6 +186,7 @@ static void peau_callback(void *opaque, int avail)
             return;
         }
         s->read_ptr += wrote / PEAU_FRAME_BYTES;
+        total += wrote;
         avail -= wrote;
     }
 }
