@@ -632,8 +632,15 @@ static void core99_machine_class_init(ObjectClass *oc, void *data)
     mc->desc = "Mac99 based PowerMac";
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
-    /* SMP is not supported currently */
-    mc->max_cpus = 2;
+    /*
+     * KeyLargo's OpenPIC addresses four CPUs, and openpic.h has said so
+     * (KEYLARGO_MAX_CPU) while this stayed at two with a comment claiming
+     * SMP did not work at all.  It does: secondary CPUs are released by
+     * the latched SRESET above.  No real Core99 was more than dual -- the
+     * Quad G5 is a different machine, U3 and 970 -- so four is beyond the
+     * hardware and whether a guest enumerates them is the guest's call.
+     */
+    mc->max_cpus = KEYLARGO_MAX_CPU;
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";

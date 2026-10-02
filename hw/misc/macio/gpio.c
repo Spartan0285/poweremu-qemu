@@ -97,6 +97,24 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     }
 }
 
+/*
+ * Which CPU a GPIO register's soft-reset line belongs to, or -1.
+ *
+ * KeyLargo puts CPU0 and CPU1 at registers 3 and 4, and CPU2 and CPU3 at
+ * 15 and 16.  Only the first pair exists on real hardware -- no Core99 Mac
+ * was more than dual -- but the controller addresses four.
+ */
+static int macio_gpio_sreset_cpu(unsigned addr)
+{
+    switch (addr) {
+    case 3:  return 0;
+    case 4:  return 1;
+    case 15: return 2;
+    case 16: return 3;
+    default: return -1;
+    }
+}
+
 static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
@@ -123,9 +141,9 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 
         s->gpio_regs[addr] = value | ibit;
         driven_low = (value & OUT_ENABLE) && !(value & OUT_DATA);
-        /* Registers 0x5b/0x5c and 0x73 in the MacIO BAR. */
-        if (addr == 3 || addr == 4) {
-            qemu_set_irq(s->cpu_sreset[addr - 3], driven_low);
+        /* Registers 0x5b/0x5c/0x67/0x68 and 0x73 in the MacIO BAR. */
+        if (macio_gpio_sreset_cpu(addr) >= 0) {
+            qemu_set_irq(s->cpu_sreset[macio_gpio_sreset_cpu(addr)], driven_low);
         } else if (addr == 27) {
             qemu_set_irq(s->timebase_enable, !driven_low);
         }
@@ -172,7 +190,7 @@ static void macio_gpio_init(Object *obj)
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
 
-    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_sreset, "sreset", 2);
+    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_sreset, "sreset", 4);
     qdev_init_gpio_out_named(DEVICE(obj), &s->timebase_enable,
                              "timebase-enable", 1);
 
@@ -197,9 +215,12 @@ static void macio_gpio_reset(DeviceState *dev)
     MacIOGPIOState *s = MACIO_GPIO(dev);
 
     /* Release the CPU reset and timebase open-collector outputs. */
-    s->gpio_regs[3] = s->gpio_regs[4] = s->gpio_regs[27] = 0;
-    qemu_set_irq(s->cpu_sreset[0], 0);
-    qemu_set_irq(s->cpu_sreset[1], 0);
+    s->gpio_regs[3] = s->gpio_regs[4] = 0;
+    s->gpio_regs[15] = s->gpio_regs[16] = 0;
+    s->gpio_regs[27] = 0;
+    for (int i = 0; i < 4; i++) {
+        qemu_set_irq(s->cpu_sreset[i], 0);
+    }
     qemu_set_irq(s->timebase_enable, 1);
 
     /* GPIO 1 is up by default */

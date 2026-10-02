@@ -40,7 +40,12 @@ struct MacIOGPIOState {
 
     MemoryRegion gpiomem;
     qemu_irq gpio_extirqs[10];
-    qemu_irq cpu_sreset[2];
+    /*
+     * CPU0-3 soft reset.  KeyLargo puts them at GPIO registers 3, 4, 15
+     * and 16; the first two are all a real Core99 ever used, since none
+     * was more than dual.
+     */
+    qemu_irq cpu_sreset[4];
     qemu_irq timebase_enable;
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
