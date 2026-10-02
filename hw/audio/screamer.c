@@ -165,6 +165,15 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
     io->len -= (samples << s->shift);
     s->wpos += samples;
 
+    /*
+     * There is sound to play again, so take part in mixing again.  See the
+     * matching deactivation in the callback.
+     */
+    if (samples && !s->active) {
+        s->active = true;
+        AUD_set_active_out(s->voice, true);
+    }
+
     /* Continue DBDMA if we have completed the transfer, otherwise defer */
     if (io->len == 0 && samples) {
         SCREAMER_DPRINTF("-> End of transfer\n");
@@ -323,6 +332,22 @@ static void screamerspk_callback(void *opaque, int free_b)
         }
         s->primed = false;                  /* underrun: refill first */
         sdbg_tick(s);
+        /*
+         * Stop taking part in mixing while there is nothing to play.
+         *
+         * QEMU mixes by taking the *minimum* of what every active voice
+         * has supplied, so a voice that stays active and supplies nothing
+         * holds every other voice on the same backend at zero.  This one
+         * was activated once and never deactivated, which left the other
+         * sound device on this machine playing at about one per cent of
+         * real time -- it only advanced when the screamer happened to
+         * contribute.  The DMA path turns this back on when the guest
+         * gives it something to play.
+         */
+        if (s->active) {
+            s->active = false;
+            AUD_set_active_out(s->voice, false);
+        }
         return;
     }
     if (!s->primed) {
@@ -377,6 +402,7 @@ static void screamer_update_settings(ScreamerState *s)
         s->mixbuf = g_malloc0(s->samples << s->shift);
     }
 
+    s->active = true;
     AUD_set_active_out(s->voice, true);
 }
 
