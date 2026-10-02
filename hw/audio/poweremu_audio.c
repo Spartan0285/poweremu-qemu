@@ -21,18 +21,30 @@
  * the PowerEmu tree.  The Screamer stays: boot-time sound comes from the
  * Mac OS ROM before any extension loads, and a guest without our driver
  * installed has to keep working.
+ *
+ * It is a PCI device rather than another macio child, and that is not
+ * cosmetic.  Mac OS loads a native driver from a node's
+ * driver,AAPL,MacOS,PowerPC property for devices its PCI enumeration
+ * discovers; a macio child is an on-board device, whose drivers come from
+ * the ROM or from an extension.  Published under macio the property was
+ * provably present and correct and Mac OS ignored it.  On PCI the node
+ * comes from enumeration, is named pci1b36,5045 after the IDs below, and
+ * is what the driver's DriverDescription matches on.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
-#include "hw/sysbus.h"
+#include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "audio/audio.h"
 #include "system/dma.h"
 #include "qom/object.h"
 #include "hw/audio/poweremu_audio.h"
+
+#define PEAU_VENDOR_ID  PCI_VENDOR_ID_REDHAT
+#define PEAU_DEVICE_ID  0x5045          /* 'PE'; clear of the ids in use */
 
 /* Registers, little-endian, one page. */
 #define PEAU_ID         0x00    /* r   'PEAU'                        */
@@ -261,18 +273,22 @@ static void peau_reset(DeviceState *dev)
     }
 }
 
-static void peau_realize(DeviceState *dev, Error **errp)
+static void peau_realize(PCIDevice *dev, Error **errp)
 {
     PowerEmuAudioState *s = POWEREMU_AUDIO(dev);
 
     if (!AUD_register_card(TYPE_POWEREMU_AUDIO, &s->card, errp)) {
         return;
     }
+    memory_region_init_io(&s->mem, OBJECT(dev), &peau_ops, s,
+                          TYPE_POWEREMU_AUDIO, 0x1000);
+    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mem);
+
     s->rate = 44100;
     peau_open_voice(s);
 }
 
-static void peau_unrealize(DeviceState *dev)
+static void peau_exit(PCIDevice *dev)
 {
     PowerEmuAudioState *s = POWEREMU_AUDIO(dev);
 
@@ -283,13 +299,7 @@ static void peau_unrealize(DeviceState *dev)
     AUD_remove_card(&s->card);
 }
 
-static void peau_init(Object *obj)
-{
-    PowerEmuAudioState *s = POWEREMU_AUDIO(obj);
 
-    memory_region_init_io(&s->mem, obj, &peau_ops, s, TYPE_POWEREMU_AUDIO, 0x1000);
-    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mem);
-}
 
 static const VMStateDescription vmstate_peau = {
     .name = TYPE_POWEREMU_AUDIO,
@@ -315,20 +325,31 @@ static const Property peau_properties[] = {
 static void peau_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
 
-    dc->realize = peau_realize;
-    dc->unrealize = peau_unrealize;
+    k->realize = peau_realize;
+    k->exit = peau_exit;
+    k->vendor_id = PEAU_VENDOR_ID;
+    k->device_id = PEAU_DEVICE_ID;
+    k->class_id = PCI_CLASS_MULTIMEDIA_AUDIO;
+    k->revision = 1;
+
     device_class_set_legacy_reset(dc, peau_reset);
+    dc->desc = "PowerEmu paravirtual sound";
     dc->vmsd = &vmstate_peau;
     device_class_set_props(dc, peau_properties);
+    set_bit(DEVICE_CATEGORY_SOUND, dc->categories);
 }
 
 static const TypeInfo peau_type_info = {
     .name = TYPE_POWEREMU_AUDIO,
-    .parent = TYPE_SYS_BUS_DEVICE,
+    .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PowerEmuAudioState),
-    .instance_init = peau_init,
     .class_init = peau_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void peau_register_types(void)

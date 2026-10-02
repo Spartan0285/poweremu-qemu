@@ -109,18 +109,6 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
     memory_region_add_subregion(&s->bar, 0x14000,
                                 sysbus_mmio_get_region(sbd, 0));
 
-    /*
-     * poweremu-audio sits at 0x17000 -- past the Screamer at 0x14000, the
-     * timer at 0x15000 and CUDA/PMU at 0x16000.  Nothing in a stock Mac
-     * looks there, so a guest that does not know about it never sees it.
-     */
-    if (!qdev_realize(DEVICE(&s->poweremu_audio), BUS(&s->macio_bus), errp)) {
-        return false;
-    }
-    sbd = SYS_BUS_DEVICE(&s->poweremu_audio);
-    memory_region_add_subregion(&s->bar, 0x17000,
-                                sysbus_mmio_get_region(sbd, 0));
-
     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
     qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
@@ -407,8 +395,6 @@ static void macio_instance_init(Object *obj)
     object_initialize_child(obj, "escc", &s->escc, TYPE_ESCC);
 
     object_initialize_child(obj, "screamer", &s->screamer, TYPE_SCREAMER);
-    object_initialize_child(obj, "poweremu-audio", &s->poweremu_audio,
-                            TYPE_POWEREMU_AUDIO);
 }
 
 static const VMStateDescription vmstate_macio_oldworld = {

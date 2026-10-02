@@ -5,7 +5,7 @@
 #ifndef HW_AUDIO_POWEREMU_AUDIO_H
 #define HW_AUDIO_POWEREMU_AUDIO_H
 
-#include "hw/sysbus.h"
+#include "hw/pci/pci_device.h"
 #include "audio/audio.h"
 #include "qom/object.h"
 
@@ -13,7 +13,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(PowerEmuAudioState, POWEREMU_AUDIO)
 
 struct PowerEmuAudioState {
-    SysBusDevice parent_obj;
+    PCIDevice parent_obj;
 
     MemoryRegion mem;
     QEMUSoundCard card;
