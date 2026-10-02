@@ -507,6 +507,9 @@ struct CPUState {
 
     struct CPUJumpCache *tb_jmp_cache;
 
+    /* Written by this vCPU; sampled atomically by the monitor. */
+    uint64_t pe_jc_probe, pe_jc_miss, pe_jc_helper;
+
     GArray *gdb_regs;
     int gdb_num_regs;
     int gdb_num_g_regs;

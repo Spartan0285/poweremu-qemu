@@ -9,7 +9,10 @@ for unit in fp vp data; do
 done
 clang -Wall -Wextra -Werror -Wno-deprecated-declarations -I"$root/hw/display" \
     -c "$root/hw/display/ppc_mac_gpu_r300_metal.m" -o "$out/metal.o"
+# The shared submission layer; manual reference counting, like the backend.
+clang -Wall -Wextra -Werror -Wno-deprecated-declarations -I"$root/hw/display" \
+    -c "$root/hw/display/ppc_mac_gpu_submit.m" -o "$out/submit.o"
 clang -fobjc-arc -Wall -Wextra -Werror -I"$root/hw/display" \
-    "$root/tests/poweremu/r300-replay-test.m" "$out/fp.o" "$out/vp.o" "$out/data.o" "$out/metal.o" \
+    "$root/tests/poweremu/r300-replay-test.m" "$out/fp.o" "$out/vp.o" "$out/data.o" "$out/metal.o" "$out/submit.o" \
     -framework Foundation -framework Metal -o "$out/test"
 "$out/test" "$1"

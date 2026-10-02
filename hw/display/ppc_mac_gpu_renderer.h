@@ -434,6 +434,15 @@ PPCMacGPURenderer *ppc_mac_gpu_renderer_metal(void);
  * falls back to ordinary QEMU-managed RAM.
  */
 void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out);
+
+/*
+ * Bring up the shared submission layer over the Metal VRAM buffer, once.
+ * The R200 backend does this from its own draw path; a generation that does
+ * not go through that path calls this instead.  False when there is no Metal
+ * VRAM buffer to render into, in which case a caller must stage through the
+ * CPU.
+ */
+bool ppc_mac_gpu_metal_submit_ready(void);
 void ppc_mac_gpu_metal_free_vram(void *opaque);
 #endif
 

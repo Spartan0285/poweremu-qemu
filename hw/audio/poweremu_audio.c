@@ -153,8 +153,17 @@ static void peau_callback(void *opaque, int avail)
 
     calls++;
     if (getenv("PEAU_CB_TRACE") && (calls % 50) == 1) {
-        fprintf(stderr, "PEAU CB #%lu avail=%d read_ptr=%u written=%lu\n",
-                calls, avail, s->read_ptr, total);
+        /*
+         * Both clocks.  The audio timer is scheduled on the virtual clock,
+         * so if sound comes out slowly it is either because the virtual
+         * clock is running behind real time or because the timer is not
+         * firing at its period; printing both says which.
+         */
+        fprintf(stderr, "PEAU CB #%lu avail=%d read_ptr=%u written=%lu "
+                "virt=%.3f real=%.3f\n",
+                calls, avail, s->read_ptr, total,
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1e9);
     }
 
     while (avail > 0) {
@@ -319,6 +328,21 @@ static void peau_reset(DeviceState *dev)
     if (s->voice) {
         AUD_set_active_out(s->voice, 0);
     }
+
+    /*
+     * PEAU_AUTORUN=1: start playing out of reset, with no guest
+     * involvement at all.  With PEAU_LOOP this gives a machine that needs
+     * no OS and no display, which is the only way to measure the audio
+     * backend's pacing with nothing else in the way.  It belongs here
+     * rather than in realize because reset runs afterwards and would
+     * undo it.
+     */
+    if (getenv("PEAU_AUTORUN") && s->voice) {
+        s->control = PEAU_CTL_RUN;
+        s->status |= PEAU_ST_RUNNING;
+        s->write_ptr = peau_ring_frames(s);
+        AUD_set_active_out(s->voice, 1);
+    }
 }
 
 /*
@@ -368,6 +392,8 @@ static void peau_realize(PCIDevice *dev, Error **errp)
 
     s->rate = 44100;
     peau_open_voice(s);
+
+
 }
 
 static void peau_exit(PCIDevice *dev)

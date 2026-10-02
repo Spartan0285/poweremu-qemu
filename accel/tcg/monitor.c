@@ -174,6 +174,22 @@ static void dump_exec_info(GString *buf)
     g_string_append_printf(buf, "cross page TB count %zu (%zu%%)\n",
                            tst.cross_page,
                            nb_tbs ? (tst.cross_page * 100) / nb_tbs : 0);
+    {
+        uint64_t pe_jc_probe = 0, pe_jc_miss = 0, pe_jc_helper = 0;
+        CPUState *cpu;
+
+        CPU_FOREACH(cpu) {
+            pe_jc_probe += qatomic_read(&cpu->pe_jc_probe);
+            pe_jc_miss += qatomic_read(&cpu->pe_jc_miss);
+            pe_jc_helper += qatomic_read(&cpu->pe_jc_helper);
+        }
+        g_string_append_printf(buf,
+            "jump cache probes   %llu, misses %llu (%.2f%%), via helper %llu (%.1f%% of probes)\n",
+            (unsigned long long)pe_jc_probe, (unsigned long long)pe_jc_miss,
+            pe_jc_probe ? 100.0 * pe_jc_miss / pe_jc_probe : 0.0,
+            (unsigned long long)pe_jc_helper,
+            pe_jc_probe ? 100.0 * pe_jc_helper / pe_jc_probe : 0.0);
+    }
     g_string_append_printf(buf, "direct jump count   %zu (%zu%%) "
                            "(2 jumps=%zu %zu%%)\n",
                            tst.direct_jmp_count,

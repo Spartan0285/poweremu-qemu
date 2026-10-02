@@ -11,6 +11,16 @@ typedef struct R300MetalTexture {
     bool clamp_to_zero_s;
     bool clamp_to_zero_t;
     unsigned max_anisotropy; /* zero/one means isotropic, at most 16 */
+    /*
+     * Sample straight out of guest VRAM rather than from a staged copy.
+     * `rgba` is then unused, and the fragment program must have been compiled
+     * with the matching tex_swizzle: the texels arrive in the guest's byte
+     * order and nothing has reordered them.
+     */
+    bool guest_source;
+    uint32_t guest_offset;
+    uint32_t guest_pitch;    /* bytes per row */
+    unsigned guest_bpp;      /* 1 or 4 */
 } R300MetalTexture;
 
 typedef struct R300MetalDraw {
@@ -32,6 +42,23 @@ typedef struct R300MetalDraw {
     double viewport_width, viewport_height; /* zero means full target */
     bool premultiplied_over; /* src + dst * (1 - src alpha), RGB and alpha */
     unsigned color_mask; /* RGBA bits 0..3 */
+    /*
+     * Render straight into guest VRAM instead of staging.
+     *
+     * With this set, `target` is unused: the colour attachment is a linear
+     * view over VRAM at guest_offset with guest_pitch bytes per row, written
+     * in guest byte order.  The fragment program must have been compiled
+     * with guest_order, and with blend_premultiplied_over when blending --
+     * Metal's own blending cannot be used on a guest-order target because
+     * its factors would operate on the swizzled channels.
+     *
+     * Nothing is uploaded, nothing is read back, and the draw does not wait
+     * for the GPU.  Ordering against the guest CPU and the 2D engine comes
+     * from the shared submission layer's hazard tracking.
+     */
+    bool guest_target;
+    uint32_t guest_offset;
+    uint32_t guest_pitch;    /* bytes per row */
 } R300MetalDraw;
 
 void *r300_metal_create(void);

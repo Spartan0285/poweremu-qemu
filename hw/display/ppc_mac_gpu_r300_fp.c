@@ -299,6 +299,11 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
     }
     emit(&w, "};\nfragment float4 r300_fragment(R300FragmentInput in [[stage_in]], "
              "constant float4 *c [[buffer(0)]]");
+    if (p->blend_premultiplied_over) {
+        /* Framebuffer fetch: the destination has to be read in the shader
+         * because it cannot be blended by the pipeline in guest order. */
+        emit(&w, ", float4 fbin [[color(0)]]");
+    }
     for (unsigned i = 0; i < 16; i++) {
         if (textures & (1u << i)) {
             emit(&w, ", texture2d<float> t%u [[texture(%u)]], "
@@ -341,6 +346,28 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
                     emit(&w, " / r[%u].w", src);
                 }
                 emit(&w, ");\n");
+                if (p->tex_swizzled) {
+                    static const char *const lane[6] = {
+                        "r", "g", "b", "a", NULL, NULL
+                    };
+                    char part[4][24];
+                    for (unsigned c = 0; c < 4; c++) {
+                        unsigned sel = p->tex_swizzle[image][c];
+                        if (sel >= 6) {
+                            reason = "texture channel swizzle";
+                            goto fail;
+                        }
+                        if (lane[sel]) {
+                            snprintf(part[c], sizeof(part[c]), "r[%u].%s",
+                                     dst, lane[sel]);
+                        } else {
+                            snprintf(part[c], sizeof(part[c]), "%s",
+                                     sel == 4 ? "0.0" : "1.0");
+                        }
+                    }
+                    emit(&w, " r[%u] = float4(%s, %s, %s, %s);\n",
+                         dst, part[0], part[1], part[2], part[3]);
+                }
                 defined[dst] = 15;
             }
         }
@@ -372,7 +399,36 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
                  ops[op], p->alpha_func & 255);
         }
     }
-    emit(&w, " return output;\n}\n");
+    const char *out_swizzle = p->out_swizzle[0] ? p->out_swizzle : "rgba";
+    for (const char *c = out_swizzle; *c; c++) {
+        if (!strchr("rgba", *c) || c - out_swizzle >= 4) {
+            reason = "render-target component select";
+            goto fail;
+        }
+    }
+    if (strlen(out_swizzle) != 4) {
+        reason = "render-target component select";
+        goto fail;
+    }
+    if (p->blend_premultiplied_over) {
+        /*
+         * The blend reads the destination back as a true (r,g,b,a) and uses
+         * output.a as the source alpha.  A non-identity component select
+         * means the shader's own channels are not the target's, so neither
+         * holds; refuse rather than guess at the composition.
+         */
+        if (strcmp(out_swizzle, "rgba") != 0) {
+            reason = "blending with a non-identity component select";
+            goto fail;
+        }
+        emit(&w, " float4 dst = %s;\n"
+                 " output = output + dst * (1.0 - output.a);\n",
+             p->guest_order ? "fbin.yxwz" : "fbin");
+    }
+    if (strcmp(out_swizzle, "rgba") != 0) {
+        emit(&w, " output = output.%s;\n", out_swizzle);
+    }
+    emit(&w, " return %s;\n}\n", p->guest_order ? "output.yxwz" : "output");
     if (w.failed) {
         reason = "MSL output buffer too small";
         goto fail;

@@ -27,6 +27,57 @@ typedef struct R300FPProgram {
      * from a register read: undeclared/unwritten inputs are rejected. */
     uint32_t input_mask;
     uint32_t alpha_func;      /* 0x4bd4: comparison only, no alpha-to-coverage */
+    /*
+     * State that has to be compiled into the shader rather than set on the
+     * pipeline, and therefore belongs to the compiled variant rather than to
+     * the draw.  Mesa keeps the same distinction in
+     * r300_fragment_program_external_state.
+     *
+     * guest_order: the target is guest VRAM read as BGRA8Unorm, so a true
+     *   (r,g,b,a) has to be written as .yxwz to land as the big-endian ARGB
+     *   word every other consumer of VRAM expects.  The swizzle is its own
+     *   inverse, so a destination read back through framebuffer fetch is
+     *   unswizzled the same way.
+     * blend_premultiplied_over: src + dst * (1 - src.a), computed in the
+     *   shader.  Metal's fixed-function blending cannot be used on a
+     *   guest-order target, because its factors would operate on the
+     *   swizzled channels.
+     */
+    bool guest_order;
+    bool blend_premultiplied_over;
+    /*
+     * How to reorder a sampled texel into (r,g,b,a), per image unit.
+     * Each entry indexes r,g,b,a,zero,one of the value the sampler returned.
+     *
+     * A texture read straight out of guest VRAM arrives in the guest's byte
+     * order, so the guest's own channel swizzle and that byte order both have
+     * to be resolved into this one reorder.  Doing it here rather than on the
+     * CPU is what lets the texture be sampled in place instead of being
+     * rewritten texel by texel before every draw.
+     *
+     * Only consulted when tex_swizzled is set, so a program compiled without
+     * it -- an offline replay, or a staged texture that was already put in
+     * (r,g,b,a) order by the CPU -- samples unchanged.
+     */
+    uint8_t tex_swizzle[16][4];
+    bool tex_swizzled;
+    /*
+     * US_OUT_FMT_0's C0..C3 selects, already resolved into the swizzle that
+     * has to be applied to the shader's own (r,g,b,a) before the target's
+     * byte order is applied.  The identity "rgba" reproduces C0=B, C1=G,
+     * C2=R, C3=A -- the arrangement that lands a natural (r,g,b,a) as a
+     * big-endian ARGB word, and the only one the compiler used to accept.
+     *
+     * Apple's 9700 accelerator uses a different arrangement for its blit
+     * shader (C0=A, C1=B, C2=G, C3=R), because the texture swizzle that
+     * feeds it has already rotated the source bytes; the two cancel and the
+     * copy is byte-for-byte.  Honouring one without the other would rotate
+     * every colour it draws.
+     *
+     * An empty string means the identity, so a program that never sets it
+     * compiles exactly as before.
+     */
+    char out_swizzle[5];
 } R300FPProgram;
 
 /* Current gate: one node, MAD ALU, TEX/TXP 2D sampling, full final output 0.

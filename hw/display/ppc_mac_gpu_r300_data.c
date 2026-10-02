@@ -4,6 +4,7 @@
 #endif
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "ppc_mac_gpu_r300_data.h"
 
 bool r300_float24_decode(uint32_t word, float *value)
@@ -26,7 +27,7 @@ bool r300_decode_immediate(const uint32_t stream[8], const uint32_t ext[8],
                            size_t output_count, uint32_t *attribute_mask)
 {
     struct Entry {
-        unsigned type, dst, count, skip, writes, swizzle, normalized;
+        unsigned type, dst, count, skip, writes, swizzle, normalized, sign;
     } entries[16];
     unsigned n = 0, stride = 0;
     uint8_t masks[16] = {0};
@@ -42,12 +43,24 @@ bool r300_decode_immediate(const uint32_t stream[8], const uint32_t ext[8],
         struct Entry *e = &entries[n++];
         e->type = desc & 15;
         e->dst = (desc >> 8) & 31;
-        e->count = e->type <= 3 ? e->type + 1 : 1;
+        /*
+         * SHORT_2 and SHORT_4 pack two signed 16-bit values per word, so they
+         * occupy one and two words.  Apple's 9700 accelerator sends its blit
+         * positions as SHORT_2 -- window coordinates need no more than that
+         * -- so refusing the type refused every desktop copy.
+         */
+        e->count = e->type <= 3 ? e->type + 1 : (e->type == 7 ? 2 : 1);
         e->skip = (desc >> 4) & 15;
         e->writes = extra >> 12;
         e->swizzle = extra & 4095;
         e->normalized = desc >> 15;
-        if (e->type > 5 || e->dst >= 16 || (e->type >= 4 && (desc & (1u << 14)))) {
+        e->sign = (desc >> 14) & 1;
+        static int legacy = -1;
+        if (legacy < 0) {
+            legacy = getenv("R350_LEGACY_DECODE") != NULL;
+        }
+        if (e->type > (legacy ? 5u : 7u) || e->dst >= 16 ||
+            (e->type >= 4 && e->type <= 5 && (desc & (1u << 14)))) {
             return false;
         }
         for (unsigned c = 0; c < 4; c++) {
@@ -82,6 +95,22 @@ bool r300_decode_immediate(const uint32_t stream[8], const uint32_t ext[8],
             if (e->type <= 3) {
                 for (unsigned c = 0; c < e->count; c++) {
                     memcpy(&values[c], &cursor[c], sizeof(float));
+                }
+            } else if (e->type >= 6) {
+                /*
+                 * SHORT_2 puts X in [15:0] and Y in [31:16]; SHORT_4 adds Z
+                 * and W in the same order in the next word.  SHORT_2 leaves
+                 * Z at 0 and W at 1, which is what values[] already holds.
+                 */
+                unsigned lanes = e->type == 7 ? 4 : 2;
+                for (unsigned c = 0; c < lanes; c++) {
+                    unsigned half = (cursor[c / 2] >> (16 * (c & 1))) & 0xffff;
+                    if (e->sign) {
+                        int16_t raw = (int16_t)half;
+                        values[c] = e->normalized ? raw / 32767.0f : raw;
+                    } else {
+                        values[c] = e->normalized ? half / 65535.0f : half;
+                    }
                 }
             } else {
                 for (unsigned c = 0; c < 4; c++) {
@@ -177,10 +206,22 @@ bool r300_expand_points(const R300VertexInput *points, unsigned point_count,
     return true;
 }
 
+/*
+ * varying_attribute is the vertex attribute the adapter carries through to
+ * the rasterizer, or zero for none.  Attribute zero is always the window
+ * position, so it can stand for "no varying".  Expanded points synthesize
+ * their coordinates into attribute 1; a bypass draw that supplies its own
+ * texture coordinates names whichever attribute VAP_PROG_STREAM_CNTL put
+ * them in, which for texture coordinate set 0 is attribute 6.
+ */
 static bool window_program(R300VPProgram *p, float c[256][4],
                            float xs, float xo, float ys, float yo,
-                           bool point_varying)
+                           unsigned varying_attribute)
 {
+    bool point_varying = varying_attribute != 0;
+    if (varying_attribute >= R300_VP_MAX_ATTRIBUTES) {
+        return false;
+    }
     if (!p || !c || !isfinite(xs) || !isfinite(xo) || !isfinite(ys) ||
         !isfinite(yo) || xs<=0 || ys>=0 || !isfinite(1/xs) || !isfinite(1/ys) ||
         !isfinite(xo/xs) || !isfinite(yo/ys)) return false;
@@ -188,7 +229,7 @@ static bool window_program(R300VPProgram *p, float c[256][4],
     p->control[0]=(3u<<10)|((point_varying ? 4u : 3u)<<20);
     p->control[1]=(point_varying ? 4u : 3u)<<16;
     p->control[2]=point_varying ? 4 : 3;
-    p->attribute_mask=point_varying ? 3 : 1;
+    p->attribute_mask=point_varying ? (1u|(1u<<varying_attribute)) : 1;
     for(unsigned i=0;i<4;i++) {
         p->code[i][0]=((1u<<i)<<20)|0x201;
         p->code[i][1]=0x00d10002|(i<<5);
@@ -200,8 +241,8 @@ static bool window_program(R300VPProgram *p, float c[256][4],
     c[1][1]=1/ys;c[1][3]=-yo/ys;
     c[3][3]=1;
     if (point_varying) {
-        p->code[4][0]=0x00f02202; /* MUL a[1] by c[4], write o[1]. */
-        p->code[4][1]=0x00d10021;
+        p->code[4][0]=0x00f02202; /* MUL the attribute by c[4], write o[1]. */
+        p->code[4][1]=0x00d10001|(varying_attribute<<5);
         p->code[4][2]=0x00d10082;
         p->code[4][3]=0x00d10005;
         p->code_valid[4]=15;
@@ -215,11 +256,18 @@ static bool window_program(R300VPProgram *p, float c[256][4],
 bool r300_window_vertex_program(R300VPProgram *p, float c[256][4],
                                  float xs, float xo, float ys, float yo)
 {
-    return window_program(p,c,xs,xo,ys,yo,false);
+    return window_program(p,c,xs,xo,ys,yo,0);
 }
 
 bool r300_window_point_program(R300VPProgram *p, float c[256][4],
                                float xs, float xo, float ys, float yo)
 {
-    return window_program(p,c,xs,xo,ys,yo,true);
+    return window_program(p,c,xs,xo,ys,yo,1);
+}
+
+bool r300_window_texture_program(R300VPProgram *p, float c[256][4],
+                                 float xs, float xo, float ys, float yo,
+                                 unsigned attribute)
+{
+    return attribute && window_program(p,c,xs,xo,ys,yo,attribute);
 }

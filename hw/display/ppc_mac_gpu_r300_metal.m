@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ppc_mac_gpu_r300_metal.h"
+#include "ppc_mac_gpu_submit.h"
 
 typedef struct R300MetalContext {
     id<MTLDevice> device;
@@ -93,7 +94,8 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
 {
     R300MetalContext *ctx = renderer;
     if (!ctx || !d || !d->vp || !d->fp || !d->vertices ||
-        !d->vertex_constants || !d->fragment_constants || !d->target ||
+        !d->vertex_constants || !d->fragment_constants ||
+        (!d->target && !d->guest_target) ||
         !d->vertex_count || d->vertex_count > 65536 ||
         (!d->primitive_points && d->vertex_count % 3) ||
         !d->width || !d->height || d->width > 4096 || d->height > 4096 ||
@@ -102,7 +104,10 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
         fabs(d->viewport_x)>4096 || fabs(d->viewport_y)>4096 ||
         d->viewport_width<0 || d->viewport_height<0 ||
         d->viewport_width>4096 || d->viewport_height>4096 ||
-        d->target_size < (uint64_t)d->width * d->height * 4 ||
+        (!d->guest_target &&
+         d->target_size < (uint64_t)d->width * d->height * 4) ||
+        (d->guest_target &&
+         (uint64_t)d->guest_pitch < (uint64_t)d->width * 4) ||
         d->scissor[0] > d->width || d->scissor[1] > d->height ||
         d->scissor[2] > d->width - d->scissor[0] ||
         d->scissor[3] > d->height - d->scissor[1] ||
@@ -128,8 +133,11 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
     for (unsigned i = 0; i < 16; i++) {
         const R300MetalTexture *t = &d->textures[i];
         if ((used_textures & (1u << i)) &&
-            (!t->rgba || !t->width || !t->height || t->width > 2048 || t->height > 2048 || t->max_anisotropy > 16 ||
-             t->size < (uint64_t)t->width * t->height * 4)) {
+            (!t->width || !t->height || t->width > 2048 || t->height > 2048 ||
+             t->max_anisotropy > 16 ||
+             (t->guest_source ? (t->guest_bpp != 1 && t->guest_bpp != 4)
+                              : (!t->rgba ||
+                                 t->size < (uint64_t)t->width * t->height * 4)))) {
             return fail(error, error_size, "missing or invalid texture resource");
         }
     }
@@ -138,7 +146,9 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
         @try {
             NSString *source = [[NSString stringWithUTF8String:fragment]
                                stringByAppendingString:[NSString stringWithUTF8String:vertex]];
-            NSString *key = [NSString stringWithFormat:@"%u:%u:%@", d->color_mask, d->premultiplied_over, source];
+            NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%@",
+                             d->color_mask, d->premultiplied_over,
+                             (unsigned)d->guest_target, source];
             id<MTLRenderPipelineState> pipeline = [ctx->pipelines objectForKey:key];
             if (!pipeline) {
                 NSError *compile_error = nil;
@@ -149,13 +159,25 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 MTLRenderPipelineDescriptor *pd = [[[MTLRenderPipelineDescriptor alloc] init] autorelease];
                 pd.vertexFunction = [[lib newFunctionWithName:@"r300_vertex"] autorelease];
                 pd.fragmentFunction = [[lib newFunctionWithName:@"r300_fragment"] autorelease];
-                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-                pd.colorAttachments[0].writeMask =
-                    ((d->color_mask & 1) ? MTLColorWriteMaskRed : 0) |
-                    ((d->color_mask & 2) ? MTLColorWriteMaskGreen : 0) |
-                    ((d->color_mask & 4) ? MTLColorWriteMaskBlue : 0) |
-                    ((d->color_mask & 8) ? MTLColorWriteMaskAlpha : 0);
-                if (d->premultiplied_over) {
+                pd.colorAttachments[0].pixelFormat = d->guest_target ?
+                    MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+                /*
+                 * The mask names the guest's channels, and on a guest-order
+                 * target the shader has already swizzled them: red leaves in
+                 * Metal's green, green in red, blue in alpha, alpha in blue.
+                 * Masking the unswizzled channels would preserve the wrong
+                 * ones.
+                 */
+                pd.colorAttachments[0].writeMask = d->guest_target ?
+                    (((d->color_mask & 1) ? MTLColorWriteMaskGreen : 0) |
+                     ((d->color_mask & 2) ? MTLColorWriteMaskRed : 0) |
+                     ((d->color_mask & 4) ? MTLColorWriteMaskAlpha : 0) |
+                     ((d->color_mask & 8) ? MTLColorWriteMaskBlue : 0)) :
+                    (((d->color_mask & 1) ? MTLColorWriteMaskRed : 0) |
+                     ((d->color_mask & 2) ? MTLColorWriteMaskGreen : 0) |
+                     ((d->color_mask & 4) ? MTLColorWriteMaskBlue : 0) |
+                     ((d->color_mask & 8) ? MTLColorWriteMaskAlpha : 0));
+                if (d->premultiplied_over && !d->guest_target) {
                     pd.colorAttachments[0].blendingEnabled = YES;
                     pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
                     pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -169,27 +191,100 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 if (ctx->pipelines.count >= 64) [ctx->pipelines removeAllObjects];
                 [ctx->pipelines setObject:pipeline forKey:key];
             }
-            id<MTLCommandBuffer> command = [ctx->queue commandBuffer];
-            id<MTLBuffer> target_bytes = upload_buffer(ctx,d->target,d->width,d->height);
-            id<MTLTexture> target = private_texture(ctx,d->width,d->height,MTLTextureUsageRenderTarget);
+            /*
+             * A guest target renders in place: the shared submission layer
+             * supplies the command buffer, and the attachment is a view over
+             * the guest's own VRAM.  Nothing is copied in either direction.
+             */
+            GPUSurfaceKey gkey = { d->guest_offset, d->width, d->height,
+                                   d->guest_pitch, MTLPixelFormatBGRA8Unorm };
+            uint64_t glo = d->guest_offset;
+            uint64_t ghi = glo + (uint64_t)d->guest_pitch * d->height;
+            id<MTLCommandBuffer> command;
+            id<MTLBuffer> target_bytes = nil;
+            id<MTLTexture> target;
+            if (d->guest_target) {
+                /* Reading or retargeting memory this batch already wrote
+                 * through another view needs the GPU told about the order.
+                 * A full written-range table can track no more, so the only
+                 * safe thing left is to flush and start over -- the same
+                 * contract the R200 backend honours. */
+                /*
+                 * The textures this draw samples have to be checked too, not
+                 * just where it draws.  The compositor renders a surface and
+                 * then samples it, so a texture written earlier in this same
+                 * batch is read through a different view than it was written
+                 * through, and Metal does not order those against each other.
+                 * Checking only the target left the Dock composited from
+                 * half-written texels -- every icon drawn twice, and
+                 * differently on each run.  The R200 backend checks its
+                 * textures for exactly this reason.
+                 */
+                bool tex_conflict = false;
+                for (unsigned t = 0; t < 16 && !tex_conflict; t++) {
+                    const R300MetalTexture *tx = &d->textures[t];
+                    if (!(used_textures & (1u << t)) || !tx->guest_source) {
+                        continue;
+                    }
+                    tex_conflict = gpu_batch_conflict(tx->guest_offset,
+                        tx->guest_offset +
+                        (uint64_t)tx->guest_pitch * tx->height, NULL);
+                }
+                if (gpu_written_full()) {
+                    gpu_submit_flush();
+                } else if (tex_conflict || gpu_batch_conflict(glo, ghi, &gkey)) {
+                    gpu_submit_note_conflict();
+                    if (gpu_submit_split_enabled()) {
+                        gpu_submit_split();
+                    } else {
+                        gpu_submit_flush();
+                    }
+                }
+                command = gpu_submit_buffer();
+                target = gpu_view(gkey, MTLPixelFormatBGRA8Unorm, true);
+                if (!target) {
+                    return fail(error,error_size,
+                                "render target is not a usable VRAM view");
+                }
+            } else {
+                command = [ctx->queue commandBuffer];
+                target_bytes = upload_buffer(ctx,d->target,d->width,d->height);
+                target = private_texture(ctx,d->width,d->height,MTLTextureUsageRenderTarget);
+            }
             id<MTLBuffer> vb = [[ctx->device newBufferWithBytes:d->vertices
                           length:d->vertex_count * sizeof(*d->vertices) options:MTLResourceStorageModeShared] autorelease];
             id<MTLBuffer> vc = [[ctx->device newBufferWithBytes:d->vertex_constants
                           length:256 * 4 * sizeof(float) options:MTLResourceStorageModeShared] autorelease];
             id<MTLBuffer> fc = [[ctx->device newBufferWithBytes:d->fragment_constants
                           length:32 * 4 * sizeof(float) options:MTLResourceStorageModeShared] autorelease];
-            if (!command || !target_bytes || !target || !vb || !vc || !fc)
+            if (!command || !target || !vb || !vc || !fc ||
+                (!d->guest_target && !target_bytes))
                 return fail(error,error_size,"Metal resource allocation failed");
             id<MTLTexture> textures[16] = {nil};
             id<MTLSamplerState> samplers[16] = {nil};
             id<MTLBlitCommandEncoder> initial = [command blitCommandEncoder];
             if (!initial) return fail(error,error_size,"Metal upload encoder failed");
-            upload(initial,target_bytes,target,d->width,d->height);
+            if (!d->guest_target) {
+                upload(initial,target_bytes,target,d->width,d->height);
+            }
             for (unsigned i = 0; i < 16; i++) {
                 if (!(used_textures & (1u << i))) continue;
                 const R300MetalTexture *t = &d->textures[i];
-                textures[i] = private_texture(ctx,t->width,t->height,MTLTextureUsageShaderRead);
-                id<MTLBuffer> data = upload_buffer(ctx,t->rgba,t->width,t->height);
+                id<MTLBuffer> data = nil;
+                if (t->guest_source) {
+                    /* In place: the texels stay where the guest put them. */
+                    MTLPixelFormat tf = t->guest_bpp == 1 ?
+                        MTLPixelFormatR8Unorm : MTLPixelFormatBGRA8Unorm;
+                    GPUSurfaceKey tk = { t->guest_offset, t->width, t->height,
+                                         t->guest_pitch, (uint32_t)tf };
+                    textures[i] = gpu_view(tk, tf, false);
+                    gpu_note_read(t->guest_offset,
+                                  t->guest_offset +
+                                  (uint64_t)t->guest_pitch * t->height);
+                } else {
+                    textures[i] = private_texture(ctx,t->width,t->height,MTLTextureUsageShaderRead);
+                    data = upload_buffer(ctx,t->rgba,t->width,t->height);
+                }
                 MTLSamplerDescriptor *sd = [[[MTLSamplerDescriptor alloc] init] autorelease];
                 sd.normalizedCoordinates = YES;
                 sd.maxAnisotropy = t->max_anisotropy ?: 1;
@@ -199,11 +294,14 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                     MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToEdge;
                 sd.minFilter = sd.magFilter = t->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 samplers[i] = [[ctx->device newSamplerStateWithDescriptor:sd] autorelease];
-                if (!textures[i] || !data || !samplers[i]) {
+                if (!textures[i] || !samplers[i] ||
+                    (!t->guest_source && !data)) {
                     [initial endEncoding];
                     return fail(error,error_size,"Metal texture allocation failed");
                 }
-                upload(initial,data,textures[i],t->width,t->height);
+                if (!t->guest_source) {
+                    upload(initial,data,textures[i],t->width,t->height);
+                }
             }
             [initial endEncoding];
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -229,6 +327,32 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
             [encoder drawPrimitives:d->primitive_points ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle
                          vertexStart:0 vertexCount:d->vertex_count];
             [encoder endEncoding];
+            if (d->guest_target) {
+                /*
+                 * The pixels are already where the guest keeps them, so there
+                 * is nothing to read back and nothing to wait for.  Record the
+                 * range so a later access through a different view, or by the
+                 * guest CPU, is ordered against this work.
+                 */
+                gpu_note_written(glo, ghi, &gkey);
+                /*
+                 * Deliberately not committed here.  Committing every draw set
+                 * the open command buffer to nil, so the conflict check at the
+                 * top of the *next* draw found nothing open and
+                 * gpu_submit_split() returned immediately -- which meant the
+                 * shared event was never created, never signalled and never
+                 * waited on, and consecutive draws to the same surface had no
+                 * ordering primitive between them at all.  The counter said
+                 * conflicts were being handled while nothing was done about
+                 * them.  The R200 path is deterministic precisely because it
+                 * keeps a batch open and lets the split do its job; this now
+                 * does the same.  The batch is committed by a guest fence, by
+                 * a flush when the CPU or the 2D engine touches a busy range,
+                 * or by the split itself.
+                 */
+                error[0] = 0;
+                return true;
+            }
             id<MTLBlitCommandEncoder> readback = [command blitCommandEncoder];
             if (!readback) return fail(error,error_size,"Metal readback encoder failed");
             [readback copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)

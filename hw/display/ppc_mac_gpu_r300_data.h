@@ -42,4 +42,11 @@ bool r300_window_vertex_program(R300VPProgram *program, float constants[256][4],
 bool r300_window_point_program(R300VPProgram *program, float constants[256][4],
                                float xscale, float xoffset,
                                float yscale, float yoffset);
+/* The same adapter for a bypass draw that supplies its own texture
+ * coordinates: carries the named attribute through to the rasterizer as
+ * vertex output 1.  Attribute 0 is the window position and is rejected. */
+bool r300_window_texture_program(R300VPProgram *program, float constants[256][4],
+                                 float xscale, float xoffset,
+                                 float yscale, float yoffset,
+                                 unsigned attribute);
 #endif

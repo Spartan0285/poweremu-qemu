@@ -28,6 +28,7 @@
 #ifdef CONFIG_DARWIN
 
 #import <Metal/Metal.h>
+#include "ppc_mac_gpu_submit.h"
 #import <QuartzCore/QuartzCore.h>
 
 #include "ppc_mac_gpu_renderer.h"
@@ -102,6 +103,28 @@ void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out)
 
         return [buf contents];  /* host pointer for memory_region_init_ram_ptr */
     }
+}
+
+bool ppc_mac_gpu_metal_submit_ready(void)
+{
+    static id<MTLCommandQueue> queue;
+
+    if (gpu_submit_ready()) {
+        return true;
+    }
+    if (!g_metal_vram_alloc || !g_metal_vram_alloc->device ||
+        !g_metal_vram_alloc->vramBuffer) {
+        return false;
+    }
+    if (!queue) {
+        queue = [g_metal_vram_alloc->device newCommandQueue];
+    }
+    if (!queue) {
+        return false;
+    }
+    gpu_submit_init(g_metal_vram_alloc->device, queue,
+                    g_metal_vram_alloc->vramBuffer);
+    return true;
 }
 
 void ppc_mac_gpu_metal_free_vram(void *opaque)
@@ -6373,339 +6396,54 @@ static void r200_metal_warn(uint32_t bit, const char *msg, uint32_t a, uint32_t 
  * the GPU until flush_r200(), which the device calls before anything reads
  * VRAM on the CPU side (2D engine ops, register reads, scanout).
  */
-typedef struct R200TexKey {
-    uint32_t offset, width, height, pitch, format;
-} R200TexKey;
 
-#define R200_VIEW_CACHE 64
-static struct {
-    R200TexKey key;
-    id<MTLTexture> tex;
-    uint64_t used;
-} g_r200_views[R200_VIEW_CACHE];
-static uint64_t g_r200_view_clock;
-
-static id<MTLCommandBuffer> g_r200_cb;
-static id<MTLCommandBuffer> g_r200_inflight;   /* newest committed, unwaited */
+/*
+ * The shared submission layer owns the command buffer but not the render
+ * pass, so it asks us to close ours before it commits.
+ */
 static id<MTLRenderCommandEncoder> g_r200_enc;
-static R200TexKey g_r200_enc_key;
+static GPUSurfaceKey g_r200_enc_key;
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
-static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
-                g_r200_stat_conflicts, g_r200_stat_view_hit, g_r200_stat_view_new;
+static uint64_t g_r200_stat_draws, g_r200_stat_passes;
 
-/* VRAM ranges written by render passes in the open batch.  Views that alias
- * the same memory are distinct Metal objects, so Metal does not order a
- * write through one against a read through another: a draw that would read
- * (or re-target) written memory through a different view flushes first. */
-#define R200_MAX_WRITTEN 128
-static struct { uint64_t lo, hi; R200TexKey key; uint32_t epoch; } g_r200_written[R200_MAX_WRITTEN];
-static int g_r200_nwritten;
-
-/*
- * Instead of stopping the vCPU until the GPU is done, a conflict can end
- * the batch and start a new one that the GPU runs only after the previous
- * one completes (a shared event signalled at the end of each batch and
- * waited for at the start of the next).  The written ranges stay for the
- * CPU-side checks; conflicts only look at the current batch's (epoch).
- * PPCGPU_SPLIT=0 goes back to waiting.
- */
-static uint32_t g_r200_epoch;
-static id<MTLSharedEvent> g_r200_event;
-static uint64_t g_r200_event_val;
-static uint64_t g_r200_stat_splits;
-
-static bool r200_split_enabled(void)
+static void r200_end_pass(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_SPLIT");
-        on = !(e && e[0] == '0');
-    }
-    return on;
-}
-
-/* A new command buffer, ordered after everything committed before it. */
-static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
-{
-    id<MTLCommandBuffer> cb = [[st->commandQueue commandBuffer] retain];
-    if (g_r200_event && g_r200_event_val) {
-        [cb encodeWaitForEvent:g_r200_event value:g_r200_event_val];
-    }
-    return cb;
-}
-
-/*
- * Vertex staging.
- *
- * Every draw hands Metal the vertices it expanded from the guest's index
- * list.  Anything over a few dozen vertices is too big to pass inline, and
- * a game sends hundreds of draws a frame, so allocating a buffer per draw
- * means millions of allocations a session.  Bump-allocate out of one large
- * buffer instead, and put it back in the pool once the command buffer that
- * referenced it has completed.
- */
-#define R200_ARENA_SIZE (8 * 1024 * 1024)
-
-static NSMutableArray *g_r200_arena_free;     /* idle, ready to reuse */
-static NSMutableArray *g_r200_arena_used;     /* referenced by the open batch */
-static id<MTLBuffer> g_r200_arena;
-static size_t g_r200_arena_off;
-static pthread_mutex_t g_r200_arena_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Space for @len bytes, or NULL when a one-off buffer is needed instead. */
-static void *r200_arena_alloc(PPCMacGPUMetalState *st, size_t len,
-                              id<MTLBuffer> *buf, size_t *off)
-{
-    len = (len + 255) & ~(size_t)255;         /* keep offsets aligned */
-    if (len > R200_ARENA_SIZE) {
-        return NULL;
-    }
-    if (!g_r200_arena || g_r200_arena_off + len > [g_r200_arena length]) {
-        if (g_r200_arena) {
-            if (!g_r200_arena_used) {
-                g_r200_arena_used = [[NSMutableArray alloc] init];
-            }
-            [g_r200_arena_used addObject:g_r200_arena];
-            [g_r200_arena release];
-            g_r200_arena = nil;
-        }
-        pthread_mutex_lock(&g_r200_arena_lock);
-        id<MTLBuffer> reuse = [g_r200_arena_free lastObject];
-        if (reuse) {
-            g_r200_arena = [reuse retain];
-            [g_r200_arena_free removeLastObject];
-        }
-        pthread_mutex_unlock(&g_r200_arena_lock);
-        if (!g_r200_arena) {
-            /* newBuffer... already returns a reference we own. */
-            g_r200_arena = [st->device newBufferWithLength:R200_ARENA_SIZE
-                                options:MTLResourceStorageModeShared];
-            if (!g_r200_arena) {
-                return NULL;
-            }
-        }
-        g_r200_arena_off = 0;
-    }
-    *buf = g_r200_arena;
-    *off = g_r200_arena_off;
-    void *p = (char *)[g_r200_arena contents] + g_r200_arena_off;
-    g_r200_arena_off += len;
-    return p;
-}
-
-/* Hand this batch's staging buffers back once the GPU is done with them. */
-static void r200_arena_recycle_on(id<MTLCommandBuffer> cb)
-{
-    NSMutableArray *mine = g_r200_arena_used;
-    g_r200_arena_used = nil;
-    if (g_r200_arena) {
-        if (!mine) {
-            mine = [[NSMutableArray alloc] init];
-        }
-        [mine addObject:g_r200_arena];
-        [g_r200_arena release];
-        g_r200_arena = nil;
-        g_r200_arena_off = 0;
-    }
-    if (!mine) {
-        return;
-    }
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        pthread_mutex_lock(&g_r200_arena_lock);
-        if (!g_r200_arena_free) {
-            g_r200_arena_free = [[NSMutableArray alloc] init];
-        }
-        /* Keep a few around; a deep batch's extras can go. */
-        for (id<MTLBuffer> b in mine) {
-            if ([g_r200_arena_free count] < 8) {
-                [g_r200_arena_free addObject:b];
-            }
-        }
-        pthread_mutex_unlock(&g_r200_arena_lock);
-        [mine release];
-    }];
-}
-
-static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
-{
-    int w = 0;
-    while (w < g_r200_nwritten && memcmp(&g_r200_written[w].key, key, sizeof(*key))) {
-        w++;
-    }
-    if (w < g_r200_nwritten) {
-        g_r200_written[w].epoch = g_r200_epoch;       /* written again in this batch */
-        return;
-    }
-    if (w == R200_MAX_WRITTEN) {
-        return;                /* full: the next draw flushes (see the conflict check) */
-    }
-    g_r200_written[w].lo = lo;
-    g_r200_written[w].hi = hi;
-    g_r200_written[w].key = *key;
-    g_r200_written[w].epoch = g_r200_epoch;
-    g_r200_nwritten++;
-}
-
-/* VRAM ranges read (as textures) by draws in the open or in-flight batches. */
-#define R200_MAX_READ 64
-static struct { uint64_t lo, hi; } g_r200_read[R200_MAX_READ];
-static int g_r200_nread;
-static bool g_r200_read_overflow;
-
-static void r200_note_read(uint64_t lo, uint64_t hi)
-{
-    for (int i = 0; i < g_r200_nread; i++) {
-        if (g_r200_read[i].lo == lo && g_r200_read[i].hi == hi) {
-            return;
-        }
-    }
-    if (g_r200_nread == R200_MAX_READ) {
-        g_r200_read_overflow = true;         /* be conservative */
-        return;
-    }
-    g_r200_read[g_r200_nread].lo = lo;
-    g_r200_read[g_r200_nread++].hi = hi;
-}
-
-static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
-                                  bool write_access)
-{
-    if (!g_r200_cb && !g_r200_inflight) {
-        return false;
-    }
-    for (int i = 0; i < g_r200_nwritten; i++) {
-        if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi) {
-            return true;
-        }
-    }
-    if (write_access) {
-        if (g_r200_read_overflow) {
-            return true;
-        }
-        for (int i = 0; i < g_r200_nread; i++) {
-            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same)
-{
-    for (int i = 0; i < g_r200_nwritten; i++) {
-        if (g_r200_written[i].epoch != g_r200_epoch) {
-            continue;          /* an earlier batch: the GPU orders it before this one */
-        }
-        if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi &&
-            !(same && !memcmp(same, &g_r200_written[i].key, sizeof(*same)))) {
-            return true;
-        }
-    }
-    return false;
-}
-static int64_t g_r200_stat_flush_us;
-
-/* Linear texture view over VRAM, cached; views stay alive while cached. */
-static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
-                                MTLPixelFormat pf, bool render_target)
-{
-    int lru = 0;
-    for (int i = 0; i < R200_VIEW_CACHE; i++) {
-        if (g_r200_views[i].tex && !memcmp(&g_r200_views[i].key, &k, sizeof(k))) {
-            g_r200_views[i].used = ++g_r200_view_clock;
-            g_r200_stat_view_hit++;
-            return g_r200_views[i].tex;
-        }
-        if (g_r200_views[i].used < g_r200_views[lru].used) {
-            lru = i;
-        }
-    }
-    MTLTextureDescriptor *d = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:pf width:k.width height:k.height
-                                 mipmapped:NO];
-    d.usage = MTLTextureUsageShaderRead |
-              (render_target ? MTLTextureUsageRenderTarget : 0);
-    d.storageMode = MTLStorageModeShared;
-    id<MTLTexture> t = [st->vramBuffer newTextureWithDescriptor:d
-                                                          offset:k.offset
-                                                     bytesPerRow:k.pitch];
-    if (!t) {
-        return nil;
-    }
-    /* An evicted view may still be referenced by the open command buffer;
-     * the command buffer retains what it uses, so releasing is safe. */
-    g_r200_stat_view_new++;
-    [g_r200_views[lru].tex release];
-    g_r200_views[lru].key = k;
-    g_r200_views[lru].tex = t;
-    g_r200_views[lru].used = ++g_r200_view_clock;
-    return t;
-}
-
-static uint32_t g_r200_seq;
-
-/* Close the open batch and commit it; returns its sequence number or 0. */
-static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
-{
-    if (!g_r200_cb) {
-        return 0;
-    }
     if (g_r200_enc) {
         [g_r200_enc endEncoding];
         [g_r200_enc release];
         g_r200_enc = nil;
     }
     g_r200_enc_depth_off = ~0u;
-    uint32_t seq = ++g_r200_seq;
-    if (seq == 0) {
-        seq = ++g_r200_seq;
-    }
-    if (done) {
-        [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-            done(arg, seq);
-        }];
-    }
-    if (g_r200_event) {
-        [g_r200_cb encodeSignalEvent:g_r200_event value:++g_r200_event_val];
-    }
-    r200_arena_recycle_on(g_r200_cb);
-    [g_r200_cb commit];
-    [g_r200_inflight release];
-    g_r200_inflight = g_r200_cb;           /* keeps the reference */
-    g_r200_cb = nil;
-    /* Committed work is ordered on the queue, but memory it writes may
-     * still be read by later batches through other views: keep the written
-     * ranges until everything in flight is known complete. */
-    return seq;
 }
+
+static void r200_submit_attach(PPCMacGPUMetalState *st)
+{
+    static bool attached;
+    if (!attached && !gpu_submit_ready() &&
+        st && st->device && st->commandQueue) {
+        gpu_submit_init(st->device, st->commandQueue, st->vramBuffer);
+        gpu_submit_set_pass_ender(r200_end_pass);
+        attached = true;
+    }
+}
+
 
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
-    return r200_commit(done, arg);
+    return gpu_submit_commit(done, arg);
 }
 
 static bool metal_flush_r200(void *opaque)
 {
-    if (!g_r200_cb && !g_r200_inflight) {
-        return false;
-    }
-    int64_t t0 = g_get_monotonic_time();
-    r200_commit(NULL, NULL);
-    [g_r200_inflight waitUntilCompleted];
-    if (g_r200_inflight.status == MTLCommandBufferStatusError) {
-        r200_metal_warn(32, "command buffer failed", 0, 0);
-    }
-    [g_r200_inflight release];
-    g_r200_inflight = nil;
-    g_r200_nwritten = 0;
-    g_r200_nread = 0;
-    g_r200_read_overflow = false;
-    g_r200_stat_flushes++;
-    g_r200_stat_flush_us += g_get_monotonic_time() - t0;
-    return true;
+    return gpu_submit_flush();
+}
+
+static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
+                                  bool write_access)
+{
+    return gpu_range_busy(lo, hi, write_access);
 }
 
 /* A 2D fill that lands on a guest depth buffer clears our private copy. */
@@ -6733,9 +6471,6 @@ static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch
             return;
         }
         @autoreleasepool {
-            if (!g_r200_cb) {
-                g_r200_cb = r200_new_cb(st);
-            }
             if (g_r200_enc) {
                 [g_r200_enc endEncoding];
                 [g_r200_enc release];
@@ -6753,7 +6488,7 @@ static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch
             rp.stencilAttachment.clearStencil = 0;
             rp.stencilAttachment.loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> e = [g_r200_cb renderCommandEncoderWithDescriptor:rp];
+            id<MTLRenderCommandEncoder> e = [gpu_submit_buffer() renderCommandEncoderWithDescriptor:rp];
             R200DrawPacket q = { 0 };
             q.depth_enable = 1;
             q.zstencil = (7u << 4) | (1u << 30);               /* ALWAYS, write */
@@ -6791,6 +6526,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (!r200_metal_setup(dev)) {
         return -1;
     }
+    r200_submit_attach(st);
     /* 16-bit colour targets (3/4/15) are handled below with an R16Uint
      * view; anything else is skipped there. */
 
@@ -7088,9 +6824,9 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                 tu->offset, tu->pitch);
                 continue;
             }
-            R200TexKey k = { tu->offset, tu->width, tu->height, tu->pitch,
+            GPUSurfaceKey k = { tu->offset, tu->width, tu->height, tu->pitch,
                              (uint32_t)pf };
-            id<MTLTexture> x = r200_view(st, k, pf, false);
+            id<MTLTexture> x = gpu_view(k, pf, false);
             if (!x) {
                 continue;
             }
@@ -7108,35 +6844,27 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
 
         /* Open (or continue) the batch and the render pass for this target. */
-        R200TexKey rk = { pkt->rt_offset, pkt->rt_width, pkt->rt_height, bpr,
+        GPUSurfaceKey rk = { pkt->rt_offset, pkt->rt_width, pkt->rt_height, bpr,
                           (uint32_t)rtpf };
         uint64_t rlo = pkt->rt_offset, rhi = rlo + (uint64_t)bpr * pkt->rt_height;
-        bool full = g_r200_nwritten == R200_MAX_WRITTEN;
-        bool conflict = r200_batch_conflict(rlo, rhi, &rk);
+        bool full = gpu_written_full();
+        bool conflict = gpu_batch_conflict(rlo, rhi, &rk);
         for (int t = 0; t < R200_MAX_TEX && !conflict; t++) {
             const R200TexUnit *tu = &pkt->tex[t];
             if (u.texinfo[t][0] && !tu->host_data) {
-                conflict = r200_batch_conflict(tu->offset, tu->offset +
+                conflict = gpu_batch_conflict(tu->offset, tu->offset +
                                (uint64_t)tu->pitch * tu->height, NULL);
             }
         }
         if (full) {
-            metal_flush_r200(st);                  /* forget everything written */
+            gpu_submit_flush();                  /* forget everything written */
         } else if (conflict) {
-            g_r200_stat_conflicts++;
-            if (r200_split_enabled()) {
-                if (!g_r200_event) {
-                    g_r200_event = [st->device newSharedEvent];
-                }
-                r200_commit(NULL, NULL);           /* the GPU keeps the order */
-                g_r200_epoch++;
-                g_r200_stat_splits++;
+            gpu_submit_note_conflict();
+            if (gpu_submit_split_enabled()) {
+                gpu_submit_split();                /* the GPU keeps the order */
             } else {
-                metal_flush_r200(st);
+                gpu_submit_flush();
             }
-        }
-        if (!g_r200_cb) {
-            g_r200_cb = r200_new_cb(st);
         }
         bool want_ds = pkt->depth_enable || pkt->stencil_enable;
         bool enc_ds = g_r200_enc_depth_off != ~0u;
@@ -7149,7 +6877,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             g_r200_enc = nil;
         }
         if (!g_r200_enc) {
-            id<MTLTexture> rt = r200_view(st, rk, rtpf, true);
+            id<MTLTexture> rt = gpu_view(rk, rtpf, true);
             if (!rt) {
                 r200_metal_warn(4, "render target view failed", pkt->rt_offset, bpr);
                 return -1;
@@ -7163,7 +6891,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                                      : MTLPixelFormatR32Uint;
             if (want_ds) {
                 /* guest depth buffer, in place, as a second colour attachment */
-                R200TexKey dk = { pkt->depth_offset, pkt->rt_width, pkt->rt_height,
+                GPUSurfaceKey dk = { pkt->depth_offset, pkt->rt_width, pkt->rt_height,
                                   pkt->depth_pitch * pkt->depth_bpp, (uint32_t)zpf };
                 NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
                 if ((pkt->depth_bpp == 2 && !g_r200_pipeline_z16) ||
@@ -7173,11 +6901,11 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                     r200_metal_warn(128, "depth buffer not usable in place",
                                     pkt->depth_offset, pkt->depth_pitch);
                 } else {
-                    dtex = r200_view(st, dk, zpf, true);
+                    dtex = gpu_view(dk, zpf, true);
                 }
                 if (dtex) {
                     uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
-                    r200_note_written(dlo, dhi, &dk);
+                    gpu_note_written(dlo, dhi, &dk);
                 }
             }
             if (dtex) {
@@ -7190,7 +6918,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
-            g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+            g_r200_enc = [[gpu_submit_buffer() renderCommandEncoderWithDescriptor:rp] retain];
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
@@ -7205,7 +6933,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                                   pkt->rt_height, 0, 1 }];
             g_r200_enc_key = rk;
             g_r200_stat_passes++;
-            r200_note_written(rlo, rhi, &rk);
+            gpu_note_written(rlo, rhi, &rk);
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
         [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
@@ -7243,7 +6971,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         size_t vbytes = (size_t)pkt->num_indices * sizeof(R200Vertex);
         id<MTLBuffer> vb = nil;
         size_t voff = 0;
-        R200Vertex *flat = r200_arena_alloc(st, vbytes, &vb, &voff);
+        R200Vertex *flat = gpu_stage_alloc(vbytes, &vb, &voff);
         if (flat) {
             for (uint32_t i = 0; i < pkt->num_indices; i++) {
                 flat[i] = pkt->verts[pkt->indices[i]];
@@ -7281,7 +7009,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 uint64_t a = (uint64_t)pkt->depth_offset +
                              (uint64_t)py * pkt->depth_pitch * 4 + px * 4;
                 const R200Vertex *v0 = &pkt->verts[pkt->indices[0]];
-                metal_flush_r200(st);
+                gpu_submit_flush();
                 qemu_log("r200 zcheck: fl=%x z=%08x at (%u,%u) depthword=%02x%02x%02x%02x "
                          "v0=(%.1f,%.1f,%.3f,%.1f) sc=(%u,%u)-(%u,%u)\n",
                          u.zinfo[0], pkt->zstencil, px, py,
@@ -7292,23 +7020,24 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         for (int t = 0; t < R200_MAX_TEX; t++) {
             if (u.texinfo[t][0] && !pkt->tex[t].host_data) {
-                r200_note_read(pkt->tex[t].offset, pkt->tex[t].offset +
+                gpu_note_read(pkt->tex[t].offset, pkt->tex[t].offset +
                                (uint64_t)pkt->tex[t].pitch * pkt->tex[t].height);
             }
         }
     }
 
+    GPUSubmitStats gs;
+    gpu_submit_stats(&gs);
     if (g_r200_stat_draws % 2000 == 0) {
         qemu_log("ppc-mac-gpu r200: %llu draws, %llu passes, %llu flushes "
                  "(%llu hazard), avg flush %llu us, views %llu hit/%llu new\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
-                 (unsigned long long)g_r200_stat_flushes,
-                 (unsigned long long)g_r200_stat_conflicts,
-                 (unsigned long long)(g_r200_stat_flushes ?
-                     g_r200_stat_flush_us / g_r200_stat_flushes : 0),
-                 (unsigned long long)g_r200_stat_view_hit,
-                 (unsigned long long)g_r200_stat_view_new);
+                 (unsigned long long)gs.flushes,
+                 (unsigned long long)gs.conflicts,
+                 (unsigned long long)(gs.flushes ? gs.flush_us / gs.flushes : 0),
+                 (unsigned long long)gs.view_hit,
+                 (unsigned long long)gs.view_new);
     }
     return 0;
 }

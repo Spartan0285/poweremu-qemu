@@ -245,6 +245,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     hash = tb_jmp_cache_hash_func(pc);
     jc = cpu->tb_jmp_cache;
 
+    qatomic_set(&cpu->pe_jc_probe, qatomic_read(&cpu->pe_jc_probe) + 1);
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].gen == jc->gen &&
@@ -255,6 +256,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
         goto hit;
     }
 
+    qatomic_set(&cpu->pe_jc_miss, qatomic_read(&cpu->pe_jc_miss) + 1);
     tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
     if (tb == NULL) {
         return NULL;
@@ -388,6 +390,7 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
 const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 {
     CPUState *cpu = env_cpu(env);
+    qatomic_set(&cpu->pe_jc_helper, qatomic_read(&cpu->pe_jc_helper) + 1);
     TranslationBlock *tb;
     vaddr pc;
     uint64_t cs_base;

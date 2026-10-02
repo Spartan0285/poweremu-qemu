@@ -223,6 +223,113 @@ static void render(id<MTLDevice> device, R300FPProgram p,
     render_mode(device, p, constants, expected, name, 0);
 }
 
+/*
+ * Guest byte order, checked as bytes.
+ *
+ * The live path renders straight into guest VRAM, which every other consumer
+ * -- the CPU through the aperture, the 2D engine, the CRTC -- reads as
+ * big-endian ARGB.  Viewed as BGRA8Unorm that means a true (r,g,b,a) has to
+ * leave the shader as .yxwz.  Checking the floats would not catch a wrong
+ * swizzle, so this case checks where each byte lands.
+ */
+static void render_guest_order(id<MTLDevice> device, R300FPProgram p,
+                               float constants[32][4],
+                               const uint8_t initial[4], const uint8_t expected[4],
+                               bool blend, const uint8_t *texel_bytes, const char *name)
+{
+    char source[R300_FP_MSL_CAPACITY], reason[256];
+    p.guest_order = true;
+    p.blend_premultiplied_over = blend;
+    CHECK(r300_fp_compile_msl(&p, source, sizeof(source), reason, sizeof(reason)));
+    NSString *msl = [[NSString stringWithUTF8String:source] stringByAppendingString:
+        @"\nvertex R300FragmentInput test_vertex(uint n [[vertex_id]]) {\n"
+         " const float2 v[3] = {float2(-3,-1), float2(3,-1), float2(0,3)};\n"
+         " R300FragmentInput o = {}; o.position = float4(v[n], 0, 1); return o; }\n"];
+    NSError *error = nil;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.fastMathEnabled = NO;
+    id<MTLLibrary> library = [device newLibraryWithSource:msl options:options error:&error];
+    if (!library) fprintf(stderr, "%s\n", error.description.UTF8String);
+    CHECK(library);
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [library newFunctionWithName:@"test_vertex"];
+    pd.fragmentFunction = [library newFunctionWithName:@"r300_fragment"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+    if (!pipeline) fprintf(stderr, "%s\n", error.description.UTF8String);
+    CHECK(pipeline);
+
+    /* A texture over ordinary memory, the way a VRAM view is made. */
+    const unsigned w = 16, h = 4, pitch = 256;
+    id<MTLBuffer> vram = [device newBufferWithLength:pitch * h
+                                             options:MTLResourceStorageModeShared];
+    CHECK(vram);
+    uint8_t *bytes = vram.contents;
+    for (unsigned y = 0; y < h; y++) {
+        for (unsigned x = 0; x < w; x++) {
+            memcpy(bytes + y * pitch + x * 4, initial, 4);
+        }
+    }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:w height:h mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> target = [vram newTextureWithDescriptor:td offset:0 bytesPerRow:pitch];
+    CHECK(target);
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setFragmentBytes:constants length:32*4*sizeof(float) atIndex:0];
+    if (texel_bytes) {
+        /* A texture in guest byte order, sampled in place the way a VRAM view
+         * is: BGRA8Unorm over bytes that are really big-endian ARGB. */
+        MTLTextureDescriptor *sd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:1 height:1 mipmapped:NO];
+        sd.storageMode = MTLStorageModeShared;
+        sd.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> tex = [device newTextureWithDescriptor:sd];
+        CHECK(tex);
+        [tex replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0
+                 withBytes:texel_bytes bytesPerRow:4];
+        MTLSamplerDescriptor *smp = [MTLSamplerDescriptor new];
+        smp.normalizedCoordinates = YES;
+        id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:smp];
+        CHECK(sampler);
+        [encoder setFragmentTexture:tex atIndex:0];
+        [encoder setFragmentSamplerState:sampler atIndex:0];
+    }
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+    CHECK(command.status == MTLCommandBufferStatusCompleted);
+
+    unsigned checked = 0;
+    for (unsigned y = 0; y < h; y++) {
+        for (unsigned x = 0; x < w; x++) {
+            const uint8_t *px = bytes + y * pitch + x * 4;
+            for (unsigned i = 0; i < 4; i++) {
+                if (px[i] != expected[i]) {
+                    fprintf(stderr, "%s: (%u,%u) byte %u is %02x, expected %02x\n",
+                            name, x, y, i, px[i], expected[i]);
+                }
+                CHECK(px[i] == expected[i]);
+            }
+            checked++;
+        }
+    }
+    printf("PASS %s: %u pixels checked byte-for-byte on %s\n",
+           name, checked, device.name.UTF8String);
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -232,6 +339,44 @@ int main(void)
         R300FPProgram p = base_program();
         const float first[4] = {0.25f, 0.5f, 0.75f, 0.375f};
         render(device, p, c, first, "constant MAD");
+        {
+            /* Exact 1/255 steps, so nothing here depends on unorm rounding. */
+            float g[32][4] = {{0x40/255.0f, 0x80/255.0f, 0xbf/255.0f, 0x60/255.0f}};
+            R300FPProgram q = base_program();
+            const uint8_t was[4] = {0x11, 0x22, 0x33, 0x44};
+            /* true (r,g,b,a) = 40 80 bf 60 lands as big-endian ARGB. */
+            const uint8_t argb[4] = {0x60, 0x40, 0x80, 0xbf};
+            render_guest_order(device, q, g, was, argb, false, NULL,
+                               "guest-order target writes big-endian ARGB");
+            /* Zero source alpha, so premultiplied-over is a plain sum and the
+             * expected bytes stay exact. */
+            float b[32][4] = {{0x40/255.0f, 0x80/255.0f, 0x3f/255.0f, 0.0f}};
+            const uint8_t dst[4] = {0x40, 0x10, 0x20, 0x30};   /* ARGB in memory */
+            const uint8_t sum[4] = {0x40, 0x50, 0xa0, 0x6f};
+            render_guest_order(device, q, b, dst, sum, true, NULL,
+                               "in-shader premultiplied-over on a guest-order target");
+            /*
+             * Sampling a guest-order texture and writing a guest-order target
+             * has to be the identity: the same four bytes come back out.  That
+             * is the whole claim behind reading textures in place, and a float
+             * comparison could not check it.
+             */
+            R300FPProgram r = base_program();
+            r.control[0] = 8; r.control[1] = 1; r.input_mask = 2;
+            r.tex[0] = 1 | (1 << 6) | (1 << 15);
+            r.alu[0].rgb_addr = (7u << 26) | 1;
+            r.alu[0].alpha_addr = (1u << 24) | 1;
+            r.tex_swizzled = true;
+            /* BGRA8Unorm over [A][R][G][B]: red is byte 2, green byte 1,
+             * blue byte 3 via alpha, alpha byte 0 via blue. */
+            const uint8_t lanes[4] = {1, 0, 3, 2};
+            memcpy(r.tex_swizzle[0], lanes, 4);
+            const uint8_t texel[4] = {0x60, 0x40, 0x80, 0xbf};  /* A R G B */
+            const uint8_t cleared[4] = {0x01, 0x02, 0x03, 0x04};
+            float none[32][4] = {{0}};
+            render_guest_order(device, r, none, cleared, texel, false, texel,
+                               "guest-order texture sampled in place round-trips");
+        }
         p.alu[0].alpha_addr |= 1;
         p.alu[0].rgb_inst = 12 | (21 << 7) | (20 << 14);
         p.alu[0].alpha_inst = 2 | (17 << 7) | (16 << 14);
