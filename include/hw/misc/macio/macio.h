@@ -37,6 +37,7 @@
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/ppc/openpic.h"
 #include "hw/audio/screamer.h"
+#include "hw/audio/poweremu_audio.h"
 #include "qom/object.h"
 
 /* Old World IRQs */
@@ -120,6 +121,13 @@ struct MacIOState {
     DBDMAState dbdma;
     ESCCState escc;
     ScreamerState screamer;
+    /*
+     * poweremu-audio: a ring-buffer sound device for a guest driver of
+     * ours, alongside the Screamer rather than in place of it.  See
+     * hw/audio/poweremu_audio.c.  The Screamer has to stay -- boot-time
+     * sound comes from the Mac OS ROM before any extension loads.
+     */
+    PowerEmuAudioState poweremu_audio;
     uint64_t frequency;
 };
 
