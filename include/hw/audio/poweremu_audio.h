@@ -16,6 +16,17 @@ struct PowerEmuAudioState {
     PCIDevice parent_obj;
 
     MemoryRegion mem;
+    /*
+     * The ring lives in a RAM BAR of the device rather than in guest
+     * memory.  A driver loaded at PCI discovery can only use libraries
+     * that live in ROM, which rules out allocating a buffer and resolving
+     * its physical address; and a RAM BAR is mapped straight into the
+     * guest, so the guest's writes are ordinary stores with no exit and
+     * the device reads its own memory with no DMA.
+     */
+    MemoryRegion ring;
+    uint8_t *ring_ptr;
+
     QEMUSoundCard card;
     SWVoiceOut *voice;
 

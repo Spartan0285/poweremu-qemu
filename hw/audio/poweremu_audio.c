@@ -40,6 +40,7 @@
 #include "migration/vmstate.h"
 #include "audio/audio.h"
 #include "system/dma.h"
+#include "qapi/error.h"
 #include "qom/object.h"
 #include "hw/audio/poweremu_audio.h"
 
@@ -58,12 +59,13 @@
 #define PEAU_WRITE_PTR  0x24    /* rw  guest's producer, in frames   */
 #define PEAU_READ_PTR   0x28    /* r   device's consumer, in frames  */
 #define PEAU_STATUS     0x2c    /* r   see PEAU_ST_*                 */
+#define PEAU_RING_BYTES_REG 0x30 /* r   size of the ring BAR, in bytes */
 
 #define PEAU_MAGIC      0x50454155u     /* 'PEAU' */
 #define PEAU_VERSION_1  1
 
-#define PEAU_CAP_S16_STEREO  (1u << 0)
-#define PEAU_CAP_MAX_RING    (1u << 20)  /* 1 MB, and the cap is the value */
+#define PEAU_CAP_S16_STEREO   (1u << 0)
+#define PEAU_CAP_RING_IN_BAR  (1u << 1)  /* the ring is BAR 1, not guest RAM */
 
 #define PEAU_FMT_S16_STEREO  0
 
@@ -74,6 +76,13 @@
 #define PEAU_ST_UNDERRUN (1u << 1)      /* sticky; cleared by writing it */
 
 #define PEAU_FRAME_BYTES 4              /* 16-bit signed stereo */
+
+/*
+ * The ring is BAR 1, a plain RAM window.  64 KB is 371 ms of 44.1 kHz
+ * stereo, which is far more slack than any guest needs and still small
+ * enough to be free.
+ */
+#define PEAU_RING_BYTES  (64 * 1024)
 
 static uint32_t peau_ring_frames(PowerEmuAudioState *s)
 {
@@ -93,6 +102,8 @@ static uint32_t peau_queued(PowerEmuAudioState *s)
     return q > frames ? frames : q;     /* the guest ran away: clamp */
 }
 
+static void peau_callback(void *opaque, int avail);
+
 static void peau_open_voice(PowerEmuAudioState *s)
 {
     struct audsettings as = {
@@ -102,8 +113,16 @@ static void peau_open_voice(PowerEmuAudioState *s)
         .endianness = 1,                /* the guest is big-endian */
     };
 
+    /*
+     * peau_callback, not NULL.  The callback is how the backend asks for
+     * frames, so a NULL one means nothing is ever drained: the guest fills
+     * the ring, sets RUN, and the device plays silence.  QEMU does say so
+     * -- "A bug was just triggered in AUD_open_out ... callback_fn=0x0" --
+     * but mac99 has a screamer that complains on every boot too, so the
+     * message was easy to read as somebody else's.
+     */
     s->voice = AUD_open_out(&s->card, s->voice, TYPE_POWEREMU_AUDIO,
-                            s, NULL, &as);
+                            s, peau_callback, &as);
     s->open_rate = as.freq;
 }
 
@@ -123,7 +142,7 @@ static void peau_callback(void *opaque, int avail)
         int frames = want / PEAU_FRAME_BYTES;
         int wrote;
 
-        if (!(s->control & PEAU_CTL_RUN) || !s->ring_base || !s->ring_size) {
+        if (!(s->control & PEAU_CTL_RUN) || !s->ring_ptr || !s->ring_size) {
             return;
         }
         if (!queued) {
@@ -137,10 +156,8 @@ static void peau_callback(void *opaque, int avail)
         /* One frame at a time over the wrap; the ring is a power of two. */
         for (int i = 0; i < frames; i++) {
             uint32_t idx = (s->read_ptr + i) % peau_ring_frames(s);
-            dma_memory_read(&address_space_memory,
-                            s->ring_base + idx * PEAU_FRAME_BYTES,
-                            &buf[i * PEAU_FRAME_BYTES], PEAU_FRAME_BYTES,
-                            MEMTXATTRS_UNSPECIFIED);
+            memcpy(&buf[i * PEAU_FRAME_BYTES],
+                   s->ring_ptr + idx * PEAU_FRAME_BYTES, PEAU_FRAME_BYTES);
         }
 
         wrote = AUD_write(s->voice, buf, frames * PEAU_FRAME_BYTES);
@@ -171,7 +188,8 @@ static uint64_t peau_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case PEAU_ID:        return PEAU_MAGIC;
     case PEAU_VERSION:   return PEAU_VERSION_1;
-    case PEAU_CAPS:      return PEAU_CAP_S16_STEREO | PEAU_CAP_MAX_RING;
+    case PEAU_CAPS:      return PEAU_CAP_S16_STEREO | PEAU_CAP_RING_IN_BAR;
+    case PEAU_RING_BYTES_REG: return PEAU_RING_BYTES;
     case PEAU_RING_BASE: return s->ring_base;
     case PEAU_RING_SIZE: return s->ring_size;
     case PEAU_RATE:      return s->rate;
@@ -205,9 +223,9 @@ static void peau_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->ring_base = v;
         break;
     case PEAU_RING_SIZE:
-        /* A power of two, capped: the consumer index wraps by masking. */
-        if (v > PEAU_CAP_MAX_RING) {
-            v = PEAU_CAP_MAX_RING;
+        /* A power of two, capped at the BAR: the index wraps by masking. */
+        if (v > PEAU_RING_BYTES) {
+            v = PEAU_RING_BYTES;
         }
         v &= ~(PEAU_FRAME_BYTES - 1);
         s->ring_size = (v && !(v & (v - 1))) ? v : 0;
@@ -270,7 +288,8 @@ static void peau_reset(DeviceState *dev)
 {
     PowerEmuAudioState *s = POWEREMU_AUDIO(dev);
 
-    s->ring_base = s->ring_size = 0;
+    s->ring_base = 0;
+    s->ring_size = PEAU_RING_BYTES;
     s->rate = 44100;
     s->format = PEAU_FMT_S16_STEREO;
     s->control = s->status = 0;
@@ -318,6 +337,12 @@ static void peau_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->mem, OBJECT(dev), &peau_ops, s,
                           TYPE_POWEREMU_AUDIO, 0x1000);
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mem);
+
+    memory_region_init_ram(&s->ring, OBJECT(dev), TYPE_POWEREMU_AUDIO ".ring",
+                           PEAU_RING_BYTES, &error_fatal);
+    s->ring_ptr = memory_region_get_ram_ptr(&s->ring);
+    pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ring);
+    s->ring_size = PEAU_RING_BYTES;
 
     s->rate = 44100;
     peau_open_voice(s);
