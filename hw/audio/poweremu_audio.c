@@ -255,7 +255,14 @@ static void peau_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 static const MemoryRegionOps peau_ops = {
     .read = peau_read_traced,
     .write = peau_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
+    /*
+     * Big endian, because the guest is.  This said LITTLE, and a guest read
+     * of the ID register returned 0x55414550 for a device answering
+     * 0x50454155 -- 'UAEP' for 'PEAU', the bytes exactly reversed.  Every
+     * register here is a plain 32-bit value the guest compares against a
+     * constant, so they have to agree on byte order.
+     */
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
@@ -273,9 +280,37 @@ static void peau_reset(DeviceState *dev)
     }
 }
 
+/*
+ * Config space, traced.  A guest driver that never gets its BAR decoded
+ * makes MMIO accesses that never reach the device, which looks exactly like
+ * a driver that never ran -- so the driver signals here first, where the
+ * answer does not depend on the command register, and then sets the
+ * memory-space bit.  Both show up below.
+ */
+static void peau_config_write(PCIDevice *dev, uint32_t addr,
+                              uint32_t val, int len)
+{
+    pci_default_write_config(dev, addr, val, len);
+    peau_log("CFG WR", addr, val);
+    if (addr <= PCI_COMMAND && addr + len > PCI_COMMAND) {
+        peau_log("CMD", PCI_COMMAND,
+                 pci_get_word(dev->config + PCI_COMMAND));
+    }
+}
+
 static void peau_realize(PCIDevice *dev, Error **errp)
 {
     PowerEmuAudioState *s = POWEREMU_AUDIO(dev);
+
+    /*
+     * Declare an interrupt pin.  Nothing here raises an interrupt yet, but
+     * the pin is what makes OpenBIOS publish an "interrupts" property --
+     * it only writes one when the PCI Interrupt Pin register is nonzero --
+     * and a PCI node with no interrupts is not a device Mac OS can finish
+     * setting up.  Every virtio device whose NDRV loads on this machine
+     * has one.
+     */
+    pci_config_set_interrupt_pin(dev->config, 1);
 
     if (!AUD_register_card(TYPE_POWEREMU_AUDIO, &s->card, errp)) {
         return;
@@ -328,6 +363,7 @@ static void peau_class_init(ObjectClass *oc, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
 
     k->realize = peau_realize;
+    k->config_write = peau_config_write;
     k->exit = peau_exit;
     k->vendor_id = PEAU_VENDOR_ID;
     k->device_id = PEAU_DEVICE_ID;
