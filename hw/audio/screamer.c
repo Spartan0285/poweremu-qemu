@@ -60,7 +60,7 @@
 #define CODEC_STAT_MANUFACTURER_CRYSTAL    0x100
 #define CODEC_STAT_MANUFACTURER_NATIONAL   0x200
 #define CODEC_STAT_AWACS_REVISION          0x3000
-#define CODEC_STAT_MASK_VALID              (0x1 << 22) 
+#define CODEC_STAT_MASK_VALID              (0x1 << 22)
 
 /* Audio */
 static const char *s_spk = "screamer";
@@ -426,6 +426,8 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
 
 static void screamer_control_write(ScreamerState *s, uint32_t val)
 {
+    uint32_t old_rate = s->rate;
+
     SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
         
     /* Basic rate selection */
@@ -457,8 +459,18 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
     }
 
     SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
-    screamer_update_settings(s);
-    
+    /*
+     * Reopening the host voice tears down and rebuilds a CoreAudio stream,
+     * with whatever latency that takes, inside a guest MMIO store -- and it
+     * drops the priming.  The guest writes this register for reasons that
+     * have nothing to do with the rate, so do it only when the rate actually
+     * moved.  Both other emulators of this chip switch lazily for the same
+     * reason.
+     */
+    if (s->rate != old_rate) {
+        screamer_update_settings(s);
+    }
+
     s->regs[0] = val;
 }
 
@@ -542,10 +554,21 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
             val = CODEC_STAT_MASK_VALID |
                   ((s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0x7] & 0xfff) << 4);
         } else {
-            /* Return status register */
-            val = s->regs[addr] & ~0xff00;
-            val |= CODEC_STAT_MANUFACTURER_NATIONAL | CODEC_STAT_AWACS_REVISION |
-                   CODEC_STAT_MASK_VALID;
+            /*
+             * Built from constants: the real register is read-only, and
+             * letting the guest's writes survive into it handed the driver
+             * back its own bits in the error and overflow fields.
+             *
+             * The sense nibble is left at zero, which Apple's awacs_hw.h
+             * reads as a microphone being plugged in (bit 0 is inverted,
+             * kNotMicSense).  Reporting nothing connected instead was tried
+             * and measured worse -- 3 boots in 6 against 12 in 12 -- so it
+             * stays as it is until there is evidence rather than inference
+             * behind changing it.  The other emulators of this chip that do
+             * boot Mac OS 9 also return zero here.
+             */
+            val = CODEC_STAT_MASK_VALID | CODEC_STAT_AWACS_REVISION |
+                  CODEC_STAT_MANUFACTURER_NATIONAL;
         }
         break;
     case CLIP_CNT_REG:
@@ -589,6 +612,7 @@ static void screamer_write(void *opaque, hwaddr addr,
         screamer_codec_write(s, codec_addr, val & 0xfff);
         break;
     case CODEC_STAT_REG:
+        break;                  /* read-only on the real chip */
     case CLIP_CNT_REG:
     case BYTE_SWAP_REG:
         s->regs[addr] = val & 0xffffffff;
