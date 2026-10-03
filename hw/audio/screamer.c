@@ -62,6 +62,35 @@
 #define CODEC_STAT_AWACS_REVISION          0x3000
 #define CODEC_STAT_MASK_VALID              (0x1 << 22)
 
+/*
+ * Sound input, in the codec's own terms.
+ *
+ * Codec control register 0 carries the whole of it: which source the input
+ * multiplexer is listening to, and how much gain to give each channel.
+ * Apple's AppleScreamerAudio, Linux's sound/ppc/awacs.h and NetBSD's
+ * awacs.c agree on every bit; the names below are Apple's.
+ */
+#define CODEC0_GAIN_RIGHT                  0x00f
+#define CODEC0_GAIN_LEFT                   0x0f0
+#define CODEC0_NOT_MIC_PREAMP              0x100
+#define CODEC0_INPUT_MUX                   0xe00   /* CD 0x200, mic 0x400,
+                                                      line 0x800 */
+/*
+ * The sound control register's input subframe.  Apple writes subframe 0 for
+ * input and for output once, at initialisation; a guest that has not chosen
+ * an input subframe is not recording, whatever else it has set.
+ */
+#define SND_CTRL_IN_SUBFRAME               0x00f
+
+/*
+ * The sense nibble of the status register says what is plugged in, and the
+ * driver reads it through a bit reversal (AppleScreamerAudio's
+ * sndHWGetInSenseBits).  The device tree this machine publishes turns bit 1
+ * into "a microphone is connected", which is the one that makes Mac OS X
+ * offer an input at all.
+ */
+#define CODEC_STAT_LINE_IN_SENSE           0x2
+
 /* Audio */
 static const char *s_spk = "screamer";
 
@@ -117,6 +146,8 @@ static void sdbg_tick(ScreamerState *s)
         sdbg.last = now;
     }
 }
+
+static int pmac_screamer_rx_transfer(ScreamerState *s, int max);
 
 /* Move up to max frames of the current TX descriptor into the ring. */
 static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
@@ -204,19 +235,38 @@ static void screamer_pace_cb(void *opaque)
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
 
     int moved = 0;
-    while (due > 0 && s->io.len) {
-        int n = pmac_screamer_tx_transfer(s, due);
+    int64_t out_left = due, in_left = due;
+    while (out_left > 0 && s->io.len) {
+        int n = pmac_screamer_tx_transfer(s, out_left);
         if (n == 0) {
             break;                          /* ring full: backend is behind */
         }
-        due -= n;
+        out_left -= n;
+        moved += n;
+    }
+    /*
+     * Input is spent from the same budget on the same tick.
+     *
+     * There is one chip and one clock here, and Mac OS X believes it: both
+     * streams belong to a single IOAudioEngine whose clock is the frame
+     * counter the output transfer above advances, and whose timestamps are
+     * taken on the output interrupt.  Pacing input from a timer of its own
+     * let the two drift, and a drifting input is read either before it has
+     * been written or after it has been overwritten.
+     */
+    while (in_left > 0 && s->in_running && s->in_io.len) {
+        int n = pmac_screamer_rx_transfer(s, in_left);
+        if (n == 0) {
+            break;
+        }
+        in_left -= n;
         moved += n;
     }
     if (moved) {
         /* DBDMA may defer the next descriptor to a bottom half. Preserve
          * the unused budget across that boundary instead of losing a
          * fraction of a timer tick on every descriptor completion. */
-        s->pace_frac += due * NANOSECONDS_PER_SECOND;
+        s->pace_frac += MIN(out_left, in_left) * NANOSECONDS_PER_SECOND;
         s->pace_idle = 0;
     } else if (++s->pace_idle > 200) {      /* ~200 ms without DMA: stop */
         return;
@@ -274,18 +324,121 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
 
 }
 
+/*
+ * Sound input.
+ *
+ * The real Screamer fills input DMA at exactly the sample rate, and Mac OS X
+ * reads its input stream's clock from how far that DMA has got -- the same
+ * arrangement as the output side, and it needs the same treatment: a timer on
+ * the virtual clock moves frames at the sample rate, and the host's capture
+ * callback fills a ring behind it.
+ *
+ * What the ring does not have, it makes up as silence rather than waiting.
+ * A host that is slow, or has no microphone, or whose owner has not given
+ * this Mac permission to listen, must not stop the guest's input clock:
+ * Mac OS X would read that as the stream stalling, and the application
+ * recording from it hangs rather than recording quiet.
+ */
+static int pmac_screamer_rx_transfer(ScreamerState *s, int max)
+{
+    DBDMA_io *io = &s->in_io;
+    int frames = MIN(io->len >> s->shift, max);
+    int queued = s->in_wpos - s->in_rpos;
+    int done;
+
+    if (frames <= 0) {
+        return 0;
+    }
+    for (done = 0; done < frames;) {
+        int at = (s->in_rpos + done) % s->in_samples;
+        int n = MIN(frames - done, s->in_samples - at);
+
+        if (done < queued) {
+            n = MIN(n, queued - done);
+            dma_memory_write(&address_space_memory,
+                             io->addr + ((hwaddr)done << s->shift),
+                             &s->inbuf[(size_t)at << s->shift],
+                             (size_t)n << s->shift, MEMTXATTRS_UNSPECIFIED);
+        } else {
+            /* Nothing captured: hand the guest silence, on time. */
+            n = frames - done;
+            dma_memory_set(&address_space_memory,
+                           io->addr + ((hwaddr)done << s->shift), 0,
+                           (size_t)n << s->shift, MEMTXATTRS_UNSPECIFIED);
+        }
+        done += n;
+    }
+
+    s->in_rpos += MIN(frames, queued);
+    if (s->in_rpos >= (uint32_t)s->in_samples) {
+        uint32_t base = s->in_rpos - s->in_rpos % s->in_samples;
+        s->in_rpos -= base;
+        s->in_wpos -= base;
+    }
+
+    io->addr += (hwaddr)frames << s->shift;
+    io->len -= frames << s->shift;
+
+    if (io->len == 0) {
+        s->in_running = false;
+        io->dma_end(io);
+    }
+    return frames;
+}
+
+/* The host has frames for us: take what fits and drop the oldest if the
+ * guest is not reading (an input nobody listens to must not back up). */
+static void screamer_in_callback(void *opaque, int avail)
+{
+    ScreamerState *s = opaque;
+    int frames = avail >> s->shift;
+
+    if (!s->inbuf) {
+        return;
+    }
+    while (frames > 0) {
+        int at = s->in_wpos % s->in_samples;
+        int n = MIN(frames, s->in_samples - at);
+        int got = AUD_read(s->in_voice, &s->inbuf[(size_t)at << s->shift],
+                           n << s->shift) >> s->shift;
+        if (got <= 0) {
+            break;
+        }
+        s->in_wpos += got;
+        frames -= got;
+        if ((int)(s->in_wpos - s->in_rpos) > s->in_samples) {
+            s->in_rpos = s->in_wpos - s->in_samples;
+        }
+    }
+}
+
 static void pmac_screamer_rx(DBDMA_io *io)
 {
+    ScreamerState *s = io->opaque;
+    DBDMA_channel *ch = io->channel;
+
     SCREAMER_DPRINTF("DMA RX transfer: addr %" HWADDR_PRIx
                      " len: %x\n", io->addr, io->len);
 
-    //ScreamerState *s = io->opaque;
-    DBDMA_channel *ch = io->channel;
-        
-    /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
-    ch->regs[DBDMA_STATUS] &= ~RUN;
+    if (!s->input || !s->in_voice) {
+        /*
+         * No input on this machine.  Stop the channel after the status
+         * update, as this has always done: Mac OS 9 freezes if an input
+         * channel it started neither runs nor stops.
+         */
+        ch->regs[DBDMA_STATUS] &= ~RUN;
+        io->dma_end(io);
+        return;
+    }
 
-    io->dma_end(io);
+    memcpy(&s->in_io, io, sizeof(DBDMA_io));
+    s->in_running = true;
+    s->pace_idle = 0;
+    if (!timer_pending(s->pace_timer)) {
+        s->pace_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->pace_frac = 0;
+        timer_mod(s->pace_timer, s->pace_last + SCREAMER_PACE_NS);
+    }
 }
 
 static void pmac_screamer_rx_flush(DBDMA_io *io)
@@ -419,6 +572,53 @@ static void screamer_update_volume(ScreamerState *s)
                        (0xf - att_right) << 4);
 }
 
+/*
+ * Follow codec register 0 and the sound control register: start or stop
+ * listening, and set the capture gain.
+ */
+static void screamer_update_input(ScreamerState *s)
+{
+    uint32_t mux = s->codec_ctrl_regs[0x0] & CODEC0_INPUT_MUX;
+    uint8_t right = s->codec_ctrl_regs[0x0] & CODEC0_GAIN_RIGHT;
+    uint8_t left = (s->codec_ctrl_regs[0x0] & CODEC0_GAIN_LEFT) >> 4;
+    bool armed = mux && (s->regs[SND_CTRL_REG] & SND_CTRL_IN_SUBFRAME);
+
+    s->in_armed = armed;
+    if (!s->input) {
+        return;
+    }
+    /*
+     * Open the capture voice the first time the guest chooses an input, not
+     * when the machine is built.
+     *
+     * Opening it asks this Mac for permission to listen, and that question
+     * is not one to ask while a virtual Mac is still starting -- on a Mac
+     * that has not answered it, the request does not come back, and the
+     * emulator would hang before the guest had drawn anything.  A guest that
+     * never records never reaches here.
+     */
+    if (!s->in_voice && armed) {
+        struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16, 1 };
+
+        s->in_voice = AUD_open_in(&s->card, s->in_voice, "screamer.in", s,
+                                  screamer_in_callback, &as);
+        if (!s->in_voice) {
+            AUD_log(s_spk, "Could not open the sound input\n");
+            return;
+        }
+        if (!s->inbuf) {
+            s->in_samples = SCREAMER_RING_FRAMES;
+            s->inbuf = g_malloc0((size_t)s->in_samples << s->shift);
+        }
+    }
+    if (!s->in_voice) {
+        return;
+    }
+    /* The codec's gain is 0..15 over about 22.5 dB; the mixer wants 0..255. */
+    AUD_set_volume_in(s->in_voice, 0, left << 4, right << 4);
+    AUD_set_active_in(s->in_voice, armed);
+}
+
 static void screamer_reset(DeviceState *dev)
 {
     ScreamerState *s = SCREAMER(dev);
@@ -433,6 +633,8 @@ static void screamer_reset(DeviceState *dev)
     s->bpos = 0;
     s->wpos = s->rpos = 0;
     s->ppos = 0;
+    s->in_wpos = s->in_rpos = 0;
+    s->in_running = false;
 
     return;
 }
@@ -498,6 +700,7 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
     }
 
     s->regs[0] = val;
+    screamer_update_input(s);
 }
 
 static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
@@ -510,6 +713,21 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
     switch (addr) {
+    case 0x0:
+        /*
+         * Input: which source, and how loud.
+         *
+         * The three multiplexer bits are a source selector, and which jack
+         * each one stands for differs between this chip's revisions -- Apple,
+         * Linux and NetBSD do not even agree on the names.  So any source at
+         * all counts as "listening", and the host's one input is handed over
+         * whichever was picked, rather than pretending to a wiring loom this
+         * machine does not have.
+         */
+        s->codec_ctrl_regs[addr] = val;
+        screamer_update_input(s);
+        return;
+
     case 0x1:
         /* Clear recalibrate if set */
         val = val & ~CODEC_CTRL1_RECALIBRATE;    
@@ -595,6 +813,16 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
              */
             val = CODEC_STAT_MASK_VALID | CODEC_STAT_AWACS_REVISION |
                   CODEC_STAT_MANUFACTURER_NATIONAL;
+            /*
+             * Say a microphone is plugged in, but only when this machine
+             * actually has an input to offer.  Mac OS X polls this once a
+             * second and builds its list of input devices from it, so
+             * claiming one that cannot record would put a dead input in the
+             * Sound preference pane.
+             */
+            if (s->input) {
+                val |= CODEC_STAT_LINE_IN_SENSE;
+            }
         }
         break;
     case CLIP_CNT_REG:
@@ -643,6 +871,15 @@ static void screamer_write(void *opaque, hwaddr addr,
     case BYTE_SWAP_REG:
         s->regs[addr] = val & 0xffffffff;
         break;
+    case FRAME_CNT_REG:
+        /*
+         * The driver zeroes this at every engine start and then reads it as
+         * the audio clock.  The write used to fall through to the
+         * unimplemented path and be dropped, so the counter carried on from
+         * wherever the last stream had left it.
+         */
+        s->regs[addr] = val & 0xffffffff;
+        break;
     default:
         qemu_log_mask(LOG_UNIMP,
                   "screamer: Unimplemented register write "
@@ -678,6 +915,13 @@ static void screamer_initfn(Object *obj)
 
 static const Property screamer_properties[] = {
     DEFINE_AUDIO_PROPERTIES(ScreamerState, card),
+    /*
+     * Off unless the machine is given one.  An input the guest never asked
+     * for costs a capture stream on the host -- and on this Mac, opening one
+     * is what makes the microphone indicator light up, which should not
+     * happen because somebody started a virtual Mac.
+     */
+    DEFINE_PROP_BOOL("input", ScreamerState, input, false),
 };
 
 static void screamer_class_init(ObjectClass *oc, void *data)

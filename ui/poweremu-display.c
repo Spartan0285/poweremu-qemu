@@ -3,6 +3,10 @@
  *
  *   -display none -object poweremu-display,id=pd0,path=/tmp/x.sock
  *
+ * A machine with more than one screen takes one of these per screen, each
+ * with its own socket:  add index=1 for the second.  index=0 (the default)
+ * is the screen the guest boots on.
+ *
  * PowerEmu listens on the Unix socket at `path`; QEMU connects at startup,
  * and again every few seconds if the connection is lost -- so a virtual Mac
  * whose PowerEmu quit unexpectedly rejoins the app when it opens again
@@ -36,6 +40,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qom/object_interfaces.h"
 #include "io/channel-socket.h"
 #include "ui/console.h"
@@ -57,6 +62,12 @@ enum {
 struct PowerEmuDisplay {
     Object parent_obj;
     char *path;
+    /*
+     * Which screen this one shows.  A machine with two heads has two of
+     * these objects, each with its own socket and its own window in the
+     * app; index 0 is the screen the guest boots on.
+     */
+    uint32_t index;
 
     QIOChannelSocket *sioc;
     guint watch;
@@ -613,10 +624,23 @@ static gboolean pe_readable(QIOChannel *ioc, GIOCondition cond, gpointer opaque)
 static void pe_attach(Notifier *n, void *data)
 {
     PowerEmuDisplay *pd = container_of(n, PowerEmuDisplay, machine_done);
-    QemuConsole *con = qemu_console_lookup_default();     /* the first graphic one */
+    /*
+     * index=0 means the machine's default screen rather than console 0 by
+     * number: a machine can carry text consoles as well, and the default is
+     * the first graphical one.  Any other index is taken literally, and has
+     * to be graphical to be shown.
+     */
+    QemuConsole *con = pd->index == 0 ? qemu_console_lookup_default()
+                                      : qemu_console_lookup_by_index(pd->index);
 
     if (!con) {
-        error_report("poweremu-display: the machine has no screen");
+        error_report("poweremu-display: the machine has no screen %u",
+                     pd->index);
+        return;
+    }
+    if (pd->index != 0 && !qemu_console_is_graphic(con)) {
+        error_report("poweremu-display: screen %u is not a graphical one",
+                     pd->index);
         return;
     }
     pd->dcl.ops = &pe_ops;
@@ -674,6 +698,26 @@ static void pe_set_path(Object *obj, const char *value, Error **errp)
     pd->path = g_strdup(value);
 }
 
+static void pe_get_index(Object *obj, Visitor *v, const char *name,
+                         void *opaque, Error **errp)
+{
+    uint32_t value = POWEREMU_DISPLAY(obj)->index;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void pe_set_index(Object *obj, Visitor *v, const char *name,
+                         void *opaque, Error **errp)
+{
+    PowerEmuDisplay *pd = POWEREMU_DISPLAY(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    pd->index = value;
+}
+
 static void pe_finalize(Object *obj)
 {
     PowerEmuDisplay *pd = POWEREMU_DISPLAY(obj);
@@ -699,6 +743,8 @@ static void pe_class_init(ObjectClass *oc, void *data)
 
     ucc->complete = pe_complete;
     object_class_property_add_str(oc, "path", pe_get_path, pe_set_path);
+    object_class_property_add(oc, "index", "uint32",
+                              pe_get_index, pe_set_index, NULL, NULL);
 }
 
 static const TypeInfo pe_info = {

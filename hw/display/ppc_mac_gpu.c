@@ -2803,8 +2803,6 @@ static void r200_fill_notify(PPCMacGPUState *s, uint32_t offset, uint32_t pitch,
 
 /* ---- Direct-R200 asynchronous fences ---- */
 
-static QEMUBH *r200_fence_bh;
-
 /* Perform queued scratch writebacks whose GPU batch has completed. */
 static void r200_fence_drain(PPCMacGPUState *s, uint32_t done)
 {
@@ -2833,7 +2831,7 @@ static void r200_fence_done_cb(void *arg, uint32_t seq)
 {
     PPCMacGPUState *s = arg;
     qatomic_set(&s->regs.r200_fence_done, seq);
-    qemu_bh_schedule(r200_fence_bh);
+    qemu_bh_schedule(s->fence_bh);
 }
 
 /*
@@ -2907,8 +2905,8 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
         return;
     }
     if (r200_direct_enabled() && s->renderer && s->renderer->submit_r200) {
-        if (!r200_fence_bh) {
-            r200_fence_bh = qemu_bh_new(r200_fence_bh_cb, s);
+        if (!s->fence_bh) {
+            s->fence_bh = qemu_bh_new(r200_fence_bh_cb, s);
         }
         seq = s->renderer->submit_r200(s->renderer_opaque,
                                        r200_fence_done_cb, s);
@@ -10670,8 +10668,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 
     /* CRTC2 / misc registers (stubs) */
     case R200_CRTC2_OFFSET_CNTL:  /* 0x0328 */
-    case R200_CRTC2_PITCH:        /* 0x023C */
-    case R200_FP2_GEN_CNTL:       /* 0x033C */
+    case R200_CRTC2_PITCH:        /* 0x032C */
+    case R200_FP2_GEN_CNTL:       /* 0x0288 */
     case R200_RBBM_CNTL:          /* 0x1710 */
         val = 0;
         break;
@@ -11728,8 +11726,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* CRTC2 / misc stubs - accept writes silently */
     case R200_CRTC2_OFFSET_CNTL:  /* 0x0328 */
-    case R200_CRTC2_PITCH:        /* 0x023C */
-    case R200_FP2_GEN_CNTL:       /* 0x033C */
+    case R200_CRTC2_PITCH:        /* 0x032C */
+    case R200_FP2_GEN_CNTL:       /* 0x0288 */
     /* NOTE: RB3D_DSTCACHE_MODE (0x3258) removed from this group —
      * it's in the 3D register range and must be stored in regs_3d[]
      * so the kext can read back written values. */

@@ -65,6 +65,23 @@ struct ScreamerState {
     uint32_t rate;
     DBDMA_io io;
 
+    /*
+     * Sound input: the microphone or line-in on this Mac, handed to the
+     * guest through the Screamer's own input DMA channel.
+     *
+     * The ring is the mirror image of the output one: the host's capture
+     * callback writes frames into it and the input DMA takes them out.
+     * in_io is the descriptor the guest has posted and is waiting on.
+     */
+    bool input;                   /* the machine was given an input at all */
+    SWVoiceIn *in_voice;
+    uint8_t *inbuf;
+    int in_samples;
+    uint32_t in_wpos, in_rpos;
+    DBDMA_io in_io;
+    bool in_running;              /* a descriptor is posted */
+    bool in_armed;                /* the guest has chosen an input source */
+
     uint32_t regs[6];
     uint32_t codec_ctrl_regs[8];
 };

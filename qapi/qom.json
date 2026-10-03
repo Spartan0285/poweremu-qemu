@@ -503,10 +503,14 @@
 #
 # @path: the Unix socket PowerEmu listens on
 #
+# @index: which of the machine's screens to show (default: 0, the screen
+#     the guest boots on).  A machine with two heads takes one of these
+#     objects per head, each with its own socket.
+#
 # Since: 10.0
 ##
 { 'struct': 'PowerEmuDisplayProperties',
-  'data': { 'path': 'str' } }
+  'data': { 'path': 'str', '*index': 'uint32' } }
 
 ##
 # @InputLinuxProperties:

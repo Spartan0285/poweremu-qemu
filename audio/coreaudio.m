@@ -44,8 +44,37 @@ typedef struct coreaudioVoiceOut {
     bool enabled;
 } coreaudioVoiceOut;
 
+/*
+ * Capture.
+ *
+ * The playback half below drives the default output device directly with an
+ * IOProc.  Input is the mirror image of it: an IOProc on the default input
+ * device copies what the microphone hears into the same ring buffer the
+ * generic layer would have filled, and `read` drains it.
+ *
+ * This Mac asks its owner for permission the first time the input IOProc
+ * runs, so a process that never opens a capture voice never raises the
+ * microphone indicator.
+ */
+typedef struct coreaudioVoiceIn {
+    HWVoiceIn hw;
+    pthread_mutex_t buf_mutex;
+    AudioDeviceID inputDeviceID;
+    int frameSizeSetting;
+    uint32_t bufferCount;
+    UInt32 audioDevicePropertyBufferFrameSize;
+    AudioDeviceIOProcID ioprocid;
+    bool enabled;
+} coreaudioVoiceIn;
+
 static const AudioObjectPropertyAddress voice_addr = {
     kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+};
+
+static const AudioObjectPropertyAddress in_voice_addr = {
+    kAudioHardwarePropertyDefaultInputDevice,
     kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyElementMain
 };
@@ -645,6 +674,319 @@ static void coreaudio_enable_out(HWVoiceOut *hw, bool enable)
     update_device_playback_state(core);
 }
 
+/* ---- capture ---- */
+
+#define coreaudio_record_logerr(status, ...) \
+    coreaudio_logerr2(status, "record", __VA_ARGS__)
+
+static int coreaudio_in_lock(coreaudioVoiceIn *core, const char *fn_name)
+{
+    int err = pthread_mutex_lock(&core->buf_mutex);
+
+    if (err) {
+        dolog("Could not lock voice for %s\nReason: %s\n",
+              fn_name, strerror(err));
+        return -1;
+    }
+    return 0;
+}
+
+static void coreaudio_in_unlock(coreaudioVoiceIn *core, const char *fn_name)
+{
+    int err = pthread_mutex_unlock(&core->buf_mutex);
+
+    if (err) {
+        dolog("Could not unlock voice for %s\nReason: %s\n",
+              fn_name, strerror(err));
+    }
+}
+
+/*
+ * What the microphone heard, called without the BQL on Core Audio's own
+ * thread.  Same locking rule as the playback IOProc: buf_mutex and nothing
+ * else.
+ */
+static OSStatus audioDeviceIOProcIn(
+    AudioDeviceID inDevice,
+    const AudioTimeStamp *inNow,
+    const AudioBufferList *inInputData,
+    const AudioTimeStamp *inInputTime,
+    AudioBufferList *outOutputData,
+    const AudioTimeStamp *inOutputTime,
+    void *hwptr)
+{
+    HWVoiceIn *hw = hwptr;
+    coreaudioVoiceIn *core = (coreaudioVoiceIn *) hwptr;
+    const uint8_t *in;
+    size_t len;
+
+    if (!inInputData || inInputData->mNumberBuffers < 1) {
+        return 0;
+    }
+    in = inInputData->mBuffers[0].mData;
+    len = inInputData->mBuffers[0].mDataByteSize;
+    if (!in || !len) {
+        return 0;
+    }
+
+    if (coreaudio_in_lock(core, "audioDeviceIOProcIn")) {
+        return 0;
+    }
+    if (inDevice != core->inputDeviceID || !hw->buf_emul) {
+        coreaudio_in_unlock(core, "audioDeviceIOProcIn(old device)");
+        return 0;
+    }
+
+    /*
+     * Keep the newest sound rather than the oldest.  If nothing is reading
+     * -- the guest has an input open but is not recording -- the ring would
+     * otherwise fill once and then hold the same half-second of audio for
+     * as long as the machine runs.
+     */
+    if (len > hw->size_emul) {
+        in += len - hw->size_emul;
+        len = hw->size_emul;
+    }
+    while (len) {
+        size_t n = MIN(len, hw->size_emul - hw->pos_emul);
+
+        memcpy((uint8_t *)hw->buf_emul + hw->pos_emul, in, n);
+        hw->pos_emul = (hw->pos_emul + n) % hw->size_emul;
+        hw->pending_emul = MIN(hw->pending_emul + n, hw->size_emul);
+        in += n;
+        len -= n;
+    }
+
+    coreaudio_in_unlock(core, "audioDeviceIOProcIn");
+    return 0;
+}
+
+static size_t coreaudio_read(HWVoiceIn *hw, void *buf, size_t size)
+{
+    coreaudioVoiceIn *core = (coreaudioVoiceIn *) hw;
+    size_t total = 0;
+
+    if (coreaudio_in_lock(core, "coreaudio_read")) {
+        return 0;
+    }
+    while (total < size && hw->pending_emul) {
+        size_t start = audio_ring_posb(hw->pos_emul, hw->pending_emul,
+                                       hw->size_emul);
+        size_t n = MIN(MIN(size - total, hw->pending_emul),
+                       hw->size_emul - start);
+
+        memcpy((uint8_t *)buf + total, (uint8_t *)hw->buf_emul + start, n);
+        hw->pending_emul -= n;
+        total += n;
+    }
+    coreaudio_in_unlock(core, "coreaudio_read");
+    return total;
+}
+
+static OSStatus init_in_device(coreaudioVoiceIn *core)
+{
+    OSStatus status;
+    AudioDeviceID deviceID;
+    AudioValueRange frameRange;
+    UInt32 framesize;
+    AudioDeviceIOProcID ioprocid;
+    UInt32 size = sizeof(deviceID);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyBufferFrameSizeRange,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+                                        &in_voice_addr, 0, NULL,
+                                        &size, &deviceID);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_record_logerr(status,
+                                "Could not get the default input device\n");
+        return status;
+    }
+    if (deviceID == kAudioDeviceUnknown) {
+        dolog("Could not initialize recording - no input device\n");
+        return kAudioHardwareBadDeviceError;
+    }
+
+    size = sizeof(frameRange);
+    status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL,
+                                        &size, &frameRange);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_record_logerr(status,
+                                "Could not get the input buffer frame range\n");
+        return status;
+    }
+    if (frameRange.mMinimum > core->frameSizeSetting) {
+        framesize = (UInt32) frameRange.mMinimum;
+    } else if (frameRange.mMaximum < core->frameSizeSetting) {
+        framesize = (UInt32) frameRange.mMaximum;
+    } else {
+        framesize = core->frameSizeSetting;
+    }
+
+    addr.mSelector = kAudioDevicePropertyBufferFrameSize;
+    status = AudioObjectSetPropertyData(deviceID, &addr, 0, NULL,
+                                        sizeof(framesize), &framesize);
+    if (status != kAudioHardwareNoError &&
+        status != kAudioHardwareBadObjectError) {
+        coreaudio_record_logerr(status,
+                                "Could not set the input buffer frame size\n");
+        return status;
+    }
+    size = sizeof(framesize);
+    status = AudioObjectGetPropertyData(deviceID, &addr, 0, NULL,
+                                        &size, &framesize);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_record_logerr(status,
+                                "Could not get the input buffer frame size\n");
+        return status;
+    }
+
+    /*
+     * Ask the device for the shape this voice wants.  Unlike playback, a
+     * failure here is not fatal: an input device that will not take the
+     * format still delivers float frames at its own rate, and Core Audio's
+     * own conversion is better than refusing to record at all.
+     */
+    {
+        AudioStreamBasicDescription d = {
+            .mBitsPerChannel = core->hw.info.bits,
+            .mBytesPerFrame = core->hw.info.bytes_per_frame,
+            .mBytesPerPacket = core->hw.info.bytes_per_frame,
+            .mChannelsPerFrame = core->hw.info.nchannels,
+            .mFormatFlags = kLinearPCMFormatFlagIsFloat,
+            .mFormatID = kAudioFormatLinearPCM,
+            .mFramesPerPacket = 1,
+            .mSampleRate = core->hw.info.freq
+        };
+        addr.mSelector = kAudioDevicePropertyStreamFormat;
+        status = AudioObjectSetPropertyData(deviceID, &addr, 0, NULL,
+                                            sizeof(d), &d);
+        if (status != kAudioHardwareNoError) {
+            coreaudio_record_logerr(status,
+                                    "Could not set the input samplerate\n");
+        }
+    }
+
+    ioprocid = NULL;
+    status = AudioDeviceCreateIOProcID(deviceID, audioDeviceIOProcIn,
+                                       &core->hw, &ioprocid);
+    if (status != kAudioHardwareNoError || ioprocid == NULL) {
+        coreaudio_record_logerr(status, "Could not set the input IOProc\n");
+        return status ? status : kAudioHardwareUnspecifiedError;
+    }
+
+    core->inputDeviceID = deviceID;
+    core->audioDevicePropertyBufferFrameSize = framesize;
+    core->hw.samples = core->bufferCount * framesize;
+    audio_generic_initialize_buffer_in(&core->hw);
+    core->ioprocid = ioprocid;
+    return 0;
+}
+
+static void fini_in_device(coreaudioVoiceIn *core)
+{
+    OSStatus status;
+
+    if (core->ioprocid != NULL) {
+        status = AudioDeviceStop(core->inputDeviceID, core->ioprocid);
+        if (status != kAudioHardwareNoError &&
+            status != kAudioHardwareBadDeviceError) {
+            coreaudio_record_logerr(status, "Could not stop recording\n");
+        }
+        status = AudioDeviceDestroyIOProcID(core->inputDeviceID,
+                                            core->ioprocid);
+        if (status != kAudioHardwareNoError &&
+            status != kAudioHardwareBadDeviceError) {
+            coreaudio_record_logerr(status, "Could not remove the IOProc\n");
+        }
+        core->ioprocid = NULL;
+    }
+    core->inputDeviceID = kAudioDeviceUnknown;
+}
+
+static int coreaudio_init_in(HWVoiceIn *hw, struct audsettings *as,
+                             void *drv_opaque)
+{
+    coreaudioVoiceIn *core = (coreaudioVoiceIn *) hw;
+    Audiodev *dev = drv_opaque;
+    AudiodevCoreaudioPerDirectionOptions *cpdo = dev->u.coreaudio.in;
+    struct audsettings obt_as;
+    int err;
+
+    err = pthread_mutex_init(&core->buf_mutex, NULL);
+    if (err) {
+        dolog("Could not create mutex\nReason: %s\n", strerror(err));
+        return -1;
+    }
+
+    obt_as = *as;
+    as = &obt_as;
+    as->fmt = AUDIO_FORMAT_F32;
+    audio_pcm_init_info(&hw->info, as);
+
+    core->frameSizeSetting = audio_buffer_frames(
+        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
+    core->bufferCount = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+
+    if (init_in_device(core)) {
+        pthread_mutex_destroy(&core->buf_mutex);
+        return -1;
+    }
+    return 0;
+}
+
+static void coreaudio_fini_in(HWVoiceIn *hw)
+{
+    coreaudioVoiceIn *core = (coreaudioVoiceIn *) hw;
+    int err;
+
+    fini_in_device(core);
+    err = pthread_mutex_destroy(&core->buf_mutex);
+    if (err) {
+        dolog("Could not destroy mutex\nReason: %s\n", strerror(err));
+    }
+}
+
+static void coreaudio_enable_in(HWVoiceIn *hw, bool enable)
+{
+    coreaudioVoiceIn *core = (coreaudioVoiceIn *) hw;
+    OSStatus status;
+
+    if (core->enabled == enable || core->ioprocid == NULL) {
+        core->enabled = enable;
+        return;
+    }
+    core->enabled = enable;
+    if (enable) {
+        /*
+         * This is where this Mac asks its owner whether the virtual Mac may
+         * listen.  Until a guest selects an input and starts its input DMA,
+         * nothing here runs and nothing is recorded.
+         */
+        status = AudioDeviceStart(core->inputDeviceID, core->ioprocid);
+        if (status != kAudioHardwareNoError) {
+            coreaudio_record_logerr(status, "Could not start recording\n");
+        }
+    } else {
+        status = AudioDeviceStop(core->inputDeviceID, core->ioprocid);
+        if (status != kAudioHardwareNoError &&
+            status != kAudioHardwareBadDeviceError) {
+            coreaudio_record_logerr(status, "Could not stop recording\n");
+        }
+        if (!coreaudio_in_lock(core, "coreaudio_enable_in")) {
+            hw->pending_emul = 0;
+            hw->pos_emul = 0;
+            coreaudio_in_unlock(core, "coreaudio_enable_in");
+        }
+    }
+}
+
 static void *coreaudio_audio_init(Audiodev *dev, Error **errp)
 {
     return dev;
@@ -665,7 +1007,11 @@ static struct audio_pcm_ops coreaudio_pcm_ops = {
     .get_buffer_out = coreaudio_get_buffer_out,
   /* wrapper for audio_generic_put_buffer_out */
     .put_buffer_out = coreaudio_put_buffer_out,
-    .enable_out = coreaudio_enable_out
+    .enable_out = coreaudio_enable_out,
+    .init_in  = coreaudio_init_in,
+    .fini_in  = coreaudio_fini_in,
+    .read     = coreaudio_read,
+    .enable_in = coreaudio_enable_in
 };
 
 static struct audio_driver coreaudio_audio_driver = {
@@ -675,9 +1021,9 @@ static struct audio_driver coreaudio_audio_driver = {
     .fini           = coreaudio_audio_fini,
     .pcm_ops        = &coreaudio_pcm_ops,
     .max_voices_out = 1,
-    .max_voices_in  = 0,
+    .max_voices_in  = 1,
     .voice_size_out = sizeof (coreaudioVoiceOut),
-    .voice_size_in  = 0
+    .voice_size_in  = sizeof (coreaudioVoiceIn)
 };
 
 static void register_audio_coreaudio(void)

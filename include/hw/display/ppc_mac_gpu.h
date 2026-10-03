@@ -287,10 +287,16 @@ struct R200Vertex;
 #define R200_AIC_LO_ADDR              0x01DC  /* GART aperture low (GPU addr) */
 #define R200_AIC_HI_ADDR              0x01E0  /* GART aperture high (GPU addr) */
 
-/* CRTC2 pitch and offset */
+/* CRTC2 pitch and offset.
+ *
+ * The two addresses below were wrong for years and swallowed the writes to
+ * whatever really lives at 0x023C and 0x033C while the real registers fell
+ * through to the unimplemented path.  Checked against the register names in
+ * the X.Org radeon driver (radeon_reg.h: RADEON_CRTC2_PITCH 0x032c,
+ * RADEON_FP2_GEN_CNTL 0x0288). */
 #define R200_CRTC2_OFFSET_CNTL       0x0328
-#define R200_CRTC2_PITCH              0x023C
-#define R200_FP2_GEN_CNTL            0x033C
+#define R200_CRTC2_PITCH             0x032C
+#define R200_FP2_GEN_CNTL            0x0288
 
 /* GPIOPAD registers */
 #define R200_GPIOPAD_MASK             0x0198
@@ -710,6 +716,13 @@ struct PPCMacGPUState {
     uint32_t regs_size;
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
+    /*
+     * Scratch writebacks waiting on the GPU, drained in the main loop.
+     * Per card: a machine can have two of these, and a file-scope bottom
+     * half built from whichever card realized first drained that card's
+     * queue whatever card the completion came from.
+     */
+    QEMUBH *fence_bh;
     bool display_invalid;       /* Display needs full redraw */
 
     /* PM4 PIO FIFO for CP command processing */
