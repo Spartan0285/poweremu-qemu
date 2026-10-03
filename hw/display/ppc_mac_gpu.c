@@ -1938,8 +1938,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         if (m->stride != s->disp_stride_override_value) {
             static int stride_override_log = 0;
             if (stride_override_log < 20) {
-                fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
+                fprintf(stderr, "[STRIDE_CHANGE][%s] update_display_mode: "
                         "CRTC gives %u, override forces %u\n",
+                        DEVICE(s)->id ? DEVICE(s)->id : "?",
                         m->stride, s->disp_stride_override_value);
                 stride_override_log++;
             }
@@ -1975,8 +1976,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
                 DEVICE(s)->id ? DEVICE(s)->id : "?",
                 m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
         if (old.stride != m->stride) {
-            fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
+            fprintf(stderr, "[STRIDE_CHANGE][%s] update_display_mode: "
                     "%u -> %u (override=%s val=%u)\n",
+                    DEVICE(s)->id ? DEVICE(s)->id : "?",
                     old.stride, m->stride,
                     s->disp_stride_override_active ? "yes" : "no",
                     s->disp_stride_override_value);
@@ -4424,8 +4426,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 static int mmio_nosrt_so = 0;
                 if (mmio_nosrt_so < 20) {
                     fprintf(stderr,
-                        "[STRIDE_CHANGE] MMIO_NOSRT: "
+                        "[STRIDE_CHANGE][%s] MMIO_NOSRT: "
                         "override %s %u -> %u\n",
+                        DEVICE(s)->id ? DEVICE(s)->id : "?",
                         s->disp_stride_override_active
                             ? "update" : "activate",
                         s->disp.stride, dst_pitch);
