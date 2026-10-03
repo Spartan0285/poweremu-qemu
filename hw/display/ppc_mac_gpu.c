@@ -12153,8 +12153,23 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
         s->regs.crtc_h_total_disp = ((boot_w / 8 - 1) << 16) |
                                      (boot_w / 8 + 31);
         s->regs.crtc_v_total_disp = ((boot_h - 1) << 16) | (boot_h + 27);
-        s->regs.crtc_pitch = (s->exact_scanout_pitch ? boot_w
-                              : r200_aligned_pitch_pixels(boot_w, 32)) / 8;
+        /*
+         * Unaligned on purpose, and not what exact-scanout-pitch controls.
+         * OpenBIOS computes the frame buffer's "linebytes" as width * bytes
+         * (drivers/vga.fs), and BootX draws the boot logo at that pitch, so
+         * the CRTC has to scan out at the same one or the logo shears: at
+         * 1680 the aligned pitch is 6912 against the 6720 it was drawn at,
+         * a drift of 48 pixels a line, and the Apple logo arrives as faint
+         * diagonal streaks on grey.
+         *
+         * Only the boot frame buffer is OpenBIOS's.  Once the OS's driver
+         * sets a mode, update_display_mode() applies the 256-byte-aligned
+         * pitch every Radeon-era Mac driver rounds to, which is why this
+         * must not simply follow exact-scanout-pitch: that flag applies to
+         * every mode set, and forcing the exact pitch on Mac OS X's desktop
+         * was measured to bring it up in shredded horizontal bands.
+         */
+        s->regs.crtc_pitch = boot_w / 8;
         s->regs.crtc_offset = 0;
     }
 
