@@ -1969,7 +1969,10 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 
     /* Check if mode changed */
     if (memcmp(&old, m, sizeof(old)) != 0) {
-        fprintf(stderr, "GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
+        /* Say which card: a machine can have two, and both write here. */
+        fprintf(stderr, "GPU MODE[%s]: %ux%u bpp=%u stride=%u offset=0x%x "
+                "pitch_reg=0x%x crtc_gen=0x%x\n",
+                DEVICE(s)->id ? DEVICE(s)->id : "?",
                 m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
         if (old.stride != m->stride) {
             fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
