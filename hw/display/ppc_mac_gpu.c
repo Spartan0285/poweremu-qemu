@@ -1895,30 +1895,6 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     }
 
     /*
-     * A card whose picture is always Open Firmware's scans out the row
-     * length Open Firmware drew it at, whatever the CRTC was told.
-     *
-     * This flag used to be read only where a VBE mode is set, which is the
-     * path the QEMU VGA driver takes; a mode set through the CRTC registers
-     * went straight past it.  That is the path Mac OS X takes, and on a
-     * second screen it is the path that matters: nothing binds an
-     * accelerated driver to the second card, so its picture keeps coming
-     * through the linear frame buffer Open Firmware describes -- width
-     * times bytes, exactly -- while the CRTC had been moved to the
-     * 256-byte-aligned length during the first mode set.  Measured at
-     * 1680x1050: 1050 rows drawn 6720 bytes apart, read back 6912 apart,
-     * so each row drifted 48 pixels and the picture ran out after 1021 of
-     * them.
-     *
-     * The first card never sets this: its boot frame buffer is Open
-     * Firmware's too, but Mac OS X's driver takes it over and from then on
-     * draws at the aligned length.
-     */
-    if (s->exact_scanout_pitch && m->width && m->bpp) {
-        m->stride = m->width * ((m->bpp + 7) / 8);
-    }
-
-    /*
      * Clear the stride override on a resolution change: it belongs to the
      * mode it was captured in.  This has to happen before the override is
      * applied below, or the frame that changes resolution gets the old
