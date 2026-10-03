@@ -972,6 +972,13 @@ static void coreaudio_enable_in(HWVoiceIn *hw, bool enable)
         status = AudioDeviceStart(core->inputDeviceID, core->ioprocid);
         if (status != kAudioHardwareNoError) {
             coreaudio_record_logerr(status, "Could not start recording\n");
+            /*
+             * Most often this Mac has not been asked for the microphone yet,
+             * or was asked and refused.  Do not remember the failure: the
+             * guest arms its input again every time it records, and if
+             * permission is given in between, the next attempt should work.
+             */
+            core->enabled = false;
         }
     } else {
         status = AudioDeviceStop(core->inputDeviceID, core->ioprocid);
