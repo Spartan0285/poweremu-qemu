@@ -789,6 +789,9 @@ struct PPCMacGPUState {
     /* EDID blob for NDRV compatibility (byte reads at MMIO 0x00-0x7F) */
     uint8_t edid_blob[128];
     bool edid_read_done;    /* true after NDRV finishes EDID reading */
+    bool boot_display;      /* shows the Apple logo; see crtc_pitch seeding */
+    uint32_t pci_device_id; /* 0: the modelled card's own */
+    bool present_pitch_override;  /* learn the scan-out pitch from blits */
 
     /* 3D vertex buffer pointers (from 3D_LOAD_VBPNTR) */
     uint32_t vb_count;              /* number of active vertex buffers */

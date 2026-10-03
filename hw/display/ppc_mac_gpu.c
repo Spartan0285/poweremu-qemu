@@ -1596,6 +1596,37 @@ static void gpu_debug_log(const char *fmt, ...)
     fflush(gpu_debug_fp);
 }
 
+/*
+ * PPCGPU_PITCHLOG=1: both ends of the row length, per card.
+ *
+ * A sheared picture means the row length the guest laid its pixels out at
+ * and the one we read them back at disagree.  Inferring either from a
+ * screenshot has been wrong more than once, so log them: what the guest
+ * programs into CRTC_PITCH, and what the scanout ends up using when it
+ * publishes a surface.  Tagged with the device id -- a machine can have two
+ * of these and both write here.
+ */
+static void pitchlog(PPCMacGPUState *s, const char *what, const char *fmt, ...)
+{
+    static int on = -1;
+    va_list ap;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_PITCHLOG");
+        on = e && e[0] == '1';
+    }
+    if (!on) {
+        return;
+    }
+    fprintf(stderr, "PITCH[%s] %-8s ",
+            DEVICE(s)->id ? DEVICE(s)->id : "?", what);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 /* ========================================================================
  * I2C / DDC helpers for EDID
  * ======================================================================== */
@@ -1747,6 +1778,23 @@ static uint32_t r200_aligned_pitch_pixels(uint32_t width, uint32_t bpp)
 
 static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
 {
+    /*
+     * A card that is told not to learn its row length this way does not.
+     *
+     * This adopts a pitch seen in any 2D blit of at least 256x256 to the
+     * visible frame buffer, and once adopted it sticks until the mode
+     * changes.  On the card Mac OS X accelerates that is right -- the
+     * compositor's blits are the frame.  On a second card, where nothing
+     * accelerates and the picture is painted at the row length the frame
+     * buffer really has, one stray blit is enough to latch a different
+     * length onto the scan-out and shear everything afterwards.  Measured
+     * on the second screen: the pitch register and the content agreed at
+     * 6720, and the override alone forced the scan-out to 6912.
+     */
+    if (!s->present_pitch_override) {
+        return;
+    }
+
     /*
      * Ask the CRTC when the console has not refreshed yet.  Taking the width
      * from s->disp alone made this guard vanish in a headless run -- min came
@@ -2392,6 +2440,12 @@ static void ppc_mac_gpu_display_update(void *opaque)
         s->surface_height = height;
         s->surface_stride = stride;
         s->surface_data = s->shadow_buf;
+        pitchlog(s, "scanout", "surface %ux%u stride=%u (exact would be %u) "
+                 "offset=0x%x pitch_reg=0x%x override=%s/%u",
+                 width, height, stride, width * ((s->disp.bpp + 7) / 8),
+                 s->disp.offset, s->regs.crtc_pitch,
+                 s->disp_stride_override_active ? "on" : "off",
+                 s->disp_stride_override_value);
         trace_ppc_mac_gpu_mode_change(width, height, s->disp.bpp, stride);
         DisplaySurface *ds = qemu_create_displaysurface_from(
             width, height,
@@ -11324,6 +11378,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         if (val != s->regs.crtc_pitch) {
             blit_path_log("CRTC", "PITCH changed 0x%x -> 0x%x",
                           s->regs.crtc_pitch, val);
+            pitchlog(s, "guest", "CRTC_PITCH 0x%x -> 0x%x (%u -> %u bytes "
+                     "at %ubpp)", s->regs.crtc_pitch, (unsigned)val,
+                     (s->regs.crtc_pitch & 0x7FF) * 8 *
+                         ((s->disp.bpp ? s->disp.bpp : 32) + 7) / 8,
+                     ((unsigned)val & 0x7FF) * 8 *
+                         ((s->disp.bpp ? s->disp.bpp : 32) + 7) / 8,
+                     s->disp.bpp);
         }
         s->regs.crtc_pitch = val;
         s->display_invalid = true;
@@ -12173,7 +12234,22 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
          * every mode set, and forcing the exact pitch on Mac OS X's desktop
          * was measured to bring it up in shredded horizontal bands.
          */
-        s->regs.crtc_pitch = boot_w / 8;
+        /*
+         * ...but only on the screen the machine boots on.
+         *
+         * A second card never shows the Apple logo, and -- measured -- its
+         * guest never writes CRTC_PITCH at all: nothing in Mac OS X
+         * reprograms it, so it keeps whatever is seeded here for the life of
+         * the machine.  Seeding the unaligned length there left the register
+         * saying 6720 while the accelerator blitted the visible frame buffer
+         * at 6912, and the scan-out then followed whichever of the two had
+         * spoken last -- which is what sheared the second screen, and why
+         * mirroring looked right (mirroring puts everything through the
+         * accelerator, at 6912).
+         */
+        s->regs.crtc_pitch = s->boot_display
+            ? boot_w / 8
+            : r200_aligned_pitch_pixels(boot_w, 32) / 8;
         s->regs.crtc_offset = 0;
     }
 
@@ -12559,6 +12635,28 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         }
     }
 
+    /*
+     * A card the accelerator should leave alone.
+     *
+     * ATIRadeon8500.kext matches on vendor and device id with
+     * IOMatchCategory = IOAccelerator, so with two of these it instantiates
+     * on both -- and on the second one, where IONDRVFramebuffer is not the
+     * framebuffer it expects, it faults.  That is the shape of the
+     * 0x300 data access panics with com.apple.ATIRadeon8500 on the stack,
+     * of About This Mac hanging on Graphics/Displays, and of the second
+     * screen being painted by the unaccelerated path at a row length the
+     * accelerated one does not use.
+     *
+     * Giving the second card a device id the kext does not know keeps the
+     * accelerator off it.  Open Firmware still configures it -- its VGA
+     * callback is reached by class, not by id -- so it keeps device_type
+     * "display" and its driver property, and IONDRVFramebuffer drives it as
+     * a plain frame buffer.  The cost is no Quartz Extreme on that screen.
+     */
+    if (s->pci_device_id) {
+        pci_config_set_device_id(dev->config, s->pci_device_id);
+    }
+
     /* Set PCI config space fields */
     pci_set_byte(&dev->config[PCI_REVISION_ID], PPC_MAC_GPU_PCI_REVISION);
 
@@ -12666,6 +12764,18 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
     DEFINE_PROP_BOOL("exact-scanout-pitch", PPCMacGPUState, exact_scanout_pitch, false),
+    /*
+     * The screen the machine boots on, which is the one Open Firmware draws
+     * the Apple logo on at the unaligned row length.  A second card is not
+     * one, and must start at the length every Mac driver rounds to, because
+     * nothing in the guest will ever set it.
+     */
+    DEFINE_PROP_BOOL("boot-display", PPCMacGPUState, boot_display, true),
+    /* 0 keeps the modelled card's own id; see the note in realize. */
+    DEFINE_PROP_UINT32("x-pci-device-id", PPCMacGPUState, pci_device_id, 0),
+    /* See r200_set_present_pitch(): off for a card nothing accelerates. */
+    DEFINE_PROP_BOOL("present-pitch-override", PPCMacGPUState,
+                     present_pitch_override, true),
     DEFINE_PROP_UINT32("host-native-width", PPCMacGPUState, host_native_w, 0),
     DEFINE_PROP_UINT32("host-native-height", PPCMacGPUState, host_native_h, 0),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
