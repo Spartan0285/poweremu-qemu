@@ -38,13 +38,17 @@ typedef struct R300FPProgram {
      *   word every other consumer of VRAM expects.  The swizzle is its own
      *   inverse, so a destination read back through framebuffer fetch is
      *   unswizzled the same way.
-     * blend_premultiplied_over: src + dst * (1 - src.a), computed in the
-     *   shader.  Metal's fixed-function blending cannot be used on a
-     *   guest-order target, because its factors would operate on the
-     *   swizzled channels.
+     * blend_in_shader: blend with blend_src/dst_* , computed in the shader.
+     *   Metal's fixed-function blending cannot be used on a guest-order
+     *   target, because its factors would operate on the swizzled channels.
+     *   The factors are the 0x20-based R200/R300 encodings, and the equation
+     *   is ADD with clamping -- the only one the device gate accepts.  This
+     *   replaces an earlier bool that hard-coded ONE/ONE_MINUS_SRC_ALPHA.
      */
     bool guest_order;
-    bool blend_premultiplied_over;
+    bool blend_in_shader;
+    uint8_t blend_src_rgb, blend_dst_rgb;
+    uint8_t blend_src_alpha, blend_dst_alpha;
     /*
      * How to reorder a sampled texel into (r,g,b,a), per image unit.
      * Each entry indexes r,g,b,a,zero,one of the value the sampler returned.

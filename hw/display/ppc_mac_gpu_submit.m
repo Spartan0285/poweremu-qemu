@@ -59,6 +59,11 @@ bool gpu_submit_ready(void)
     return g_device != nil && g_queue != nil;
 }
 
+id<MTLBuffer> gpu_submit_vram(void)
+{
+    return g_vram;
+}
+
 void gpu_submit_set_pass_ender(void (*end_pass)(void))
 {
     g_end_pass = end_pass;

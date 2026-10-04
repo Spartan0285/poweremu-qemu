@@ -53,6 +53,18 @@ void gpu_submit_init(id<MTLDevice> device, id<MTLCommandQueue> queue,
 bool gpu_submit_ready(void);
 
 /*
+ * The VRAM buffer this layer is bound to, or nil before anything attached.
+ *
+ * The layer is a process-wide singleton: it is bound to the first card that
+ * attaches, and every texture it builds is a linear view over *that* buffer.
+ * With two cards that is a trap -- the second card's draws, and the hazard
+ * tables that decide when a scan-out must wait, would all land on the first
+ * card's video memory.  A caller that is not the owner has to stay off this
+ * path, so it needs to be able to ask.
+ */
+id<MTLBuffer> gpu_submit_vram(void);
+
+/*
  * A batch cannot be committed while the client still has a render pass open,
  * and this layer does not know what the client's passes are for.  The client
  * registers how to close one.

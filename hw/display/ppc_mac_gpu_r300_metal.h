@@ -40,7 +40,18 @@ typedef struct R300MetalDraw {
     unsigned scissor[4]; /* x,y,width,height */
     double viewport_x, viewport_y;
     double viewport_width, viewport_height; /* zero means full target */
-    bool premultiplied_over; /* src + dst * (1 - src alpha), RGB and alpha */
+    /*
+     * Blending as the guest programmed it.  This replaces an earlier
+     * `premultiplied_over` flag that hard-coded ONE / ONE_MINUS_SRC_ALPHA:
+     * Chess asks for ordinary non-premultiplied alpha (SRC_ALPHA /
+     * ONE_MINUS_SRC_ALPHA) and so every one of its blended draws was
+     * refused by the device's blend gate.  Factors are the 0x20-based
+     * R200/R300 encodings; the equation is always ADD with clamping, which
+     * is the only one the gate accepts.
+     */
+    bool blend_enable;
+    uint8_t blend_src_rgb, blend_dst_rgb;
+    uint8_t blend_src_alpha, blend_dst_alpha;
     unsigned color_mask; /* RGBA bits 0..3 */
     /*
      * Render straight into guest VRAM instead of staging.
@@ -48,7 +59,7 @@ typedef struct R300MetalDraw {
      * With this set, `target` is unused: the colour attachment is a linear
      * view over VRAM at guest_offset with guest_pitch bytes per row, written
      * in guest byte order.  The fragment program must have been compiled
-     * with guest_order, and with blend_premultiplied_over when blending --
+     * with guest_order, and with blend_in_shader when blending --
      * Metal's own blending cannot be used on a guest-order target because
      * its factors would operate on the swizzled channels.
      *

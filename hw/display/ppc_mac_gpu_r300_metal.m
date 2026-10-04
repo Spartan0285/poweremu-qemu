@@ -10,6 +10,36 @@
 #include <string.h>
 #include "ppc_mac_gpu_r300_metal.h"
 #include "ppc_mac_gpu_submit.h"
+#include "ppc_mac_gpu_3d_regs.h"
+
+/*
+ * One R200/R300 blend factor as an MTLBlendFactor.  Kept in step with
+ * r300_blend_factor_supported(): the device gate refuses anything that has
+ * no mapping here, so a false return means the gate and this table have
+ * drifted apart rather than that a guest asked for something exotic.
+ */
+static bool r300_blend_factor_metal(unsigned f, MTLBlendFactor *out)
+{
+    switch (f) {
+    case R200_BLEND_GL_ZERO: *out = MTLBlendFactorZero; return true;
+    case R200_BLEND_GL_ONE: *out = MTLBlendFactorOne; return true;
+    case R200_BLEND_GL_SRC_COLOR: *out = MTLBlendFactorSourceColor; return true;
+    case R200_BLEND_GL_ONE_MINUS_SRC_COLOR:
+        *out = MTLBlendFactorOneMinusSourceColor; return true;
+    case R200_BLEND_GL_DST_COLOR:
+        *out = MTLBlendFactorDestinationColor; return true;
+    case R200_BLEND_GL_ONE_MINUS_DST_COLOR:
+        *out = MTLBlendFactorOneMinusDestinationColor; return true;
+    case R200_BLEND_GL_SRC_ALPHA: *out = MTLBlendFactorSourceAlpha; return true;
+    case R200_BLEND_GL_ONE_MINUS_SRC_ALPHA:
+        *out = MTLBlendFactorOneMinusSourceAlpha; return true;
+    case R200_BLEND_GL_DST_ALPHA:
+        *out = MTLBlendFactorDestinationAlpha; return true;
+    case R200_BLEND_GL_ONE_MINUS_DST_ALPHA:
+        *out = MTLBlendFactorOneMinusDestinationAlpha; return true;
+    default: return false;
+    }
+}
 
 typedef struct R300MetalContext {
     id<MTLDevice> device;
@@ -146,8 +176,10 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
         @try {
             NSString *source = [[NSString stringWithUTF8String:fragment]
                                stringByAppendingString:[NSString stringWithUTF8String:vertex]];
-            NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%@",
-                             d->color_mask, d->premultiplied_over,
+            NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u:%@",
+                             d->color_mask, (unsigned)d->blend_enable,
+                             d->blend_src_rgb, d->blend_dst_rgb,
+                             d->blend_src_alpha, d->blend_dst_alpha,
                              (unsigned)d->guest_target, source];
             id<MTLRenderPipelineState> pipeline = [ctx->pipelines objectForKey:key];
             if (!pipeline) {
@@ -177,14 +209,26 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                      ((d->color_mask & 2) ? MTLColorWriteMaskGreen : 0) |
                      ((d->color_mask & 4) ? MTLColorWriteMaskBlue : 0) |
                      ((d->color_mask & 8) ? MTLColorWriteMaskAlpha : 0));
-                if (d->premultiplied_over && !d->guest_target) {
+                /*
+                 * A guest-order target blends in the fragment shader
+                 * instead: Metal's factors would operate on the swizzled
+                 * channels.  See R300FPProgram::blend_in_shader.
+                 */
+                if (d->blend_enable && !d->guest_target) {
+                    MTLBlendFactor srgb, drgb, salpha, dalpha;
+                    if (!r300_blend_factor_metal(d->blend_src_rgb, &srgb) ||
+                        !r300_blend_factor_metal(d->blend_dst_rgb, &drgb) ||
+                        !r300_blend_factor_metal(d->blend_src_alpha, &salpha) ||
+                        !r300_blend_factor_metal(d->blend_dst_alpha, &dalpha)) {
+                        return fail(error, error_size, "unsupported blend factor");
+                    }
                     pd.colorAttachments[0].blendingEnabled = YES;
                     pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
                     pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-                    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-                    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-                    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-                    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    pd.colorAttachments[0].sourceRGBBlendFactor = srgb;
+                    pd.colorAttachments[0].destinationRGBBlendFactor = drgb;
+                    pd.colorAttachments[0].sourceAlphaBlendFactor = salpha;
+                    pd.colorAttachments[0].destinationAlphaBlendFactor = dalpha;
                 }
                 pipeline = [[ctx->device newRenderPipelineStateWithDescriptor:pd error:&compile_error] autorelease];
                 if (!pipeline) return fail(error,error_size,compile_error.description.UTF8String ?: "Metal pipeline failed");

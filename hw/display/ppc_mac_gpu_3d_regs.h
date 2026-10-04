@@ -514,6 +514,62 @@
 #define R200_COMB_FCN_SUB_CLAMP         (2 << 12)
 #define R200_COMB_FCN_SUB_NOCLAMP       (3 << 12)
 
+/*
+ * RB3D_CBLEND (0x4E04) and RB3D_ABLEND (0x4E08) on R300/R350.
+ *
+ *   [0]      BLEND_ENABLE
+ *   [2:1]    set by every blending guest seen here; the kernel's
+ *            r300_reg.h calls these BLEND_UNKNOWN
+ *   [5:3]    DISCARD_SRC_PIXELS, per AMD's R3xx_3D_Registers spec and
+ *            Mesa's gallium r300 driver.  The older kernel r300_reg.h
+ *            instead calls bit 3 BLEND_NO_SEPARATE.  The two readings
+ *            disagree, and for every value a guest has actually programmed
+ *            here both are no-ops: discarding source pixels whose alpha is
+ *            zero cannot change the result of a
+ *            SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend, and NO_SEPARATE only
+ *            matters when ABLEND's factors differ from CBLEND's, which is
+ *            decoded from ABLEND either way.  Neither bit is acted on, so
+ *            the ambiguity cannot change a pixel.
+ *   [14:12]  COMB_FCN, the blend equation
+ *   [21:16]  SRC blend factor, 0x20-based
+ *   [29:24]  DST blend factor, 0x20-based
+ */
+#define R300_RB3D_CBLEND                0x4E04
+#define R300_RB3D_ABLEND                0x4E08
+#define R300_BLEND_ENABLE               (1u << 0)
+
+#define r300_blend_src_factor(v) \
+    (((v) >> R200_SRC_BLEND_SHIFT) & R200_BLEND_FACTOR_MASK)
+#define r300_blend_dst_factor(v) \
+    (((v) >> R200_DST_BLEND_SHIFT) & R200_BLEND_FACTOR_MASK)
+#define r300_blend_comb_fcn(v)          ((v) & R200_COMB_FCN_MASK)
+
+/*
+ * The blend factors that can be expressed both as an MTLBlendFactor and as
+ * an MSL expression over (output, dst).  CONST_COLOR and CONST_ALPHA need
+ * the blend colour register, which a draw does not carry, and
+ * SRC_ALPHA_SATURATE has no shader-side form here.  A draw asking for one
+ * is refused rather than blended wrong.
+ */
+static inline int r300_blend_factor_supported(unsigned f)
+{
+    switch (f) {
+    case R200_BLEND_GL_ZERO:
+    case R200_BLEND_GL_ONE:
+    case R200_BLEND_GL_SRC_COLOR:
+    case R200_BLEND_GL_ONE_MINUS_SRC_COLOR:
+    case R200_BLEND_GL_DST_COLOR:
+    case R200_BLEND_GL_ONE_MINUS_DST_COLOR:
+    case R200_BLEND_GL_SRC_ALPHA:
+    case R200_BLEND_GL_ONE_MINUS_SRC_ALPHA:
+    case R200_BLEND_GL_DST_ALPHA:
+    case R200_BLEND_GL_ONE_MINUS_DST_ALPHA:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Legacy 0-based blend factor aliases (for code compatibility) */
 #define R200_BLEND_ZERO                 R200_BLEND_GL_ZERO
 #define R200_BLEND_ONE                  R200_BLEND_GL_ONE

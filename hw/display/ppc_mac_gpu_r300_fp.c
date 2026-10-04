@@ -9,6 +9,45 @@
 #include <stdarg.h>
 #include <string.h>
 #include "ppc_mac_gpu_r300_fp.h"
+#include "ppc_mac_gpu_3d_regs.h"
+
+/*
+ * One blend factor as an MSL expression over (output, dst), where `output`
+ * is the source colour the shader just computed.  `rgb` picks the
+ * three-component form; the alpha channel takes the scalar one.  GL's
+ * SRC_COLOR/DST_COLOR degenerate to the alpha channel for alpha, which is
+ * why those cases differ between the two forms.
+ *
+ * NULL means the factor has no form here, which the device gate is supposed
+ * to have refused already -- see r300_blend_factor_supported().
+ */
+static const char *r300_fp_blend_factor(unsigned f, bool rgb)
+{
+    switch (f) {
+    case R200_BLEND_GL_ZERO:
+        return rgb ? "float3(0.0)" : "0.0";
+    case R200_BLEND_GL_ONE:
+        return rgb ? "float3(1.0)" : "1.0";
+    case R200_BLEND_GL_SRC_COLOR:
+        return rgb ? "output.rgb" : "output.a";
+    case R200_BLEND_GL_ONE_MINUS_SRC_COLOR:
+        return rgb ? "(1.0 - output.rgb)" : "(1.0 - output.a)";
+    case R200_BLEND_GL_DST_COLOR:
+        return rgb ? "dst.rgb" : "dst.a";
+    case R200_BLEND_GL_ONE_MINUS_DST_COLOR:
+        return rgb ? "(1.0 - dst.rgb)" : "(1.0 - dst.a)";
+    case R200_BLEND_GL_SRC_ALPHA:
+        return rgb ? "float3(output.a)" : "output.a";
+    case R200_BLEND_GL_ONE_MINUS_SRC_ALPHA:
+        return rgb ? "float3(1.0 - output.a)" : "(1.0 - output.a)";
+    case R200_BLEND_GL_DST_ALPHA:
+        return rgb ? "float3(dst.a)" : "dst.a";
+    case R200_BLEND_GL_ONE_MINUS_DST_ALPHA:
+        return rgb ? "float3(1.0 - dst.a)" : "(1.0 - dst.a)";
+    default:
+        return NULL;
+    }
+}
 
 typedef struct MSLWriter {
     char *out;
@@ -299,7 +338,7 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
     }
     emit(&w, "};\nfragment float4 r300_fragment(R300FragmentInput in [[stage_in]], "
              "constant float4 *c [[buffer(0)]]");
-    if (p->blend_premultiplied_over) {
+    if (p->blend_in_shader) {
         /* Framebuffer fetch: the destination has to be read in the shader
          * because it cannot be blended by the pipeline in guest order. */
         emit(&w, ", float4 fbin [[color(0)]]");
@@ -410,7 +449,7 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
         reason = "render-target component select";
         goto fail;
     }
-    if (p->blend_premultiplied_over) {
+    if (p->blend_in_shader) {
         /*
          * The blend reads the destination back as a true (r,g,b,a) and uses
          * output.a as the source alpha.  A non-identity component select
@@ -421,9 +460,25 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
             reason = "blending with a non-identity component select";
             goto fail;
         }
+        const char *fs_rgb = r300_fp_blend_factor(p->blend_src_rgb, true);
+        const char *fd_rgb = r300_fp_blend_factor(p->blend_dst_rgb, true);
+        const char *fs_a = r300_fp_blend_factor(p->blend_src_alpha, false);
+        const char *fd_a = r300_fp_blend_factor(p->blend_dst_alpha, false);
+        if (!fs_rgb || !fd_rgb || !fs_a || !fd_a) {
+            reason = "unsupported blend factor";
+            goto fail;
+        }
+        /*
+         * saturate() is COMB_FCN_ADD_CLAMP, which is the only equation the
+         * device gate accepts.  The store to a unorm target would clamp
+         * anyway, so this changes nothing for the premultiplied case that
+         * used to be hard-coded here, and is correct for the rest.
+         */
         emit(&w, " float4 dst = %s;\n"
-                 " output = output + dst * (1.0 - output.a);\n",
-             p->guest_order ? "fbin.yxwz" : "fbin");
+                 " output = float4(saturate(output.rgb * %s + dst.rgb * %s),\n"
+                 "                 saturate(output.a * %s + dst.a * %s));\n",
+             p->guest_order ? "fbin.yxwz" : "fbin",
+             fs_rgb, fd_rgb, fs_a, fd_a);
     }
     if (strcmp(out_swizzle, "rgba") != 0) {
         emit(&w, " output = output.%s;\n", out_swizzle);

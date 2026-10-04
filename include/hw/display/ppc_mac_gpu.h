@@ -643,6 +643,7 @@ struct PPCMacGPUState {
     /* Parent */
     PCIDevice pci;
 
+
     /* Scratch for vertex assembly, reused across draws.
      *
      * These were a g_new0/g_free pair inside the draw path.  Warcraft issues
@@ -791,6 +792,19 @@ struct PPCMacGPUState {
     bool edid_read_done;    /* true after NDRV finishes EDID reading */
     bool boot_display;      /* shows the Apple logo; see crtc_pitch seeding */
     uint32_t pci_device_id; /* 0: the modelled card's own */
+    /*
+     * 0: the modelled card's own (ATI).  A second card sets this to a
+     * non-ATI vendor so that Mac OS X's ATI accelerator ignores it
+     * completely -- see the note by pci_config_set_vendor_id().
+     */
+    uint32_t pci_vendor_id;
+    /*
+     * Offer the AGP capability.  A real Power Mac has one AGP slot and one
+     * UniNorth GART, so only one card can be the AGP one; a second card that
+     * also claims it gets an IOAGPDevice nub that AppleMacRiscAGP has no
+     * second GART for.
+     */
+    bool agp_capability;
     bool present_pitch_override;  /* learn the scan-out pitch from blits */
 
     /* 3D vertex buffer pointers (from 3D_LOAD_VBPNTR) */

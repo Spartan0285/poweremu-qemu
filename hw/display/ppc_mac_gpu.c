@@ -6973,6 +6973,39 @@ static void r350_route_record(uint32_t f0, uint32_t f1, uint32_t cnt,
 }
 
 /*
+ * Which blend states are asked for, by fingerprint.
+ *
+ * The gate used to accept one literal pair and refuse everything else, so
+ * "blend equation or factors" as a reason could not say what was wanted.
+ * Chess turned out to want ordinary non-premultiplied alpha, 824 times out
+ * of 828 rejections, which only a census could show.  Recorded for accepted
+ * draws as well as refused ones: a blend that is taken and composited wrong
+ * is explained by nothing otherwise.
+ */
+#define R350_BLEND_KINDS 16
+static struct {
+    uint32_t cblend, ablend;
+    uint64_t count;
+} r350_blend_census[R350_BLEND_KINDS];
+static unsigned r350_blend_kinds;
+
+static void r350_blend_record(uint32_t cblend, uint32_t ablend)
+{
+    for (unsigned i = 0; i < r350_blend_kinds; i++) {
+        if (r350_blend_census[i].cblend == cblend &&
+            r350_blend_census[i].ablend == ablend) {
+            r350_blend_census[i].count++;
+            return;
+        }
+    }
+    if (r350_blend_kinds < R350_BLEND_KINDS) {
+        r350_blend_census[r350_blend_kinds] = (typeof(r350_blend_census[0])){
+            cblend, ablend, 1 };
+        r350_blend_kinds++;
+    }
+}
+
+/*
  * The same fingerprint for draws that are *accepted*.  A rejected draw is
  * already explained by the reason and the route census; a draw that is taken,
  * runs, and still leaves the wrong pixels on screen is explained by nothing,
@@ -7333,10 +7366,31 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         RG(0x4330)==0x4048), "interpolator routing",
         r350_route_record(RG(0x2090), RG(0x2094), RG(0x4300), RG(0x4304),
                           RG(0x4310), RG(0x4330)));
-    if (RG(0x4e04)&1) {
-        REQUIRE(RG(0x4e04)==0x27210007 && RG(0x4e08)==0x27210000,
-                "blend equation or factors");
-        draw.premultiplied_over=true;
+    if (RG(0x4e04) & R300_BLEND_ENABLE) {
+        /*
+         * This used to accept exactly one literal pair -- ONE /
+         * ONE_MINUS_SRC_ALPHA, i.e. premultiplied over -- and refuse
+         * everything else.  Chess asks for SRC_ALPHA / ONE_MINUS_SRC_ALPHA,
+         * plain non-premultiplied alpha, and so had every blended draw
+         * thrown away.  Decode the factors instead and carry them on the
+         * draw; widening the whitelist by another literal is the pattern
+         * x-r350-decode-rs exists to undo.
+         */
+        uint32_t cblend = RG(0x4e04), ablend = RG(0x4e08);
+        r350_blend_record(cblend, ablend);
+        draw.blend_enable = true;
+        draw.blend_src_rgb = r300_blend_src_factor(cblend);
+        draw.blend_dst_rgb = r300_blend_dst_factor(cblend);
+        draw.blend_src_alpha = r300_blend_src_factor(ablend);
+        draw.blend_dst_alpha = r300_blend_dst_factor(ablend);
+        REQUIRE(r300_blend_comb_fcn(cblend) == R200_COMB_FCN_ADD_CLAMP &&
+                r300_blend_comb_fcn(ablend) == R200_COMB_FCN_ADD_CLAMP,
+                "blend equation");
+        REQUIRE(r300_blend_factor_supported(draw.blend_src_rgb) &&
+                r300_blend_factor_supported(draw.blend_dst_rgb) &&
+                r300_blend_factor_supported(draw.blend_src_alpha) &&
+                r300_blend_factor_supported(draw.blend_dst_alpha),
+                "blend factors");
     }
     REQUIRE((RG(0x4f00)&7)==0 && (RG(0x4bd4)&~0xfffu)==0 &&
             RG(0x4e18)==0 && (RG(0x42b8)&3)==0 && (RG(0x4bc0)&1)==0,
@@ -7815,7 +7869,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         draw.guest_offset=offset;
         draw.guest_pitch=width*4;
         fp.guest_order=true;
-        fp.blend_premultiplied_over=draw.premultiplied_over;
+        fp.blend_in_shader=draw.blend_enable;
+        fp.blend_src_rgb=draw.blend_src_rgb;
+        fp.blend_dst_rgb=draw.blend_dst_rgb;
+        fp.blend_src_alpha=draw.blend_src_alpha;
+        fp.blend_dst_alpha=draw.blend_dst_alpha;
     }
     if (direct || guest_textures) {
         /* Recompile: byte order, blending and the texel reorder are all
@@ -7845,10 +7903,12 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     if (diag) {
         size_t o = ((size_t)draw.scissor[1]*width + draw.scissor[0])*4;
         fprintf(stderr,"R350_TGTDIAG draw=%u off=%08x crtc=%08x pitch=%u endian=%u w=%u h=%u "
-                "scissor=%u,%u,%u,%u mask=%x prem=%u\n",
+                "scissor=%u,%u,%u,%u mask=%x blend=%u:%02x%02x:%02x%02x\n",
                 s->r350->draws_seen,offset,s->regs.crtc_offset,width,target_endian,width,height,
                 draw.scissor[0],draw.scissor[1],draw.scissor[2],draw.scissor[3],
-                draw.color_mask,draw.premultiplied_over);
+                draw.color_mask,draw.blend_enable,
+                draw.blend_src_rgb,draw.blend_dst_rgb,
+                draw.blend_src_alpha,draw.blend_dst_alpha);
         /* A direct target has no staging buffer to report. */
         for (unsigned px=0; px<3 && o+(px+1)*4<=draw.target_size; px++)
             if (target) {
@@ -11957,6 +12017,23 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     s->regs.crtc_v_total_disp = ((h - 1) << 16) | (h + 27);
                     s->regs.crtc_pitch = (s->exact_scanout_pitch ? w
                                           : r200_aligned_pitch_pixels(w, bpp)) / 8;
+                    /*
+                     * The pitch writer the instrumentation used to miss.
+                     * This assigns s->regs.crtc_pitch directly instead of
+                     * going through the MMIO CRTC_PITCH case, so a scanout
+                     * stride that was set here showed up with no
+                     * corresponding "guest" line -- which once read as
+                     * "nothing ever programs this card's pitch".  It is also
+                     * the whole of the second screen's shear: qemu_vga.ndrv
+                     * paints at the unrounded row length and this rounds the
+                     * scanout up to a 256-byte boundary.
+                     */
+                    pitchlog(s, "vbe", "mode %ux%ux%u -> CRTC_PITCH 0x%x "
+                             "(%u bytes/row, exact would be %u) exact-opt=%s",
+                             w, h, bpp, s->regs.crtc_pitch,
+                             s->regs.crtc_pitch * 8 * ((bpp + 7) / 8),
+                             w * ((bpp + 7) / 8),
+                             s->exact_scanout_pitch ? "on" : "off");
                     uint32_t y_off = s->regs.vbe_regs[VBE_DISPI_INDEX_Y_OFFSET];
                     s->regs.crtc_offset = y_off * w * ((bpp + 7) / 8);
                     s->display_invalid = true;
@@ -12680,6 +12757,23 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     if (s->pci_device_id) {
         pci_config_set_device_id(dev->config, s->pci_device_id);
     }
+    /*
+     * ...and, for a second card, a vendor the accelerator does not know
+     * either.
+     *
+     * A device id it does not recognise stops ATIRadeon8500 *matching* the
+     * card, but not from being told about it:  the kext registers an
+     * IOFramebuffer notification, so it hears about every frame buffer that
+     * appears, and on one carrying an ATI vendor id it goes on to touch
+     * registers that are not there.  Measured, repeatedly, with the second
+     * card at 1002:5964: "panic ... 0x300 - Data access" inside
+     * com.apple.ATIRadeon8500, with the faulting address different every
+     * time -- a pointer walked off the end of a mapping rather than one bad
+     * constant.  A non-ATI vendor leaves nothing for it to recognise.
+     */
+    if (s->pci_vendor_id) {
+        pci_config_set_vendor_id(dev->config, s->pci_vendor_id);
+    }
 
     /* Set PCI config space fields */
     pci_set_byte(&dev->config[PCI_REVISION_ID], PPC_MAC_GPU_PCI_REVISION);
@@ -12702,30 +12796,39 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
      * and IOPCIFamily creates IOAGPDevice nubs for devices that
      * have the AGP PCI capability (cap_id = 0x02).
      */
-    if (pci_add_capability(dev, PCI_CAP_ID_AGP, 0x58,
-                           PCI_AGP_SIZEOF, errp) < 0) {
-        return;
+    /*
+     * Only one card may be the AGP one.  A real Power Mac has a single AGP
+     * slot behind a single UniNorth GART, so a second card claiming the
+     * capability gets an IOAGPDevice nub that AppleMacRiscAGP has no second
+     * GART to back.  Two-card panics decode to a fault inside
+     * AppleMacRiscPCI called from the ATI accelerator, which is that path.
+     */
+    if (s->agp_capability) {
+        if (pci_add_capability(dev, PCI_CAP_ID_AGP, 0x58,
+                               PCI_AGP_SIZEOF, errp) < 0) {
+            return;
+        }
+        /* AGP version 2.0 */
+        pci_set_byte(dev->config + 0x58 + PCI_AGP_VERSION, 0x20);
+        /* AGP Status: SBA, 4x/2x/1x capable, 32 RQ depth */
+        pci_set_long(dev->config + 0x58 + PCI_AGP_STATUS,
+                     PCI_AGP_STATUS_SBA |
+                     PCI_AGP_STATUS_RATE4 |
+                     PCI_AGP_STATUS_RATE2 |
+                     PCI_AGP_STATUS_RATE1 |
+                     (0x1F << 24));  /* max requests - 1 = 31 */
+        /* AGP Command: enable AGP + SBA + 4x rate.
+         * The kext checks AGP status to decide whether to enable 3D/GL.
+         * Without AGP enabled, it only provides 2D acceleration. */
+        pci_set_long(dev->config + 0x58 + PCI_AGP_COMMAND,
+                     PCI_AGP_COMMAND_AGP |   /* AGP enabled */
+                     PCI_AGP_COMMAND_SBA |   /* Sideband addressing */
+                     PCI_AGP_COMMAND_RATE4 | /* 4x rate */
+                     (0x1F << 24));          /* max requests */
+        /* AppleMacRiscAGP::setAGPEnable() writes the command register and
+         * spins until the enable bit reads back; it must be writable. */
+        pci_set_long(dev->wmask + 0x58 + PCI_AGP_COMMAND, 0xffffffff);
     }
-    /* AGP version 2.0 */
-    pci_set_byte(dev->config + 0x58 + PCI_AGP_VERSION, 0x20);
-    /* AGP Status: SBA, 4x/2x/1x capable, 32 RQ depth */
-    pci_set_long(dev->config + 0x58 + PCI_AGP_STATUS,
-                 PCI_AGP_STATUS_SBA |
-                 PCI_AGP_STATUS_RATE4 |
-                 PCI_AGP_STATUS_RATE2 |
-                 PCI_AGP_STATUS_RATE1 |
-                 (0x1F << 24));  /* max requests - 1 = 31 */
-    /* AGP Command: enable AGP + SBA + 4x rate.
-     * The kext checks AGP status to decide whether to enable 3D/GL.
-     * Without AGP enabled, it only provides 2D acceleration. */
-    pci_set_long(dev->config + 0x58 + PCI_AGP_COMMAND,
-                 PCI_AGP_COMMAND_AGP |   /* AGP enabled */
-                 PCI_AGP_COMMAND_SBA |   /* Sideband addressing */
-                 PCI_AGP_COMMAND_RATE4 | /* 4x rate */
-                 (0x1F << 24));          /* max requests */
-    /* AppleMacRiscAGP::setAGPEnable() writes the command register and spins
-     * until the enable bit reads back; it must be writable like real HW. */
-    pci_set_long(dev->wmask + 0x58 + PCI_AGP_COMMAND, 0xffffffff);
 
     /* Power Management capability at offset 0x50 (real RV280 layout) */
     if (pci_add_capability(dev, PCI_CAP_ID_PM, 0x50, 8, errp) < 0) {
@@ -12797,6 +12900,8 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_BOOL("boot-display", PPCMacGPUState, boot_display, true),
     /* 0 keeps the modelled card's own id; see the note in realize. */
     DEFINE_PROP_UINT32("x-pci-device-id", PPCMacGPUState, pci_device_id, 0),
+    DEFINE_PROP_UINT32("x-pci-vendor-id", PPCMacGPUState, pci_vendor_id, 0),
+    DEFINE_PROP_BOOL("agp", PPCMacGPUState, agp_capability, true),
     /* See r200_set_present_pitch(): off for a card nothing accelerates. */
     DEFINE_PROP_BOOL("present-pitch-override", PPCMacGPUState,
                      present_pitch_override, true),
@@ -12949,6 +13054,12 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                 r350_route_census[i].rs_count, r350_route_census[i].rs_inst_count,
                 r350_route_census[i].rs_ip0, r350_route_census[i].rs_inst0,
                 r350_route_census[i].count);
+        }
+        for (unsigned i = 0; i < r350_blend_kinds; i++) {
+            g_string_append_printf(out, " blend%u=%08x:%08x/%" PRIu64, i,
+                                   r350_blend_census[i].cblend,
+                                   r350_blend_census[i].ablend,
+                                   r350_blend_census[i].count);
         }
         for (unsigned i = 0; i < 256; i++) {
             if (r350_pm4_opcode_count[i]) {

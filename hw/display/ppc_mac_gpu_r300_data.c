@@ -148,6 +148,16 @@ bool r300_triangle_indices(unsigned primitive, unsigned vertices,
     case 13:
         if (vertices % 4) return false;
         n = vertices / 4 * 6; break;
+    case 14:
+        /*
+         * QUAD_STRIP.  Measured on the R350 path: 596 of the 597
+         * primitive-assembly rejections Chess suffers, and 72% of every draw
+         * the device turns away -- the single biggest reason its 3D never
+         * reaches the screen.  Each pair of vertices after the first two
+         * closes another quad, so (vertices - 2) / 2 of them.
+         */
+        if (vertices < 4) return false;
+        n = (vertices - 2) / 2 * 6; break;
     default: return false;
     }
     if (n > capacity) return false;
@@ -156,6 +166,13 @@ bool r300_triangle_indices(unsigned primitive, unsigned vertices,
         if (primitive==4) {t[0]=i*3;t[1]=i*3+1;t[2]=i*3+2;}
         else if (primitive==5) {t[0]=0;t[1]=i+1;t[2]=i+2;}
         else if (primitive==6) {t[0]=i+(i&1);t[1]=i+1-(i&1);t[2]=i+2;}
+        else if (primitive==14) {
+            /* The same winding ppc_mac_gpu.c's other index builder uses for
+             * QUAD_STRIP: i,i+1,i+3 then i,i+3,i+2. */
+            unsigned base = i/2*2;
+            if (i & 1) {t[0]=base;t[1]=base+3;t[2]=base+2;}
+            else       {t[0]=base;t[1]=base+1;t[2]=base+3;}
+        }
         else {t[0]=i/2*4;t[1]=t[0]+1+(i&1);t[2]=t[1]+1;}
     }
     *count=n;

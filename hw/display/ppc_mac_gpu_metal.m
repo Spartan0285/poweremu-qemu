@@ -6428,6 +6428,37 @@ static void r200_submit_attach(PPCMacGPUMetalState *st)
     }
 }
 
+/*
+ * Is this card the one the submit layer is bound to?
+ *
+ * The layer, its command buffer, its render-pass encoder and its hazard
+ * tables are all process globals bound to whichever card attached first
+ * (see gpu_submit_vram).  A second card reaching them would render into the
+ * first card's VRAM and answer the first card's hazard questions, so it has
+ * to be turned away and left on the software path instead.  Before anything
+ * has attached there is no owner and nobody is excluded.
+ */
+static bool r200_submit_owns(PPCMacGPUMetalState *st)
+{
+    id<MTLBuffer> owner = gpu_submit_vram();
+
+    if (!st || !st->vramBuffer) {
+        return false;
+    }
+    if (owner == nil || owner == st->vramBuffer) {
+        return true;
+    }
+    {
+        static bool said;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[GPU_SUBMIT] second card refused the shared "
+                            "submit path; it renders in software\n");
+        }
+    }
+    return false;
+}
+
 
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
@@ -6443,6 +6474,16 @@ static bool metal_flush_r200(void *opaque)
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
+    /*
+     * The hazard tables are keyed on raw VRAM offsets with no card identity,
+     * and both cards put their frame buffer at the same offset.  Answering
+     * from them for a card that never submits through this layer reports the
+     * *other* card's pending work -- so a scan-out would wait on, or race
+     * with, a buffer it does not own.  A non-owner has no batched work here.
+     */
+    if (!r200_submit_owns(opaque)) {
+        return false;
+    }
     return gpu_range_busy(lo, hi, write_access);
 }
 
@@ -6527,6 +6568,9 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         return -1;
     }
     r200_submit_attach(st);
+    if (!r200_submit_owns(st)) {
+        return -1;      /* not ours to render; the device falls back */
+    }
     /* 16-bit colour targets (3/4/15) are handled below with an R16Uint
      * view; anything else is skipped there. */
 
