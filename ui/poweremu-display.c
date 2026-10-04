@@ -230,7 +230,7 @@ static void pe_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h
              */
             uint32_t gen = 0;
             const uint8_t *t; int c, r;
-            if (!ppc_mac_gpu_harmony_tiles(&t, &c, &r, &gen) || gen == pd->mask_gen) {
+            if (!ppc_mac_gpu_harmony_tiles(pd->index, &t, &c, &r, &gen) || gen == pd->mask_gen) {
                 return;
             }
             pd->mask_gen = gen;
@@ -268,7 +268,7 @@ static void pe_harmony_alpha(PowerEmuDisplay *pd, int x, int y, int w, int h)
     if (!pd->harmony || !pd->shm) {
         return;
     }
-    if (!ppc_mac_gpu_harmony_tiles(&tiles, &cols, &rows, &gen)) {
+    if (!ppc_mac_gpu_harmony_tiles(pd->index, &tiles, &cols, &rows, &gen)) {
         return;
     }
     for (int row = y; row < y + h && row < pd->height; row++) {

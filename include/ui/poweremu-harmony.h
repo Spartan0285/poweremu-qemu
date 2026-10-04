@@ -42,7 +42,11 @@ void ppc_mac_gpu_harmony_enable(bool on);
  * the guest has not drawn anything yet.  The pointer stays valid until
  * the next call; the caller must not free it.
  */
-bool ppc_mac_gpu_harmony_tiles(const uint8_t **tiles, int *cols, int *rows,
-                                 uint32_t *generation);
+/*
+ * `screen` is the display asking -- the index poweremu-display was given.
+ * Each card keeps its own grid, because each observed its own screen.
+ */
+bool ppc_mac_gpu_harmony_tiles(unsigned screen, const uint8_t **tiles,
+                               int *cols, int *rows, uint32_t *generation);
 
 #endif /* POWEREMU_HARMONY_H */

@@ -899,8 +899,54 @@ typedef struct {
     bool live, settled;
 } PEWindow;
 
-static PEWindow pe_windows[PE_WINDOW_MAX];
-static int64_t pe_windows_printed_us;
+/*
+ * Harmony's view of the screen, per card.
+ *
+ * All of this used to be file-scope, and `pe_window_saw_blit()` took no card
+ * argument, so with two cards whichever one was blitting wrote into the
+ * other's window table and tile grid -- and the grid was reallocated and
+ * zeroed every time the two cards' screen dimensions disagreed, which is
+ * every frame when they are at different sizes.  Harmony is still a
+ * machine-wide *mode* (`pe_harm_on`), but what it has observed belongs to
+ * the card that observed it.
+ *
+ * Kept outside PPCMacGPUState deliberately: a member added to that struct
+ * once broke every QOM cast, and nothing here needs to live in it.
+ */
+#define PE_HARMONY_CARDS 2
+typedef struct PEHarmonyCard {
+    const void *owner;                  /* the PPCMacGPUState that claimed it */
+    PEWindow windows[PE_WINDOW_MAX];
+    int64_t windows_printed_us;
+    uint32_t desktop_surface;           /* whose copy last covered the screen */
+    int64_t desktop_surface_us;         /* and when */
+    uint32_t desktop_pitch;             /* and at what pitch */
+    uint8_t *tiles;
+    int cols, rows;
+    uint32_t gen;
+    int64_t resized_us;
+} PEHarmonyCard;
+
+static PEHarmonyCard pe_harm_cards[PE_HARMONY_CARDS];
+
+/* The slot this card owns, claimed in realize order on first use. */
+static PEHarmonyCard *pe_harmony_for(const void *owner)
+{
+    unsigned i;
+
+    for (i = 0; i < PE_HARMONY_CARDS; i++) {
+        if (pe_harm_cards[i].owner == owner) {
+            return &pe_harm_cards[i];
+        }
+    }
+    for (i = 0; i < PE_HARMONY_CARDS; i++) {
+        if (!pe_harm_cards[i].owner) {
+            pe_harm_cards[i].owner = owner;
+            return &pe_harm_cards[i];
+        }
+    }
+    return &pe_harm_cards[0];           /* more cards than slots: share */
+}
 
 /*
  * What a run of copies is, told from the copies alone.
@@ -957,9 +1003,6 @@ static const char *pe_area_name(PEHarmonyArea a)
     }
 }
 
-static uint32_t pe_desktop_surface;       /* whose copy last covered the screen */
-static int64_t pe_desktop_surface_us;     /* and when */
-static uint32_t pe_desktop_pitch;         /* and at what pitch */
 
 /*
  * The fill-ins arrive with the desktop, not minutes later.  Two seconds is
@@ -971,7 +1014,8 @@ static uint32_t pe_desktop_pitch;         /* and at what pitch */
 #define PE_DESKTOP_SURFACE_US (2 * G_TIME_SPAN_SECOND)
 
 /* What a copy out of `surface` covering this rectangle is. */
-static PEHarmonyArea pe_area_of_copy(uint32_t surface, uint32_t pitch,
+static PEHarmonyArea pe_area_of_copy(PEHarmonyCard *hc,
+                                       uint32_t surface, uint32_t pitch,
                                        uint32_t x0, uint32_t y0,
                                        uint32_t x1, uint32_t y1,
                                        uint32_t scr_w, uint32_t scr_h)
@@ -980,12 +1024,12 @@ static PEHarmonyArea pe_area_of_copy(uint32_t surface, uint32_t pitch,
     int64_t now = g_get_monotonic_time();
 
     if (a == PE_AREA_DESKTOP) {
-        pe_desktop_surface = surface;
-        pe_desktop_pitch = pitch;
-        pe_desktop_surface_us = now;
-    } else if (a == PE_AREA_WINDOW && surface == pe_desktop_surface &&
-               pitch == pe_desktop_pitch &&
-               now - pe_desktop_surface_us < PE_DESKTOP_SURFACE_US) {
+        hc->desktop_surface = surface;
+        hc->desktop_pitch = pitch;
+        hc->desktop_surface_us = now;
+    } else if (a == PE_AREA_WINDOW && surface == hc->desktop_surface &&
+               pitch == hc->desktop_pitch &&
+               now - hc->desktop_surface_us < PE_DESKTOP_SURFACE_US) {
         /*
          * Part of the desktop repaint that is going on right now.  When the
          * screen changes size the compositor fills the newly uncovered
@@ -1012,19 +1056,16 @@ static PEHarmonyArea pe_area_of_copy(uint32_t surface, uint32_t pitch,
     return a;
 }
 
-static const char *pe_window_kind(const PEWindow *e)
+static const char *pe_window_kind(PEHarmonyCard *hc, const PEWindow *e)
 {
-    return pe_area_name(pe_area_of_copy(e->surface, e->pitch, e->x0, e->y0, e->x1, e->y1,
+    return pe_area_name(pe_area_of_copy(hc, e->surface, e->pitch,
+                                        e->x0, e->y0, e->x1, e->y1,
                                         e->scr_w, e->scr_h));
 }
 
 /* ---- the tile grid ---------------------------------------------------- */
 
-static bool pe_harm_on;
-static uint8_t *pe_harm_tiles;
-static int pe_harm_cols, pe_harm_rows;
-static uint32_t pe_harm_gen;
-static int64_t pe_harm_resized_us;
+static bool pe_harm_on;                 /* the mode is machine-wide */
 
 /*
  * The grid is kept whether harmony mode is on or not, because it has to
@@ -1036,20 +1077,37 @@ static int64_t pe_harm_resized_us;
  */
 void ppc_mac_gpu_harmony_enable(bool on)
 {
+    unsigned i;
+
+    /* The mode is machine-wide: both screens enter and leave it together. */
     pe_harm_on = on;
-    pe_harm_gen++;
+    for (i = 0; i < PE_HARMONY_CARDS; i++) {
+        pe_harm_cards[i].gen++;
+    }
 }
 
-bool ppc_mac_gpu_harmony_tiles(const uint8_t **tiles, int *cols, int *rows,
-                                 uint32_t *generation)
+/*
+ * `screen` is the display this listener shows -- the same index
+ * poweremu-display takes.  Each card observed its own screen, so each has
+ * its own grid; handing every listener the first card's was what made a
+ * second screen's mask nonsense.
+ */
+bool ppc_mac_gpu_harmony_tiles(unsigned screen, const uint8_t **tiles,
+                                 int *cols, int *rows, uint32_t *generation)
 {
-    if (!pe_harm_on || !pe_harm_tiles) {
+    PEHarmonyCard *hc;
+
+    if (screen >= PE_HARMONY_CARDS) {
         return false;
     }
-    *tiles = pe_harm_tiles;
-    *cols = pe_harm_cols;
-    *rows = pe_harm_rows;
-    *generation = pe_harm_gen;
+    hc = &pe_harm_cards[screen];
+    if (!pe_harm_on || !hc->tiles) {
+        return false;
+    }
+    *tiles = hc->tiles;
+    *cols = hc->cols;
+    *rows = hc->rows;
+    *generation = hc->gen;
     return true;
 }
 
@@ -1059,7 +1117,8 @@ bool ppc_mac_gpu_harmony_tiles(const uint8_t **tiles, int *cols, int *rows,
  * towards showing a little too much of the guest rather than cutting the
  * edge off one of its windows.
  */
-static void pe_harmony_mark(uint32_t surface, uint32_t pitch,
+static void pe_harmony_mark(PEHarmonyCard *hc,
+                              uint32_t surface, uint32_t pitch,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                               uint32_t scr_w, uint32_t scr_h)
 {
@@ -1068,12 +1127,12 @@ static void pe_harmony_mark(uint32_t surface, uint32_t pitch,
     }
     int cols = (scr_w + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
     int rows = (scr_h + PE_HARMONY_TILE - 1) / PE_HARMONY_TILE;
-    if (cols != pe_harm_cols || rows != pe_harm_rows) {
-        g_free(pe_harm_tiles);
-        pe_harm_tiles = g_malloc0((size_t)cols * rows);
-        pe_harm_cols = cols;
-        pe_harm_rows = rows;
-        pe_harm_resized_us = g_get_monotonic_time();
+    if (cols != hc->cols || rows != hc->rows) {
+        g_free(hc->tiles);
+        hc->tiles = g_malloc0((size_t)cols * rows);
+        hc->cols = cols;
+        hc->rows = rows;
+        hc->resized_us = g_get_monotonic_time();
     }
 
     /*
@@ -1087,12 +1146,12 @@ static void pe_harmony_mark(uint32_t surface, uint32_t pitch,
      * afterwards.
      */
     int64_t now = g_get_monotonic_time();
-    bool settling = now - pe_harm_resized_us < G_TIME_SPAN_SECOND * 3 / 2;
+    bool settling = now - hc->resized_us < G_TIME_SPAN_SECOND * 3 / 2;
     if (settling && ((uint64_t)w * h * 10 < (uint64_t)scr_w * scr_h * 9)) {
         return;
     }
 
-    PEHarmonyArea a = pe_area_of_copy(surface, pitch, x, y, x + w, y + h,
+    PEHarmonyArea a = pe_area_of_copy(hc, surface, pitch, x, y, x + w, y + h,
                                         scr_w, scr_h);
     int tx0, ty0, tx1, ty1;
     if (a == PE_AREA_WINDOW) {
@@ -1122,14 +1181,14 @@ static void pe_harmony_mark(uint32_t surface, uint32_t pitch,
     bool whole_screen = (uint64_t)w * h * 10 >= (uint64_t)scr_w * scr_h * 9;
 
     for (int ty = ty0; ty < ty1; ty++) {
-        uint8_t *row = pe_harm_tiles + (size_t)ty * cols;
+        uint8_t *row = hc->tiles + (size_t)ty * cols;
         for (int tx = tx0; tx < tx1; tx++) {
             if (whole_screen && row[tx] != PE_AREA_UNKNOWN) {
                 continue;
             }
             if (row[tx] != (uint8_t)a) {
                 row[tx] = a;
-                pe_harm_gen++;
+                hc->gen++;
             }
         }
     }
@@ -1198,7 +1257,8 @@ static void pe_window_capture(const uint8_t *vram, uint64_t vram_size,
     fclose(f);
 }
 
-static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
+static void pe_window_saw_blit(PEHarmonyCard *hc,
+                               uint32_t surface, uint32_t pitch,
                                uint32_t src_x, uint32_t src_y,
                                uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                uint32_t scr_w, uint32_t scr_h,
@@ -1210,7 +1270,7 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
     if (!w || !h) {
         return;
     }
-    pe_harmony_mark(surface, pitch, x, y, w, h, scr_w, scr_h);
+    pe_harmony_mark(hc, surface, pitch, x, y, w, h, scr_w, scr_h);
     int64_t now = g_get_monotonic_time();
     if (on && on[0] >= '2') {
         /* Every copy, for working out what the compositor is doing. */
@@ -1219,7 +1279,7 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
     }
     PEWindow *slot = NULL;
     for (int i = 0; i < PE_WINDOW_MAX; i++) {
-        PEWindow *e = &pe_windows[i];
+        PEWindow *e = &hc->windows[i];
         if (e->live && e->surface == surface && e->pitch == pitch) {
             slot = e;
             break;
@@ -1229,10 +1289,10 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
         /* A free slot, or the one nobody has drawn to for longest. */
         int64_t oldest = now;
         for (int i = 0; i < PE_WINDOW_MAX; i++) {
-            if (!pe_windows[i].live) { slot = &pe_windows[i]; break; }
-            if (pe_windows[i].last_us <= oldest) {
-                oldest = pe_windows[i].last_us;
-                slot = &pe_windows[i];
+            if (!hc->windows[i].live) { slot = &hc->windows[i]; break; }
+            if (hc->windows[i].last_us <= oldest) {
+                oldest = hc->windows[i].last_us;
+                slot = &hc->windows[i];
             }
         }
         memset(slot, 0, sizeof(*slot));
@@ -1277,13 +1337,13 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
      * cannot work from here: this is only called *by* a copy, so the
      * moment things go quiet is the moment nothing calls it again.
      */
-    if (!on || now - pe_windows_printed_us < 2 * G_TIME_SPAN_SECOND) {
+    if (!on || now - hc->windows_printed_us < 2 * G_TIME_SPAN_SECOND) {
         return;
     }
-    pe_windows_printed_us = now;
+    hc->windows_printed_us = now;
     fprintf(stderr, "PEWINDOWS ----\n");
     for (int i = 0; i < PE_WINDOW_MAX; i++) {
-        PEWindow *e = &pe_windows[i];
+        PEWindow *e = &hc->windows[i];
         bool quiet = now - e->last_us > 5 * G_TIME_SPAN_SECOND;
         if (!e->live) {
             continue;
@@ -1307,7 +1367,7 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
                 "%ux%u origin=(%d,%d) store=%ux%u kind=%s pieces=%" PRIu64 "\n",
                 e->surface, e->pitch, e->x0, e->y0, e->x1, e->y1,
                 e->x1 - e->x0, e->y1 - e->y0, e->ox, e->oy, e->sx1, e->sy1,
-                pe_window_kind(e), e->pieces);
+                pe_window_kind(hc, e), e->pieces);
     }
 }
 
@@ -4455,7 +4515,8 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
              * -- and with no display attached that is only when somebody
              * asks for a screendump.
              */
-            pe_window_saw_blit(src_offset, src_pitch, src_x, src_y,
+            pe_window_saw_blit(pe_harmony_for(s),
+                               src_offset, src_pitch, src_x, src_y,
                                dst_x, dst_y, blit_w, blit_h,
                                ((((s->regs.crtc_h_total_disp) >> 16) & 0xFF) + 1) * 8,
                                (((s->regs.crtc_v_total_disp) >> 16) & 0x7FF) + 1,
