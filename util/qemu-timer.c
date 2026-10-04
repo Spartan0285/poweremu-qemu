@@ -38,6 +38,10 @@
 #include <poll.h>
 #endif
 
+#ifdef CONFIG_DARWIN
+#include <sys/event.h>
+#endif
+
 #ifdef CONFIG_PRCTL_PR_SET_TIMERSLACK
 #include <sys/prctl.h>
 #endif
@@ -319,11 +323,87 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#ifdef CONFIG_DARWIN
+/*
+ * A nanosecond wait on a system with no ppoll().
+ *
+ * macOS has no ppoll(), so this file's fallback is g_poll(), whose timeout is
+ * a whole number of milliseconds -- rounded *up*, deliberately, because
+ * waiting too little is a busy-wait.  Every deadline shorter than a
+ * millisecond therefore becomes a millisecond: a 100 us timer sleeps ten
+ * times longer than it asked for, and a guest whose timers pace its frames
+ * feels exactly that.
+ *
+ * A one-shot kqueue timer in nanoseconds, polled alongside the caller's own
+ * descriptors, ends the wait at the right moment.  The g_poll() timeout stays
+ * as the backstop it always was: it rounds up, so it can only fire later than
+ * the kqueue, never instead of it.
+ *
+ * Borrowed from lyons88/qemu-g5, which met the same millisecond on the same
+ * platform.
+ *
+ * The descriptor is per thread and is not closed when a thread ends: QEMU's
+ * polling threads live as long as the process, so this costs one descriptor
+ * each rather than growing.
+ */
+static __thread int poll_kq = -1;
+
+static int qemu_poll_ns_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    g_autofree GPollFD *all = NULL;
+    struct kevent kev;
+    int ret;
+
+    if (poll_kq == -1) {
+        poll_kq = kqueue();
+        if (poll_kq < 0) {
+            poll_kq = -2;           /* asked once; do not ask again */
+        } else {
+            qemu_set_cloexec(poll_kq);
+        }
+    }
+    if (poll_kq < 0) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    /* NOTE_CRITICAL: not a candidate for the timer coalescing that would put
+     * the millisecond straight back. */
+    EV_SET(&kev, 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           NOTE_NSECONDS | NOTE_CRITICAL, timeout, NULL);
+    if (kevent(poll_kq, &kev, 1, NULL, 0, NULL) < 0) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    all = g_new(GPollFD, nfds + 1);
+    memcpy(all, fds, nfds * sizeof(GPollFD));
+    all[nfds] = (GPollFD) { .fd = poll_kq, .events = G_IO_IN };
+
+    ret = g_poll(all, nfds + 1, qemu_timeout_ns_to_ms(timeout));
+    /* The caller asked about its own descriptors; the timer is ours. */
+    if (ret > 0 && all[nfds].revents) {
+        ret--;
+    }
+    for (guint i = 0; i < nfds; i++) {
+        fds[i].revents = all[i].revents;
+    }
+
+    /* Drop the timer, and with it the event if it fired. */
+    EV_SET(&kev, 0, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    kevent(poll_kq, &kev, 1, NULL, 0, NULL);
+    return ret;
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
+#ifdef CONFIG_DARWIN
+    if (timeout > 0) {
+        return qemu_poll_ns_kqueue(fds, nfds, timeout);
+    }
+#endif
 #ifdef CONFIG_PPOLL
     if (timeout < 0) {
         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
