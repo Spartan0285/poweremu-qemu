@@ -752,8 +752,35 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
      * Everything that must see finished drawing comes through here, so this
      * is the only place that has to wait for the workers -- no new ordering
      * rules, and none to forget at a new call site.
+     *
+     * The wait must not hold the big lock.  The workers draw through
+     * r200_render_draw(), which takes the BQL to serialise against the
+     * vCPU and main-loop callers, and almost every caller of this function
+     * is already holding it -- an MMIO write, or the display refresh.  So
+     * the waiter held the lock the worker needed to finish, and the worker
+     * could never decrement inflight: both stopped, the guest with them.
+     * Intermittent by nature, since it needs a flush to land while a draw
+     * is actually in flight, which reads from outside as "sometimes it
+     * hangs, no panic, and the CPU is busy".
+     *
+     * Dropping it around the wait is safe in a way the deadlock is not:
+     * nothing between here and the re-acquire touches device state, and a
+     * draw submitted meanwhile is simply another one to wait for.
+     *
+     * The same shape of bug, found independently in lyons88/qemu-g5 as
+     * "no BQL under tex lock".
      */
-    r200_async_drain();
+    if (r200_async.started) {
+        bool had_bql = bql_locked();
+
+        if (had_bql) {
+            bql_unlock();
+        }
+        r200_async_drain();
+        if (had_bql) {
+            bql_lock();
+        }
+    }
     if (s->renderer && s->renderer->flush_r200) {
         int64_t t0 = g_get_monotonic_time();
         bool did = s->renderer->flush_r200(s->renderer_opaque);
