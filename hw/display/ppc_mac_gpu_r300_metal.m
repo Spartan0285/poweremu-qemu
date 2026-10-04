@@ -128,7 +128,9 @@ static void upload(id<MTLBlitCommandEncoder> blit, id<MTLBuffer> bytes,
  * (offset, pitch) is enough.  `fresh` says the texture has never been
  * rendered to, and its first pass clears it instead of loading.
  */
-#define R300_DEPTH_FORMAT MTLPixelFormatDepth32Float
+/* One format for both attachments, as the R200 backend does: a depth
+ * buffer and a stencil buffer are the same guest allocation. */
+#define R300_DEPTH_FORMAT MTLPixelFormatDepth32Float_Stencil8
 #define R300_MAX_DEPTH 4
 static struct {
     uint32_t offset, pitch;
@@ -190,6 +192,18 @@ static MTLSamplerAddressMode r300_address_mode(unsigned mode)
     }
 }
 
+/* Stencil operations, in the hardware's order. */
+static MTLStencilOperation r300_sop(unsigned f)
+{
+    static const MTLStencilOperation map[8] = {
+        MTLStencilOperationKeep, MTLStencilOperationZero,
+        MTLStencilOperationReplace, MTLStencilOperationIncrementClamp,
+        MTLStencilOperationDecrementClamp, MTLStencilOperationInvert,
+        MTLStencilOperationIncrementWrap, MTLStencilOperationDecrementWrap,
+    };
+    return map[f & 7];
+}
+
 /* The hardware's compare encoding, the same eight values the R200 path uses. */
 static MTLCompareFunction r300_cmp(unsigned f)
 {
@@ -203,7 +217,7 @@ static MTLCompareFunction r300_cmp(unsigned f)
 }
 
 #define R300_DSS_CACHE 16
-static struct { uint32_t key; id<MTLDepthStencilState> st; } g_r300_dss[R300_DSS_CACHE];
+static struct { uint64_t key; id<MTLDepthStencilState> st; } g_r300_dss[R300_DSS_CACHE];
 static int g_r300_ndss;
 
 static id<MTLDepthStencilState> r300_dss(id<MTLDevice> dev, const R300MetalDraw *d)
@@ -211,8 +225,19 @@ static id<MTLDepthStencilState> r300_dss(id<MTLDevice> dev, const R300MetalDraw 
     /* Writing without testing is a real arrangement -- 80 of Chess's draws
      * ask for it -- and in Metal that is the ALWAYS compare. */
     unsigned func = d->depth_enable ? (d->depth_func & 7) : 7;
-    uint32_t key = func | (d->depth_write ? 8u : 0u);
+    uint64_t key = func | (d->depth_write ? 8u : 0u);
 
+    if (d->stencil_enable) {
+        key |= 1ull << 4;
+        for (int f = 0; f < 2; f++) {
+            key |= (uint64_t)(d->stencil_func[f] & 7)  << (5 + f * 12);
+            key |= (uint64_t)(d->stencil_fail[f] & 7)  << (8 + f * 12);
+            key |= (uint64_t)(d->stencil_zpass[f] & 7) << (11 + f * 12);
+            key |= (uint64_t)(d->stencil_zfail[f] & 7) << (14 + f * 12);
+        }
+        key |= (uint64_t)(d->stencil_read_mask & 0xff) << 32;
+        key |= (uint64_t)(d->stencil_write_mask & 0xff) << 40;
+    }
     for (int i = 0; i < g_r300_ndss; i++) {
         if (g_r300_dss[i].key == key) {
             return g_r300_dss[i].st;
@@ -221,6 +246,23 @@ static id<MTLDepthStencilState> r300_dss(id<MTLDevice> dev, const R300MetalDraw 
     MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
     dd.depthCompareFunction = r300_cmp(func);
     dd.depthWriteEnabled = d->depth_write;
+    if (d->stencil_enable) {
+        MTLStencilDescriptor *front = [[MTLStencilDescriptor alloc] init];
+        MTLStencilDescriptor *back = [[MTLStencilDescriptor alloc] init];
+        MTLStencilDescriptor *side[2] = { front, back };
+        for (int f = 0; f < 2; f++) {
+            side[f].stencilCompareFunction = r300_cmp(d->stencil_func[f]);
+            side[f].stencilFailureOperation = r300_sop(d->stencil_fail[f]);
+            side[f].depthStencilPassOperation = r300_sop(d->stencil_zpass[f]);
+            side[f].depthFailureOperation = r300_sop(d->stencil_zfail[f]);
+            side[f].readMask = d->stencil_read_mask;
+            side[f].writeMask = d->stencil_write_mask;
+        }
+        dd.frontFaceStencil = front;
+        dd.backFaceStencil = back;
+        [front release];
+        [back release];
+    }
     id<MTLDepthStencilState> st = [dev newDepthStencilStateWithDescriptor:dd];
     [dd release];
     if (g_r300_ndss < R300_DSS_CACHE) {
@@ -287,11 +329,20 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
         @try {
             NSString *source = [[NSString stringWithUTF8String:fragment]
                                stringByAppendingString:[NSString stringWithUTF8String:vertex]];
-            NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u:%@",
+            /*
+             * The attachment set belongs in the key.  A pipeline is built
+             * against the formats of the pass it will be used in, so one
+             * compiled without a depth attachment cannot encode in a pass
+             * that has one -- and with the same shader and blend state it
+             * would otherwise be handed straight back from this cache.
+             */
+            unsigned ds = (d->depth_enable || d->depth_write ||
+                           d->stencil_enable) ? 1u : 0u;
+            NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u:%u:%@",
                              d->color_mask, (unsigned)d->blend_enable,
                              d->blend_src_rgb, d->blend_dst_rgb,
                              d->blend_src_alpha, d->blend_dst_alpha,
-                             (unsigned)d->guest_target, source];
+                             (unsigned)d->guest_target, ds, source];
             id<MTLRenderPipelineState> pipeline = [ctx->pipelines objectForKey:key];
             if (!pipeline) {
                 NSError *compile_error = nil;
@@ -306,8 +357,9 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                     MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
                 /* Declared here and keyed below: a pipeline built without the
                  * attachment cannot be used in a pass that has one. */
-                if (d->depth_enable || d->depth_write) {
+                if (ds) {
                     pd.depthAttachmentPixelFormat = R300_DEPTH_FORMAT;
+                    pd.stencilAttachmentPixelFormat = R300_DEPTH_FORMAT;
                 }
                 /*
                  * The mask names the guest's channels, and on a guest-order
@@ -474,7 +526,7 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
              */
             id<MTLTexture> depth_tex = nil;
             bool depth_fresh = false;
-            if (d->depth_enable || d->depth_write) {
+            if (d->depth_enable || d->depth_write || d->stencil_enable) {
                 depth_tex = r300_depth_tex(ctx->device, d->depth_offset,
                                            d->depth_pitch, &depth_fresh);
                 if (!depth_tex) {
@@ -488,6 +540,12 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                     MTLLoadActionClear : MTLLoadActionLoad;
                 pass.depthAttachment.clearDepth = 1.0;
                 pass.depthAttachment.storeAction = MTLStoreActionStore;
+                /* The same allocation carries the stencil planes. */
+                pass.stencilAttachment.texture = depth_tex;
+                pass.stencilAttachment.loadAction = depth_fresh ?
+                    MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.clearStencil = 0;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
             }
             pass.colorAttachments[0].texture = target;
             pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -497,6 +555,9 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
             [encoder setRenderPipelineState:pipeline];
             if (depth_tex) {
                 [encoder setDepthStencilState:r300_dss(ctx->device, d)];
+                if (d->stencil_enable) {
+                    [encoder setStencilReferenceValue:d->stencil_ref];
+                }
             }
             [encoder setViewport:(MTLViewport){d->viewport_x,d->viewport_y,d->viewport_width ?: d->width,
                 d->viewport_height ?: d->height,0,1}];

@@ -7662,7 +7662,28 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     if (RG(0x4f00) & 7) {
         r350_zb_record(RG(0x4f00), RG(0x4f04), RG(0x4f20), RG(0x4f24), RG(0x4f10));
     }
-    REQUIRE((RG(0x4f00)&1)==0, "stencil test");               /* ZB_CNTL */
+    /*
+     * Stencil.  ZB_CNTL bit 0 enables it and bit 4 asks for separate front
+     * and back state; without it both faces take the front fields.  Chess
+     * marks a region with ALWAYS/REPLACE and then draws through it with
+     * EQUAL and every operation set to keep.
+     */
+    draw.stencil_enable = RG(0x4f00) & 1;
+    {
+        uint32_t zs = RG(0x4f04), rm = RG(0x4f08);
+        bool two_sided = (RG(0x4f00) >> 4) & 1;
+        draw.stencil_func[0]  = (zs >> 3) & 7;
+        draw.stencil_fail[0]  = (zs >> 6) & 7;
+        draw.stencil_zpass[0] = (zs >> 9) & 7;
+        draw.stencil_zfail[0] = (zs >> 12) & 7;
+        draw.stencil_func[1]  = two_sided ? (zs >> 15) & 7 : draw.stencil_func[0];
+        draw.stencil_fail[1]  = two_sided ? (zs >> 18) & 7 : draw.stencil_fail[0];
+        draw.stencil_zpass[1] = two_sided ? (zs >> 21) & 7 : draw.stencil_zpass[0];
+        draw.stencil_zfail[1] = two_sided ? (zs >> 24) & 7 : draw.stencil_zfail[0];
+        draw.stencil_ref        = rm & 0xff;
+        draw.stencil_read_mask  = (rm >> 8) & 0xff;
+        draw.stencil_write_mask = (rm >> 16) & 0xff;
+    }
     draw.depth_enable = (RG(0x4f00) >> 1) & 1;
     draw.depth_write  = (RG(0x4f00) >> 2) & 1;
     draw.depth_func   = RG(0x4f04) & 7;

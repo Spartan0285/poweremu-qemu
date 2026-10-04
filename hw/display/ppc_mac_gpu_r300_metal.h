@@ -101,6 +101,25 @@ typedef struct R300MetalDraw {
     bool cull_back;
     bool front_is_cw;
 
+    /*
+     * The stencil test.  Encoding from the R5xx acceleration guide's
+     * ZB_ZSTENCILCNTL and ZB_STENCILREFMASK tables: the compare functions use
+     * the same eight values as the depth compare, and the operations are
+     * keep, zero, replace, increment and decrement with clamp, invert, then
+     * increment and decrement with wrap.
+     *
+     * Front and back carry their own function and operations; a guest that
+     * does not ask for two-sided stencil sets both from the same fields.
+     */
+    bool stencil_enable;
+    unsigned stencil_func[2];        /* [0] front, [1] back */
+    unsigned stencil_fail[2];
+    unsigned stencil_zpass[2];
+    unsigned stencil_zfail[2];
+    unsigned stencil_ref;
+    unsigned stencil_read_mask;
+    unsigned stencil_write_mask;
+
     bool depth_enable;       /* test against the buffer */
     bool depth_write;        /* write results into it */
     unsigned depth_func;     /* 0..7, meaningful when depth_enable */
