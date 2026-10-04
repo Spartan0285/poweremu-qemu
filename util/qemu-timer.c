@@ -348,6 +348,23 @@ int qemu_timeout_ns_to_ms(int64_t ns)
  */
 static __thread int poll_kq = -1;
 
+/*
+ * POWEREMU_COARSE_TIMERS=1 puts the millisecond back, so the two can be
+ * compared in the same build on the same run of the same workload.  "It feels
+ * smoother" is not a measurement without a control, and rebuilding between
+ * the halves of a comparison changes more than the one thing being compared.
+ */
+static bool coarse_timers(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        /* Racing threads compute the same answer from the same environment. */
+        on = getenv("POWEREMU_COARSE_TIMERS") != NULL;
+    }
+    return on != 0;
+}
+
 static int qemu_poll_ns_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
 {
     g_autofree GPollFD *all = NULL;
@@ -400,7 +417,7 @@ static int qemu_poll_ns_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
 #ifdef CONFIG_DARWIN
-    if (timeout > 0) {
+    if (timeout > 0 && !coarse_timers()) {
         return qemu_poll_ns_kqueue(fds, nfds, timeout);
     }
 #endif
