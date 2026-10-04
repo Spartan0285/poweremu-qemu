@@ -119,6 +119,105 @@ static void upload(id<MTLBlitCommandEncoder> blit, id<MTLBuffer> bytes,
       destinationOrigin:MTLOriginMake(0,0,0)];
 }
 
+/*
+ * Private depth textures, one per guest depth buffer.
+ *
+ * Ported from the R200 backend's g_r200_depth: the guest's buffer lives in
+ * VRAM, Metal will not make a depth texture out of a buffer, and a depth
+ * buffer is read back only by the hardware itself, so a private texture per
+ * (offset, pitch) is enough.  `fresh` says the texture has never been
+ * rendered to, and its first pass clears it instead of loading.
+ */
+#define R300_DEPTH_FORMAT MTLPixelFormatDepth32Float
+#define R300_MAX_DEPTH 4
+static struct {
+    uint32_t offset, pitch;
+    id<MTLTexture> tex;
+    uint64_t used;
+    bool fresh;
+} g_r300_depth[R300_MAX_DEPTH];
+static uint64_t g_r300_depth_clock;
+
+static id<MTLTexture> r300_depth_tex(id<MTLDevice> dev, uint32_t offset,
+                                     uint32_t pitch, bool *fresh)
+{
+    int lru = 0;
+
+    if (!pitch) {
+        return nil;
+    }
+    for (int i = 0; i < R300_MAX_DEPTH; i++) {
+        if (g_r300_depth[i].tex && g_r300_depth[i].offset == offset &&
+            g_r300_depth[i].pitch == pitch) {
+            g_r300_depth[i].used = ++g_r300_depth_clock;
+            *fresh = g_r300_depth[i].fresh;
+            g_r300_depth[i].fresh = false;
+            return g_r300_depth[i].tex;
+        }
+        if (g_r300_depth[i].used < g_r300_depth[lru].used) {
+            lru = i;
+        }
+    }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:R300_DEPTH_FORMAT width:pitch
+                                    height:2048 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    if (!t) {
+        return nil;
+    }
+    [g_r300_depth[lru].tex release];
+    g_r300_depth[lru].offset = offset;
+    g_r300_depth[lru].pitch = pitch;
+    g_r300_depth[lru].tex = t;
+    g_r300_depth[lru].used = ++g_r300_depth_clock;
+    g_r300_depth[lru].fresh = false;
+    *fresh = true;                      /* this pass clears it */
+    fprintf(stderr, "ppc-mac-gpu r350: depth buffer at 0x%x, pitch %u\n", offset, pitch);
+    return t;
+}
+
+/* The hardware's compare encoding, the same eight values the R200 path uses. */
+static MTLCompareFunction r300_cmp(unsigned f)
+{
+    static const MTLCompareFunction map[8] = {
+        MTLCompareFunctionNever, MTLCompareFunctionLess,
+        MTLCompareFunctionLessEqual, MTLCompareFunctionEqual,
+        MTLCompareFunctionGreaterEqual, MTLCompareFunctionGreater,
+        MTLCompareFunctionNotEqual, MTLCompareFunctionAlways,
+    };
+    return map[f & 7];
+}
+
+#define R300_DSS_CACHE 16
+static struct { uint32_t key; id<MTLDepthStencilState> st; } g_r300_dss[R300_DSS_CACHE];
+static int g_r300_ndss;
+
+static id<MTLDepthStencilState> r300_dss(id<MTLDevice> dev, const R300MetalDraw *d)
+{
+    /* Writing without testing is a real arrangement -- 80 of Chess's draws
+     * ask for it -- and in Metal that is the ALWAYS compare. */
+    unsigned func = d->depth_enable ? (d->depth_func & 7) : 7;
+    uint32_t key = func | (d->depth_write ? 8u : 0u);
+
+    for (int i = 0; i < g_r300_ndss; i++) {
+        if (g_r300_dss[i].key == key) {
+            return g_r300_dss[i].st;
+        }
+    }
+    MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+    dd.depthCompareFunction = r300_cmp(func);
+    dd.depthWriteEnabled = d->depth_write;
+    id<MTLDepthStencilState> st = [dev newDepthStencilStateWithDescriptor:dd];
+    [dd release];
+    if (g_r300_ndss < R300_DSS_CACHE) {
+        g_r300_dss[g_r300_ndss].key = key;
+        g_r300_dss[g_r300_ndss++].st = st;
+    }
+    return st;
+}
+
 bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                      char *error, size_t error_size)
 {
@@ -193,6 +292,11 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 pd.fragmentFunction = [[lib newFunctionWithName:@"r300_fragment"] autorelease];
                 pd.colorAttachments[0].pixelFormat = d->guest_target ?
                     MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
+                /* Declared here and keyed below: a pipeline built without the
+                 * attachment cannot be used in a pass that has one. */
+                if (d->depth_enable || d->depth_write) {
+                    pd.depthAttachmentPixelFormat = R300_DEPTH_FORMAT;
+                }
                 /*
                  * The mask names the guest's channels, and on a guest-order
                  * target the shader has already swizzled them: red leaves in
@@ -348,17 +452,49 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 }
             }
             [initial endEncoding];
+            /*
+             * The depth buffer.
+             *
+             * Metal cannot alias a depth texture onto the VRAM buffer, so
+             * each guest depth buffer gets a private one, exactly as the R200
+             * backend does.  A buffer seen for the first time is cleared
+             * rather than loaded -- there is nothing in our copy yet, and the
+             * guest's own clear is a draw with the compare set to ALWAYS,
+             * which lands on the cleared texture and agrees with it.
+             */
+            id<MTLTexture> depth_tex = nil;
+            bool depth_fresh = false;
+            if (d->depth_enable || d->depth_write) {
+                depth_tex = r300_depth_tex(ctx->device, d->depth_offset,
+                                           d->depth_pitch, &depth_fresh);
+                if (!depth_tex) {
+                    return fail(error,error_size,"depth buffer unavailable");
+                }
+            }
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (depth_tex) {
+                pass.depthAttachment.texture = depth_tex;
+                pass.depthAttachment.loadAction = depth_fresh ?
+                    MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.clearDepth = 1.0;
+                pass.depthAttachment.storeAction = MTLStoreActionStore;
+            }
             pass.colorAttachments[0].texture = target;
             pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
             pass.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
             if (!encoder) return fail(error,error_size,"Metal render encoder failed");
             [encoder setRenderPipelineState:pipeline];
+            if (depth_tex) {
+                [encoder setDepthStencilState:r300_dss(ctx->device, d)];
+            }
             [encoder setViewport:(MTLViewport){d->viewport_x,d->viewport_y,d->viewport_width ?: d->width,
                 d->viewport_height ?: d->height,0,1}];
             [encoder setScissorRect:(MTLScissorRect){d->scissor[0],d->scissor[1],d->scissor[2],d->scissor[3]}];
-            [encoder setCullMode:MTLCullModeNone];
+            [encoder setCullMode:d->cull_front ? MTLCullModeFront :
+                                 d->cull_back ? MTLCullModeBack : MTLCullModeNone];
+            [encoder setFrontFacingWinding:d->front_is_cw ?
+                MTLWindingClockwise : MTLWindingCounterClockwise];
             [encoder setVertexBuffer:vb offset:0 atIndex:0];
             [encoder setVertexBuffer:vc offset:0 atIndex:1];
             [encoder setFragmentBuffer:fc offset:0 atIndex:0];

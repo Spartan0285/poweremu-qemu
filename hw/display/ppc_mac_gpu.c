@@ -526,6 +526,58 @@ static struct {
 } r350_reject_census[R350_REJECT_REASONS];
 static unsigned r350_reject_kinds;
 
+/*
+ * What the guest asks of the depth unit, counted.
+ *
+ * Reported through the "perf" property rather than the log: the rejections
+ * arrive in a burst of a few hundred inside a second or two and then stop, so
+ * anything printed on a timer reports the first moment and never the total --
+ * which is exactly what the first attempt at this did.
+ */
+#define R350_ZB_KINDS 8
+static struct {
+    uint32_t cntl, zs, off, pitch, fmt;
+    uint64_t count;
+} r350_zb_census[R350_ZB_KINDS];
+static unsigned r350_zb_kinds;
+
+static void r350_zb_record(uint32_t cntl, uint32_t zs, uint32_t off,
+                           uint32_t pitch, uint32_t fmt)
+{
+    for (unsigned i = 0; i < r350_zb_kinds; i++) {
+        if (r350_zb_census[i].cntl == cntl && r350_zb_census[i].zs == zs) {
+            r350_zb_census[i].count++;
+            return;
+        }
+    }
+    if (r350_zb_kinds < R350_ZB_KINDS) {
+        r350_zb_census[r350_zb_kinds] = (typeof(r350_zb_census[0]))
+            { cntl, zs, off, pitch, fmt, 1 };
+        r350_zb_kinds++;
+    }
+}
+
+/* The output-format registers, when one of them turns a draw away. */
+#define R350_OUT_KINDS 8
+static struct { uint32_t fmt, cctl, mask; uint64_t count; } r350_out_census[R350_OUT_KINDS];
+static unsigned r350_out_kinds;
+
+static void r350_out_record(uint32_t fmt, uint32_t cctl, uint32_t mask)
+{
+    for (unsigned i = 0; i < r350_out_kinds; i++) {
+        if (r350_out_census[i].fmt == fmt && r350_out_census[i].cctl == cctl
+            && r350_out_census[i].mask == mask) {
+            r350_out_census[i].count++;
+            return;
+        }
+    }
+    if (r350_out_kinds < R350_OUT_KINDS) {
+        r350_out_census[r350_out_kinds] = (typeof(r350_out_census[0]))
+            { fmt, cctl, mask, 1 };
+        r350_out_kinds++;
+    }
+}
+
 static void r350_reject_record(const char *reason)
 {
     for (unsigned i = 0; i < r350_reject_kinds; i++) {
@@ -7572,10 +7624,39 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * things".  Chess was rejected 827 times here and the reason said nothing
      * about which register to look at.
      */
-    REQUIRE((RG(0x4f00)&7)==0, "depth or stencil test");      /* ZB_CNTL */
+    /*
+     * The depth test.
+     *
+     * ZB_CNTL: bit 0 stencil, bit 1 depth test, bit 2 depth write.  The
+     * compare function is the low three bits of ZB_ZSTENCILCNTL, the same
+     * eight values the colour compare uses.  Measured on Chess: it clears by
+     * drawing with the compare set to 7 (always) and tests with 1 (less),
+     * and 80 of its draws write depth without testing, which is the always
+     * compare with writes left on.
+     *
+     * Stencil is still refused.  It is 338 of Chess's 827 depth draws and a
+     * separate piece of work; keeping it out means what is accepted here is
+     * drawn correctly rather than drawn wrongly.
+     */
+    if (RG(0x4f00) & 7) {
+        r350_zb_record(RG(0x4f00), RG(0x4f04), RG(0x4f20), RG(0x4f24), RG(0x4f10));
+    }
+    REQUIRE((RG(0x4f00)&1)==0, "stencil test");               /* ZB_CNTL */
+    draw.depth_enable = (RG(0x4f00) >> 1) & 1;
+    draw.depth_write  = (RG(0x4f00) >> 2) & 1;
+    draw.depth_func   = RG(0x4f04) & 7;
+    draw.depth_offset = RG(0x4f20);
+    draw.depth_pitch  = RG(0x4f24) & 0x3fff;
+    REQUIRE(!(draw.depth_enable || draw.depth_write) || draw.depth_pitch,
+            "depth buffer pitch");
     REQUIRE((RG(0x4bd4)&~0xfffu)==0, "alpha test state");     /* FG_ALPHA_FUNC */
     REQUIRE(RG(0x4e18)==0, "logic op");                       /* RB3D_ROPCNTL */
-    REQUIRE((RG(0x42b8)&3)==0, "face culling");               /* SU_CULL_MODE */
+    draw.cull_front  = RG(0x42b8) & 1;
+    draw.cull_back   = (RG(0x42b8) >> 1) & 1;
+    draw.front_is_cw = (RG(0x42b8) >> 2) & 1;
+    /* Both faces culled draws nothing at all; the hardware allows it, and
+     * accepting it would be accepting a draw we then fail to make invisible. */
+    REQUIRE(!(draw.cull_front && draw.cull_back), "both faces culled");
     REQUIRE((RG(0x4bc0)&1)==0, "fog");                        /* FG_FOG_BLEND */
     /*
      * US_OUT_FMT_0: four 8- or 10-bit components, plus C0..C3_SEL saying
@@ -7586,9 +7667,27 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      */
     {
         uint32_t out_fmt = RG(0x46a4);
-        REQUIRE((out_fmt & 31) <= 1 && (out_fmt & ~0xffffu) == 0 &&
-                RG(0x4e00)==0 && (RG(0x4e0c)&~15u)==0,
-                "render-target output format or mask");
+        /* One reason per condition, and the values with them: four conditions
+         * behind one name is what made the depth gate take an extra run to
+         * identify. */
+        if ((out_fmt & 31) > 1 || (out_fmt & ~0xffffu) || RG(0x4e00)
+            || (RG(0x4e0c) & ~15u)) {
+            r350_out_record(out_fmt, RG(0x4e00), RG(0x4e0c));
+        }
+        REQUIRE((out_fmt & 31) <= 1, "output component size");
+        REQUIRE((out_fmt & ~0xffffu) == 0, "output format high bits");
+        /*
+         * RB3D_CCTL.  Chess programs 0x600 on every one of its 489 depth
+         * draws: colour compression and CMASK, which are ways for the
+         * hardware to store the colour buffer more cheaply and are
+         * transparent to anything that reads it as pixels -- which is what
+         * this renderer writes and what the guest scans out.  Accepted by
+         * value rather than by mask, so a bit nobody has seen still stops a
+         * draw rather than being waved through, and the census says what
+         * turned up.
+         */
+        REQUIRE(RG(0x4e00)==0 || RG(0x4e00)==0x600, "colour buffer control");
+        REQUIRE((RG(0x4e0c)&~15u)==0, "colour write mask");    /* RB3D_COLORMASK */
         static const char channel[4] = { 'a', 'r', 'g', 'b' };
         unsigned sel[4];
         for (unsigned i = 0; i < 4; i++) {
@@ -13270,6 +13369,18 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                 r350_taken_census[i].colour_offset,
                 r350_taken_census[i].colour_pitch,
                 r350_taken_census[i].prim, r350_taken_census[i].count);
+        }
+        for (unsigned i = 0; i < r350_out_kinds; i++) {
+            g_string_append_printf(out, " out%u=%08x:%08x:%08x/%" PRIu64, i,
+                                   r350_out_census[i].fmt, r350_out_census[i].cctl,
+                                   r350_out_census[i].mask, r350_out_census[i].count);
+        }
+        for (unsigned i = 0; i < r350_zb_kinds; i++) {
+            g_string_append_printf(out, " zb%u=%02x:%08x:%08x:%08x:%08x/%"
+                                   PRIu64, i, r350_zb_census[i].cntl,
+                                   r350_zb_census[i].zs, r350_zb_census[i].off,
+                                   r350_zb_census[i].pitch, r350_zb_census[i].fmt,
+                                   r350_zb_census[i].count);
         }
         for (unsigned i = 0; i < r350_reject_kinds; i++) {
             /* The property is parsed as space-separated key=value, and a

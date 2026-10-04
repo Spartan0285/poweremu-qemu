@@ -70,6 +70,35 @@ typedef struct R300MetalDraw {
     bool guest_target;
     uint32_t guest_offset;
     uint32_t guest_pitch;    /* bytes per row */
+
+    /*
+     * The depth test.
+     *
+     * The guest's depth buffer is in VRAM and Metal cannot alias a depth
+     * texture onto a buffer, so one private texture per (offset, pitch)
+     * stands in for it -- the arrangement the R200 backend already uses.
+     * Nothing is written back to the guest's own buffer yet: Chess clears
+     * depth by drawing a full-screen pass with the compare set to ALWAYS, so
+     * the private copy is kept in step without having to mirror the guest's
+     * memory.
+     *
+     * depth_func is the hardware's own encoding, which is the same eight
+     * values as the colour compare: 0 never, 1 less, ... 7 always.
+     */
+    /*
+     * Face culling.  SU_CULL_MODE: bit 0 culls front faces, bit 1 back, and
+     * bit 2 says a front face is wound clockwise.  The encoder used to set
+     * MTLCullModeNone unconditionally, so this had to be refused.
+     */
+    bool cull_front;
+    bool cull_back;
+    bool front_is_cw;
+
+    bool depth_enable;       /* test against the buffer */
+    bool depth_write;        /* write results into it */
+    unsigned depth_func;     /* 0..7, meaningful when depth_enable */
+    uint32_t depth_offset;   /* VRAM offset of the guest's buffer */
+    uint32_t depth_pitch;    /* pixels per row */
 } R300MetalDraw;
 
 void *r300_metal_create(void);
