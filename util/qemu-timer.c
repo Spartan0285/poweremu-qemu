@@ -411,10 +411,87 @@ static int qemu_poll_ns_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
 }
 #endif
 
-/* qemu implementation of g_poll which uses a nanosecond timeout but is
- * otherwise identical to g_poll
+#ifdef CONFIG_DARWIN
+/*
+ * What the waits actually do, so the kqueue path can be judged by measurement
+ * rather than by how the guest feels.
+ *
+ * POWEREMU_POLL_STATS=1 times every wait with a deadline and reports, every
+ * five seconds, how many fell in each band and how late they came back on
+ * average.  Run it once each way (see POWEREMU_COARSE_TIMERS) and the two
+ * reports answer both halves of the question: whether short waits happen at
+ * all in this workload, and whether they now land on time.
  */
-int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+#define POLL_BANDS 6
+static const int64_t poll_band_ns[POLL_BANDS] = {
+    100000, 250000, 500000, 1000000, 2000000, INT64_MAX
+};
+static const char *const poll_band_name[POLL_BANDS] = {
+    "<100us", "<250us", "<500us", "<1ms", "<2ms", ">=2ms"
+};
+static struct {
+    uint64_t calls[POLL_BANDS];
+    uint64_t late_ns[POLL_BANDS];
+    int64_t reported_at;
+} poll_stats;
+
+static bool poll_stats_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("POWEREMU_POLL_STATS") != NULL;
+    }
+    return on != 0;
+}
+
+static int64_t poll_now_ns(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+static void poll_stats_record(int64_t asked, int64_t took)
+{
+    int i;
+
+    for (i = 0; i < POLL_BANDS; i++) {
+        if (asked < poll_band_ns[i]) {
+            break;
+        }
+    }
+    if (i == POLL_BANDS) {
+        i = POLL_BANDS - 1;
+    }
+    /* Raced between polling threads; the error is a sample, not a decade. */
+    poll_stats.calls[i]++;
+    poll_stats.late_ns[i] += took > asked ? (uint64_t)(took - asked) : 0;
+
+    int64_t now = poll_now_ns();
+    if (poll_stats.reported_at == 0) {
+        poll_stats.reported_at = now;
+        return;
+    }
+    if (now - poll_stats.reported_at < 5000000000LL) {
+        return;
+    }
+    poll_stats.reported_at = now;
+    fprintf(stderr, "[POLL] %s waits:", coarse_timers() ? "g_poll(ms)" : "kqueue(ns)");
+    for (i = 0; i < POLL_BANDS; i++) {
+        if (!poll_stats.calls[i]) {
+            continue;
+        }
+        fprintf(stderr, "  %s n=%" PRIu64 " late=%.0fus", poll_band_name[i],
+                poll_stats.calls[i],
+                poll_stats.late_ns[i] / (double)poll_stats.calls[i] / 1000.0);
+    }
+    fprintf(stderr, "\n");
+}
+#endif
+
+static int qemu_poll_ns_dispatch(GPollFD *fds, guint nfds, int64_t timeout)
 {
 #ifdef CONFIG_DARWIN
     if (timeout > 0 && !coarse_timers()) {
@@ -440,6 +517,23 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 #else
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
+}
+
+/* qemu implementation of g_poll which uses a nanosecond timeout but is
+ * otherwise identical to g_poll
+ */
+int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+{
+#ifdef CONFIG_DARWIN
+    if (timeout > 0 && poll_stats_on()) {
+        int64_t began = poll_now_ns();
+        int ret = qemu_poll_ns_dispatch(fds, nfds, timeout);
+
+        poll_stats_record(timeout, poll_now_ns() - began);
+        return ret;
+    }
+#endif
+    return qemu_poll_ns_dispatch(fds, nfds, timeout);
 }
 
 
