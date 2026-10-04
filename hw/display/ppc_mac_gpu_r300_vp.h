@@ -8,6 +8,13 @@
 #define R300_VP_MAX_INSTRUCTIONS 256
 #define R300_VP_MAX_PARAMETERS 256
 #define R300_VP_MAX_ATTRIBUTES 16
+/*
+ * Alternate temporary memory: 20 vectors, of which the math half of a dual
+ * instruction may write only the first four.  See the R5xx acceleration
+ * guide, "DUAL MATH OP USAGE".
+ */
+#define R300_VP_ALT_TEMPORARIES 20
+#define R300_VP_ALT_TEMP_WRITABLE 4
 
 typedef struct R300VPProgram {
     uint32_t control[3];         /* PVS_CNTL_1/2/3: 0x22d0..0x22d8 */

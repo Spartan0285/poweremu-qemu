@@ -30,14 +30,40 @@ static void emit(VPWriter *w, const char *fmt, ...)
     }
 }
 
+/*
+ * `need` says which components of the result this operand actually reaches:
+ * the instruction's write mask for a component-wise operation, and all four
+ * for a dot product, where every component feeds every output.
+ *
+ * A component outside it may read a register that was never written.  The
+ * hardware has no notion of an undefined register -- it returns whatever the
+ * file holds -- and the result is discarded by the write mask either way, so
+ * refusing the whole instruction over it rejects a program that is perfectly
+ * well defined in its own terms.  Chess does exactly this: it writes t[7].xyz
+ * and then reads -t[7].xyzw into an add that keeps only xyz.
+ */
 static bool source(char *out, size_t cap, uint32_t word,
                    uint32_t attributes, const uint8_t defined[32],
-                   unsigned param_base, unsigned param_max)
+                   unsigned param_base, unsigned param_max, unsigned need)
 {
-    if (word & ~0x1fffffffu) {
-        return false; /* relative addressing / unsupported extension */
+    /*
+     * Field widths from the hardware's own description of a source operand
+     * (R5xx acceleration guide, "PVS Source Operand Description"):
+     *
+     *   1:0   register type      3     absolute value
+     *   2     spare              4     addressing mode 0
+     *   12:5  offset             31    addressing mode 1
+     *
+     * This used to read the type as five bits, which quietly swallowed the
+     * spare bit, the absolute-value flag and an addressing mode -- so a
+     * source asking for abs() looked like a register class that does not
+     * exist, and was refused for the wrong reason.
+     */
+    if (word & ((1u << 4) | (1u << 31))) {
+        return false;               /* relative addressing: not translated */
     }
-    unsigned kind = word & 31, index = (word >> 5) & 255;
+    unsigned kind = word & 3, index = (word >> 5) & 255;
+    bool absolute = (word >> 3) & 1;
     char components[4][48];
     for (unsigned i = 0; i < 4; i++) {
         unsigned swizzle = (word >> (13 + i * 3)) & 7;
@@ -47,7 +73,11 @@ static bool source(char *out, size_t cap, uint32_t word,
                      swizzle == 4 ? "0.0f" : "1.0f");
         } else if (swizzle < 4) {
             char channel = "xyzw"[swizzle];
-            if (kind == 0 && index < 32 && (defined[index] & (1u << swizzle))) {
+            if (kind == 0 && index < 32 && !(defined[index] & (1u << swizzle))
+                && !(need & (1u << i))) {
+                /* Never written, and this lane is thrown away. */
+                snprintf(components[i], sizeof(components[i]), "0.0f");
+            } else if (kind == 0 && index < 32 && (defined[index] & (1u << swizzle))) {
                 snprintf(components[i], sizeof(components[i]), "%st[%u].%c", neg, index, channel);
             } else if (kind == 1 && index < R300_VP_MAX_ATTRIBUTES &&
                        (attributes & (1u << index))) {
@@ -55,6 +85,10 @@ static bool source(char *out, size_t cap, uint32_t word,
             } else if (kind == 2 && index <= param_max &&
                        param_base + index < R300_VP_MAX_PARAMETERS) {
                 snprintf(components[i], sizeof(components[i]), "%sc[%u].%c", neg, param_base + index, channel);
+            } else if (kind == 3 && index < R300_VP_ALT_TEMPORARIES) {
+                /* The alternate temporary file, which the math half of a
+                 * dual instruction writes and the vector half reads back. */
+                snprintf(components[i], sizeof(components[i]), "%sm[%u].%c", neg, index, channel);
             } else {
                 return false;
             }
@@ -62,8 +96,11 @@ static bool source(char *out, size_t cap, uint32_t word,
             return false;
         }
     }
-    int n = snprintf(out, cap, "float4(%s,%s,%s,%s)",
-                     components[0], components[1], components[2], components[3]);
+    int n = absolute ?
+        snprintf(out, cap, "abs(float4(%s,%s,%s,%s))",
+                 components[0], components[1], components[2], components[3]) :
+        snprintf(out, cap, "float4(%s,%s,%s,%s)",
+                 components[0], components[1], components[2], components[3]);
     return n >= 0 && (size_t)n < cap;
 }
 
@@ -106,15 +143,36 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
              "device const R300VertexInput *vertices [[buffer(0)]], "
              "constant float4 *c [[buffer(1)]]) {\n"
              " device const float4 *a = vertices[vid].a;\n"
-             " float4 t[32]; float4 o[32];\n");
+             " float4 t[32]; float4 o[32]; float4 m[%u];\n", R300_VP_ALT_TEMPORARIES);
+    /* ATRM is read before it is written where a program pipelines a dual
+     * instruction ahead of its consumer; zero is the only defensible value. */
+    emit(&w, " for (uint i = 0; i < %u; i++) m[i] = float4(0.0f);\n",
+         R300_VP_ALT_TEMPORARIES);
     if (p->zero_initialize_temporaries) {
         emit(&w, " for (uint i = 0; i < 32; i++) t[i] = float4(0.0f);\n");
     }
     for (unsigned pc = start; pc <= end; pc++) {
         const uint32_t *code = p->code[pc];
-        unsigned op = code[0] & 255, kind = (code[0] >> 8) & 31;
-        unsigned dst = (code[0] >> 13) & 31, mask = (code[0] >> 20) & 15;
-        unsigned count = (op == 4 || op == 128) ? 3 : 2;
+        /*
+         * Field widths from the hardware's description of the opcode and
+         * destination word (R5xx acceleration guide, "PVS Opcode &
+         * Destination Operand Description"):
+         *
+         *   5:0  opcode        11:8  register type    20:23 write enables
+         *   6    math inst     12    addressing mode  24/25 vector/math sat
+         *   7    macro inst    19:13 offset           28    dual math op
+         *
+         * The register type is four bits and the offset seven, not five
+         * apiece; bits 18 and 19 are part of the offset and were being
+         * refused as reserved, so any program addressing a destination above
+         * 31 was turned away for a reason that was not true.
+         */
+        unsigned op = code[0] & 255, kind = (code[0] >> 8) & 15;
+        unsigned dst = (code[0] >> 13) & 127, mask = (code[0] >> 20) & 15;
+        bool dual = (code[0] >> 28) & 1;
+        /* 68 is the math engine's lighting coefficient: three operands,
+         * W components only. */
+        unsigned count = (op == 4 || op == 128 || op == 68) ? 3 : 2;
         /*
          * Bit 28 stays refused, and the reason is worth keeping.
          *
@@ -136,9 +194,21 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
          * translator the second register file.  Until then they are refused,
          * which is what the census says.
          */
-        if (p->code_valid[pc] != 15 || (code[0] & ~0x00f3ffffu) ||
-            (kind != 0 && kind != 2) || !mask ||
-            (op != 1 && op != 2 && op != 3 && op != 4 && op != 128)) {
+        /*
+         * Accepted: opcode, destination, write enables, and the dual-math
+         * bit.  Still refused, because none of it is translated: relative
+         * addressing (12, 29:31), the two saturate flags (24, 25) and
+         * predication (26, 27).
+         *
+         * A dual instruction's vector half may use at most two sources --
+         * the third source word is where the math instruction lives -- so a
+         * three-source opcode cannot be one.
+         */
+        if (p->code_valid[pc] != 15 || (code[0] & ~0x10ffefffu) ||
+            (kind != 0 && kind != 2) || !mask || dst >= 32 ||
+            (dual && count == 3) ||
+            (op != 1 && op != 2 && op != 3 && op != 4 && op != 128 &&
+             op != 68)) {
             /*
              * Say which of these it was, and for which opcode.  As one name
              * it covered five unrelated conditions -- a program uploaded
@@ -158,8 +228,11 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         }
         char operands[3][256];
         for (unsigned i = 0; i < count; i++) {
+            /* A dot product mixes all four components into every output;
+             * everything else here is component-wise. */
             if (!source(operands[i], sizeof(operands[i]), code[i + 1],
-                        p->attribute_mask, temps, param_base, param_max)) {
+                        p->attribute_mask, temps, param_base, param_max,
+                        (op == 1 || op == 68) ? 15u : mask)) {
                 snprintf(detail, sizeof(detail),
                          "undefined vertex source pc=%u operand=%u word=%08x attributes=%04x",
                          pc, i, code[i + 1], p->attribute_mask);
@@ -168,7 +241,25 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
             }
         }
         emit(&w, " { float4 va = %s; float4 vb = %s;\n", operands[0], operands[1]);
-        if (count == 3) {
+        if (op == 68) {
+            /*
+             * ME_LIGHT_COEFF_DX, the lighting coefficients:
+             *
+             *   x = 1
+             *   y = max(B.w, 0)
+             *   z = B.w > 0 ? max(A.w, 0) ^ clamp(C.w, -128, 128) : 0
+             *   w = 1
+             *
+             * The exponent is clamped by the hardware, and the base is
+             * clamped at zero before the power -- a negative base would
+             * otherwise give a NaN rather than the zero the hardware
+             * produces.
+             */
+            emit(&w, " float4 vc = %s;\n", operands[2]);
+            emit(&w, " float lz = vb.w > 0.0f ? pow(max(va.w, 0.0f),"
+                     " clamp(vc.w, -128.0f, 128.0f)) : 0.0f;\n");
+            emit(&w, " float4 value = float4(1.0f, max(vb.w, 0.0f), lz, 1.0f);\n");
+        } else if (count == 3) {
             emit(&w, " float4 vc = %s; float4 value = va * vb + vc;\n", operands[2]);
         } else {
             emit(&w, " float4 value = %s;\n", op == 1 ? "float4(dot(va, vb))" :
@@ -181,6 +272,74 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
             }
         }
         (kind == 0 ? temps : results)[dst] |= mask;
+        /*
+         * The math half of a dual instruction.
+         *
+         * The third source word is not a source at all: it holds the whole
+         * math instruction (R5xx acceleration guide, "Dual Math Instruction
+         * (Replaces PVS_SRC_OPERAND_2)"):
+         *
+         *   1:0   source type      18:16 second operand swizzle
+         *   2     opcode msb       20:19 destination, ATRM 0-3
+         *   3     absolute value   24:21 opcode
+         *   12:5  source offset    25/26 negate first/second operand
+         *   15:13 first operand    28:27 which component to write
+         *
+         * Only opcode 9 is translated.  It is the one Chess uses, on all
+         * three of its dual instructions, and the others are a scalar unit's
+         * worth of work that nothing has yet asked for.
+         */
+        if (dual) {
+            uint32_t d = code[3];
+            unsigned mop = ((d >> 21) & 15) | (((d >> 2) & 1) << 4);
+            unsigned msrc_type = d & 3, msrc_off = (d >> 5) & 255;
+            unsigned mswz_x = (d >> 13) & 7;
+            unsigned mdst = (d >> 19) & 3, mwe = (d >> 27) & 3;
+            bool mabs = (d >> 3) & 1, mneg_x = (d >> 25) & 1;
+            char operand[256];
+
+            if (d & ((1u << 4) | (1u << 31))) {
+                snprintf(detail, sizeof(detail), "dual math relative addressing");
+                reason = detail;
+                goto fail;
+            }
+            if (mop != 9) {
+                snprintf(detail, sizeof(detail), "dual math opcode %u", mop);
+                reason = detail;
+                goto fail;
+            }
+            if (mdst >= R300_VP_ALT_TEMP_WRITABLE) {
+                snprintf(detail, sizeof(detail), "dual math destination %u", mdst);
+                reason = detail;
+                goto fail;
+            }
+            /* One scalar operand, taken from the component the first swizzle
+             * selects.  Build it through the same source decoder so that the
+             * register classes and their bounds are checked in one place. */
+            {
+                uint32_t scalar = msrc_type | (mabs ? (1u << 3) : 0u)
+                                | (msrc_off << 5)
+                                | (mswz_x << 13) | (mswz_x << 16)
+                                | (mswz_x << 19) | (mswz_x << 22)
+                                | (mneg_x ? (1u << 25) : 0u);
+                if (!source(operand, sizeof(operand), scalar, p->attribute_mask,
+                            temps, param_base, param_max, 15u)) {
+                    snprintf(detail, sizeof(detail),
+                             "dual math source word=%08x", d);
+                    reason = detail;
+                    goto fail;
+                }
+            }
+            /*
+             * ME_RECIP_SQRT_FF: 1.0 / sqrt(abs(x)), and an input of zero
+             * gives zero -- not infinity, and not the MAX_FLOAT its _DX
+             * sibling returns.  rsqrt(0) in Metal is infinity, so the zero
+             * case is written out rather than left to the intrinsic.
+             */
+            emit(&w, " { float ms = abs((%s).x);\n", operand);
+            emit(&w, " m[%u].%c = ms == 0.0f ? 0.0f : rsqrt(ms); }\n",
+                 mdst, "xyzw"[mwe]);
+        }
         emit(&w, " }\n");
         if (pc == position_end && results[0] != 15) {
             reason = "position is incomplete at declared position-program end";
@@ -231,6 +390,29 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
     }
     return true;
 fail:
+    /*
+     * The program itself, once, whatever turned it away.
+     *
+     * Four dwords per slot, as the hardware takes them.  A rejection names a
+     * register; the program says what the shader is actually doing, which is
+     * what decides whether the next step is a few lines or a feature.
+     */
+    {
+        static bool dumped;
+        if (!dumped) {
+            dumped = true;
+            fprintf(stderr, "[R350_VP] %s\n", reason);
+            for (unsigned q = start; q <= end && q < R300_VP_MAX_INSTRUCTIONS; q++) {
+                uint32_t w = p->code[q][0];
+                fprintf(stderr, "[R350_VP] %2u: %08x %08x %08x %08x  valid=%x"
+                        "  op=%u math=%u macro=%u dst=%u off=%u we=%x%s\n",
+                        q, w, p->code[q][1], p->code[q][2], p->code[q][3],
+                        p->code_valid[q], w & 63, (w >> 6) & 1, (w >> 7) & 1,
+                        (w >> 8) & 15, (w >> 13) & 127, (w >> 20) & 15,
+                        (w & (1u << 28)) ? "  DUAL" : "");
+            }
+        }
+    }
     out[0] = 0;
     snprintf(error, error_capacity, "%s", reason);
     return false;
