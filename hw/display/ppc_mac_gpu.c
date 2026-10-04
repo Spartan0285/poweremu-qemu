@@ -451,10 +451,53 @@ static struct {
  * textures are counted per draw by where they are read from; vram_high is
  * the highest VRAM byte any render target, depth buffer or texture used.
  */
-static struct {
+typedef struct R200Perf {
+    const void *owner;                  /* the PPCMacGPUState that claimed it */
     uint64_t frames, draws, tex_vram, tex_agp, agp_bytes, vram_high;
     bool drew;
-} r200_perf;
+} R200Perf;
+
+/*
+ * One set per card, not one per machine.
+ *
+ * A second guest screen is a second card with its own scan-out and its own
+ * flips, and the overlay on each window reads its own card's "perf"
+ * property.  Shared totals made both windows show the sum of the two
+ * screens' frames, so a still second screen flattered the first and a busy
+ * one made an idle window look busy.
+ *
+ * Kept outside PPCMacGPUState deliberately, like the Harmony state above: a
+ * member added to that struct once broke every QOM cast, and nothing here
+ * needs to live in it.  The slot is claimed in realize rather than on first
+ * use, because draws reach these counters from the worker thread and two
+ * threads racing to claim a slot is a bug waiting for a second card.
+ */
+#define R200_PERF_CARDS 2
+static R200Perf r200_perf_cards[R200_PERF_CARDS];
+
+static R200Perf *r200_perf_for(const void *owner)
+{
+    unsigned i;
+
+    for (i = 0; i < R200_PERF_CARDS; i++) {
+        if (r200_perf_cards[i].owner == owner) {
+            return &r200_perf_cards[i];
+        }
+    }
+    return &r200_perf_cards[0];         /* unclaimed, or more cards than slots */
+}
+
+static void r200_perf_claim(const void *owner)
+{
+    unsigned i;
+
+    for (i = 0; i < R200_PERF_CARDS; i++) {
+        if (!r200_perf_cards[i].owner) {
+            r200_perf_cards[i].owner = owner;
+            return;
+        }
+    }
+}
 
 /*
  * What the R350 experiment costs, so it can be compared with the R200 path
@@ -533,18 +576,22 @@ static struct {
     uint64_t aaresolve, scanout_draws, resolved;
 } r350_perf;
 
-static void r200_perf_present(void)
+static void r200_perf_present(PPCMacGPUState *s)
 {
-    if (r200_perf.drew) {
-        r200_perf.frames++;
-        r200_perf.drew = false;
+    R200Perf *perf = r200_perf_for(s);
+
+    if (perf->drew) {
+        perf->frames++;
+        perf->drew = false;
     }
 }
 
-static void r200_perf_high(uint64_t end)
+static void r200_perf_high(PPCMacGPUState *s, uint64_t end)
 {
-    if (end > r200_perf.vram_high) {
-        r200_perf.vram_high = end;
+    R200Perf *perf = r200_perf_for(s);
+
+    if (end > perf->vram_high) {
+        perf->vram_high = end;
     }
 }
 
@@ -861,7 +908,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
         if (lo < (uint64_t)s->regs.crtc_offset + r200_scanout_bytes(s) &&
             hi > s->regs.crtc_offset) {
             r200_rate.presents++;          /* 2D write into the scanout */
-            r200_perf_present();
+            r200_perf_present(s);
         }
     }
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
@@ -1903,6 +1950,31 @@ static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
         }
         return;
     }
+    /*
+     * And it has to fit in video memory.
+     *
+     * This assigns s->disp.stride directly, so it misses the bound
+     * ppc_mac_gpu_update_display_mode() applies to every stride it computes:
+     * offset + stride * height must stay inside the card.  A pitch learned
+     * from a blit is guest-supplied, and an over-large one made the 32bpp
+     * scan-out read past the end of VRAM -- and handed the same unchecked
+     * length to memory_region_snapshot_and_clear_dirty(), which does not
+     * return from an out-of-range request, it aborts.  The 16bpp path has
+     * carried this check all along; this one had not.
+     */
+    if ((uint64_t)s->disp.offset + (uint64_t)dst_pitch * s->disp.height
+        > s->vram_size) {
+        static int pitch_too_big_log;
+        if (pitch_too_big_log < 10) {
+            fprintf(stderr, "[STRIDE_CHANGE] ignoring BLT pitch %u for "
+                    "%ux%u: offset 0x%x + %u rows would leave the %"
+                    PRIu64 "-byte frame buffer\n", dst_pitch, width,
+                    s->disp.height, s->disp.offset, s->disp.height,
+                    s->vram_size);
+            pitch_too_big_log++;
+        }
+        return;
+    }
     s->disp_stride_override_active = true;
     s->disp_stride_override_value = dst_pitch;
     s->disp.stride = dst_pitch;
@@ -2780,7 +2852,18 @@ static void ppc_mac_gpu_display_update(void *opaque)
             g_pe_scan_rows = NULL;
         }
     }
-    if (!s->dirty_scan && s->dirty_sweep != 0) {
+    /*
+     * The bound on the dirty-bitmap length is part of the condition.
+     *
+     * memory_region_snapshot_and_clear_dirty() does not fail an out-of-range
+     * request, it aborts the emulator, and this is the one call that takes a
+     * guest-influenced stride.  The stride is clamped at its source now; this
+     * is what keeps a mistake there from being a dead process rather than a
+     * wrong-looking screen.
+     */
+    if (!s->dirty_scan && s->dirty_sweep != 0
+        && (uint64_t)s->disp.offset + (uint64_t)stride * height
+           <= s->vram_size) {
         DirtyBitmapSnapshot *snap;
         int y0 = s->dmg_any ? s->dmg_y0 : (int)height;
         int y1 = s->dmg_any ? s->dmg_y1 : -1;
@@ -6928,12 +7011,12 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                r200_render_draw(s, vram, &pkt) == 0) {
         ppc_mac_gpu_dirty(s, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
-        r200_perf.draws++;
+        r200_perf_for(s)->draws++;
         r200_traffic.draws++;
-        r200_perf.drew = true;
-        r200_perf_high((uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+        r200_perf_for(s)->drew = true;
+        r200_perf_high(s, (uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
         if (pkt.depth_enable && pkt.depth_pitch) {
-            r200_perf_high((uint64_t)pkt.depth_offset +
+            r200_perf_high(s, (uint64_t)pkt.depth_offset +
                            (uint64_t)pkt.rt_height * pkt.depth_pitch * pkt.depth_bpp);
         }
         for (int t = 0; t < R200_MAX_TEX; t++) {
@@ -6942,11 +7025,11 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
             }
             uint64_t bytes = (uint64_t)pkt.tex[t].pitch * pkt.tex[t].height;
             if (pkt.tex[t].host_data) {
-                r200_perf.tex_agp++;
-                r200_perf.agp_bytes += bytes;
+                r200_perf_for(s)->tex_agp++;
+                r200_perf_for(s)->agp_bytes += bytes;
             } else {
-                r200_perf.tex_vram++;
-                r200_perf_high((uint64_t)pkt.tex[t].offset + bytes);
+                r200_perf_for(s)->tex_vram++;
+                r200_perf_high(s, (uint64_t)pkt.tex[t].offset + bytes);
             }
         }
     }
@@ -7907,12 +7990,12 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         }
         r350_perf.texture_bytes += bytes + output;   /* staged, not viewed */
         if (r350_address_is_local(s, texoffset & ~31u)) {
-            r200_perf.tex_vram++;
-            r200_perf_high((uint64_t)((texoffset & ~31u) -
+            r200_perf_for(s)->tex_vram++;
+            r200_perf_high(s, (uint64_t)((texoffset & ~31u) -
                            (((uint64_t)s->regs.mc_fb_location & 0xffff) << 16)) + bytes);
         } else {
-            r200_perf.tex_agp++;
-            r200_perf.agp_bytes += bytes;
+            r200_perf_for(s)->tex_agp++;
+            r200_perf_for(s)->agp_bytes += bytes;
         }
         draw.textures[unit]=(R300MetalTexture){.rgba=textures[unit],.size=output,
             .width=tw,.height=th,.linear_filter=min>=2,
@@ -8060,7 +8143,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * the same frame/draw ratio the R200 path reports, rather than one
      * "frame" per composited window.
      */
-    r200_perf.draws++;
+    r200_perf_for(s)->draws++;
     r350_perf.draws++;
     r350_taken_record(s, prim);
     /*
@@ -8152,11 +8235,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             g_free(vmsl);
         }
     }
-    r200_perf_high((uint64_t)offset + draw.target_size);
+    r200_perf_high(s, (uint64_t)offset + draw.target_size);
     if (offset == s->regs.crtc_offset) {
-        r200_perf_present();
+        r200_perf_present(s);
     } else {
-        r200_perf.drew = true;
+        r200_perf_for(s)->drew = true;
     }
     success=true;
 done:
@@ -11533,7 +11616,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                               s->regs.crtc_offset, base);
                 r200_rate.flips++;             /* page flip: one frame */
-                r200_perf_present();
+                r200_perf_present(s);
             }
             s->regs.crtc_offset = base;
         }
@@ -12499,6 +12582,9 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
 
+    /* This card's own counters for the performance overlay. */
+    r200_perf_claim(s);
+
     /* Compute VRAM size from MB property */
     s->vram_size = (uint64_t)s->vram_size_mb * MiB;
 
@@ -13117,13 +13203,14 @@ static void ppc_mac_gpu_append_cpu_perf(GString *out)
 static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(obj);
+    const R200Perf *perf = r200_perf_for(s);
     GString *out = g_string_new(NULL);
 
     g_string_append_printf(out, "frames=%" PRIu64 " draws=%" PRIu64 " tex_vram=%" PRIu64
                            " tex_agp=%" PRIu64 " agp_bytes=%" PRIu64
                            " vram_high=%" PRIu64 " vram_usable=%u",
-                           r200_perf.frames, r200_perf.draws, r200_perf.tex_vram,
-                           r200_perf.tex_agp, r200_perf.agp_bytes, r200_perf.vram_high,
+                           perf->frames, perf->draws, perf->tex_vram,
+                           perf->tex_agp, perf->agp_bytes, perf->vram_high,
                            s->regs.config_memsize);
     if (s->r350_probe) {
         g_string_append_printf(out, " r350_draws=%" PRIu64 " r350_rejected=%" PRIu64
