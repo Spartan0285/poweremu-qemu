@@ -557,6 +557,27 @@ static void r350_zb_record(uint32_t cntl, uint32_t zs, uint32_t off,
     }
 }
 
+/* Sampler state, when one of its conditions turns a draw away. */
+#define R350_TEX_KINDS 8
+static struct { uint32_t filter, format0; uint64_t count; } r350_tex_census[R350_TEX_KINDS];
+static unsigned r350_tex_kinds;
+
+static void r350_tex_record(uint32_t filter, uint32_t format0)
+{
+    for (unsigned i = 0; i < r350_tex_kinds; i++) {
+        if (r350_tex_census[i].filter == filter
+            && r350_tex_census[i].format0 == format0) {
+            r350_tex_census[i].count++;
+            return;
+        }
+    }
+    if (r350_tex_kinds < R350_TEX_KINDS) {
+        r350_tex_census[r350_tex_kinds] = (typeof(r350_tex_census[0]))
+            { filter, format0, 1 };
+        r350_tex_kinds++;
+    }
+}
+
 /* The output-format registers, when one of them turns a draw away. */
 #define R350_OUT_KINDS 8
 static struct { uint32_t fmt, cctl, mask; uint64_t count; } r350_out_census[R350_OUT_KINDS];
@@ -7991,11 +8012,25 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         unsigned mag=(filter>>9)&3,min=(filter>>11)&3,mip=(filter>>13)&3;
         unsigned max_level=(filter>>17)&15;
         unsigned aniso=(filter>>21)&7;
-        REQUIRE((clamp_s==2 || clamp_s==6) &&
-                (clamp_t==2 || clamp_t==6) && min==mag &&
-                min>=1 && min<=3 && mip<=2 && max_level<=levels &&
-                aniso<=4 && (filter&0x0f000000)==0,
-                "sampler addressing, filtering or mip levels");
+        /* One reason per condition, with the values, so the next step is a
+         * register rather than a guess.  Eight conditions behind one name is
+         * what made each of the gates before this one cost an extra run. */
+        if (!((clamp_s==2 || clamp_s==6) && (clamp_t==2 || clamp_t==6) &&
+              min==mag && min>=1 && min<=3 && mip<=2 && max_level<=levels &&
+              aniso<=4 && (filter&0x0f000000)==0)) {
+            r350_tex_record(filter, format0);
+        }
+        /* Repeat as well as the two clamps.  Mirror (1) and the rest stay
+         * refused: nothing has asked for them, and a mode guessed wrong is a
+         * texture that looks plausible and is wrong at its edges. */
+        REQUIRE(clamp_s==0 || clamp_s==2 || clamp_s==6, "sampler clamp s");
+        REQUIRE(clamp_t==0 || clamp_t==2 || clamp_t==6, "sampler clamp t");
+        REQUIRE(min==mag, "sampler min and mag differ");
+        REQUIRE(min>=1 && min<=3, "sampler filter mode");
+        REQUIRE(mip<=2, "sampler mip filter");
+        REQUIRE(max_level<=levels, "sampler mip levels");
+        REQUIRE(aniso<=4, "sampler anisotropy");
+        REQUIRE((filter&0x0f000000)==0, "sampler filter high bits");
         unsigned swizzle[4]={(format1>>12)&7,(format1>>15)&7,(format1>>18)&7,(format1>>9)&7};
         REQUIRE(swizzle[0]<=5 && swizzle[1]<=5 && swizzle[2]<=5 && swizzle[3]<=5,"texture channel swizzle");
         REQUIRE(texture_bpp==4 || ((swizzle[0]==0 || swizzle[0]>=4) &&
@@ -8035,7 +8070,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             guest_textures = true;
             draw.textures[unit]=(R300MetalTexture){
                 .width=tw,.height=th,.linear_filter=min>=2,
-                .clamp_to_zero_s=clamp_s==6,.clamp_to_zero_t=clamp_t==6,
+                .address_s=clamp_s,.address_t=clamp_t,
                 .max_anisotropy=min==3 ? 1u<<aniso : 1,
                 .guest_source=true,.guest_offset=texoffset & ~31u,
                 .guest_pitch=tp * texture_bpp,.guest_bpp=texture_bpp};
@@ -8109,7 +8144,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         }
         draw.textures[unit]=(R300MetalTexture){.rgba=textures[unit],.size=output,
             .width=tw,.height=th,.linear_filter=min>=2,
-            .clamp_to_zero_s=clamp_s==6,.clamp_to_zero_t=clamp_t==6,
+            .address_s=clamp_s,.address_t=clamp_t,
             .max_anisotropy=min==3 ? 1u<<aniso : 1};
         if (capture_texture) {
             g_autofree char *name = g_strdup_printf("draw-%u-texture-%u-rgba.bin",
@@ -13369,6 +13404,12 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                 r350_taken_census[i].colour_offset,
                 r350_taken_census[i].colour_pitch,
                 r350_taken_census[i].prim, r350_taken_census[i].count);
+        }
+        for (unsigned i = 0; i < r350_tex_kinds; i++) {
+            g_string_append_printf(out, " tex%u=%08x:%08x/%" PRIu64, i,
+                                   r350_tex_census[i].filter,
+                                   r350_tex_census[i].format0,
+                                   r350_tex_census[i].count);
         }
         for (unsigned i = 0; i < r350_out_kinds; i++) {
             g_string_append_printf(out, " out%u=%08x:%08x:%08x/%" PRIu64, i,

@@ -178,6 +178,18 @@ static id<MTLTexture> r300_depth_tex(id<MTLDevice> dev, uint32_t offset,
     return t;
 }
 
+/* The hardware's texture addressing modes.  Only the three the validation
+ * lets through reach here; anything else is refused where it can still say
+ * which mode it was. */
+static MTLSamplerAddressMode r300_address_mode(unsigned mode)
+{
+    switch (mode) {
+    case 0:  return MTLSamplerAddressModeRepeat;
+    case 6:  return MTLSamplerAddressModeClampToZero;
+    default: return MTLSamplerAddressModeClampToEdge;   /* 2 */
+    }
+}
+
 /* The hardware's compare encoding, the same eight values the R200 path uses. */
 static MTLCompareFunction r300_cmp(unsigned f)
 {
@@ -436,10 +448,8 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 MTLSamplerDescriptor *sd = [[[MTLSamplerDescriptor alloc] init] autorelease];
                 sd.normalizedCoordinates = YES;
                 sd.maxAnisotropy = t->max_anisotropy ?: 1;
-                sd.sAddressMode = t->clamp_to_zero_s ?
-                    MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToEdge;
-                sd.tAddressMode = t->clamp_to_zero_t ?
-                    MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToEdge;
+                sd.sAddressMode = r300_address_mode(t->address_s);
+                sd.tAddressMode = r300_address_mode(t->address_t);
                 sd.minFilter = sd.magFilter = t->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 samplers[i] = [[ctx->device newSamplerStateWithDescriptor:sd] autorelease];
                 if (!textures[i] || !samplers[i] ||

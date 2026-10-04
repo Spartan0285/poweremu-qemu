@@ -115,10 +115,45 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         unsigned op = code[0] & 255, kind = (code[0] >> 8) & 31;
         unsigned dst = (code[0] >> 13) & 31, mask = (code[0] >> 20) & 15;
         unsigned count = (op == 4 || op == 128) ? 3 : 2;
+        /*
+         * Bit 28 stays refused, and the reason is worth keeping.
+         *
+         * It was let through on the reasoning that the top bits of the
+         * destination word are modifiers and that the one at 28 selects
+         * between the halves of a *math* instruction, which a dot product is
+         * not -- so it should be inert.  The 434 draws that set it then
+         * failed at the next step instead, reading a source of kind 3.
+         *
+         * Kind 3 is the alternate temporary file, and that is what settles
+         * it: ATRM exists for pair scheduling and is the only file the math
+         * half of a dual instruction can write.  So bit 28 is not inert on
+         * these instructions at all -- they are dual, a vector op and a math
+         * op issued together, and this translator emits only the vector half.
+         * Allowing the bit buys a draw that runs with half its arithmetic
+         * missing, which is worse than one that does not run.
+         *
+         * Supporting them means decoding both halves and giving the
+         * translator the second register file.  Until then they are refused,
+         * which is what the census says.
+         */
         if (p->code_valid[pc] != 15 || (code[0] & ~0x00f3ffffu) ||
             (kind != 0 && kind != 2) || !mask ||
             (op != 1 && op != 2 && op != 3 && op != 4 && op != 128)) {
-            reason = "incomplete upload or unsupported vertex opcode/destination";
+            /*
+             * Say which of these it was, and for which opcode.  As one name
+             * it covered five unrelated conditions -- a program uploaded
+             * incompletely, a reserved bit, a destination this translator
+             * does not write, an empty write mask, and an opcode it cannot
+             * translate -- and the census could not tell them apart.  Kept
+             * short so that distinct kinds stay few.
+             */
+            snprintf(detail, sizeof(detail), "vertex %s op=%u kind=%u bits=%08x",
+                     p->code_valid[pc] != 15 ? "program incomplete" :
+                     (code[0] & ~0x00f3ffffu) ? "reserved bits" :
+                     (kind != 0 && kind != 2) ? "destination kind" :
+                     !mask ? "empty write mask" : "opcode",
+                     op, kind, code[0] & ~0x00f3ffffu);
+            reason = detail;
             goto fail;
         }
         char operands[3][256];

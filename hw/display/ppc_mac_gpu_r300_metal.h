@@ -8,8 +8,15 @@ typedef struct R300MetalTexture {
     size_t size;
     unsigned width, height;
     bool linear_filter;
-    bool clamp_to_zero_s;
-    bool clamp_to_zero_t;
+    /*
+     * The hardware's own addressing mode per axis, rather than a yes/no:
+     * 0 repeats, 2 clamps to the last texel, 6 clamps to a zero border.
+     * It used to be a single boolean meaning "6 or not", which could not
+     * express repeat at all -- and repeat is what Chess asks for on every
+     * textured draw it makes.
+     */
+    unsigned address_s;
+    unsigned address_t;
     unsigned max_anisotropy; /* zero/one means isotropic, at most 16 */
     /*
      * Sample straight out of guest VRAM rather than from a staged copy.
