@@ -7563,9 +7563,20 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 r300_blend_factor_supported(draw.blend_dst_alpha),
                 "blend factors");
     }
-    REQUIRE((RG(0x4f00)&7)==0 && (RG(0x4bd4)&~0xfffu)==0 &&
-            RG(0x4e18)==0 && (RG(0x42b8)&3)==0 && (RG(0x4bc0)&1)==0,
-            "depth/stencil/alpha/logic/cull/fog state");
+    /*
+     * One condition per rejection reason.
+     *
+     * These five were a single REQUIRE, so the census could say only that a
+     * draw wanted something in this group -- which is the difference between
+     * "Chess needs the depth test" and "Chess needs one of five unrelated
+     * things".  Chess was rejected 827 times here and the reason said nothing
+     * about which register to look at.
+     */
+    REQUIRE((RG(0x4f00)&7)==0, "depth or stencil test");      /* ZB_CNTL */
+    REQUIRE((RG(0x4bd4)&~0xfffu)==0, "alpha test state");     /* FG_ALPHA_FUNC */
+    REQUIRE(RG(0x4e18)==0, "logic op");                       /* RB3D_ROPCNTL */
+    REQUIRE((RG(0x42b8)&3)==0, "face culling");               /* SU_CULL_MODE */
+    REQUIRE((RG(0x4bc0)&1)==0, "fog");                        /* FG_FOG_BLEND */
     /*
      * US_OUT_FMT_0: four 8- or 10-bit components, plus C0..C3_SEL saying
      * which of the shader's own channels each one takes.  The arrangement
