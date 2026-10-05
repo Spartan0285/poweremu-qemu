@@ -116,6 +116,13 @@ static inline unsigned r350_vram_component_byte(unsigned component)
     return 3 - component;
 }
 
+/* R3xx 32-bit texture address within one image.
+ *
+ * AMD's R3xx/R5xx memory-layout reference defines a 32-byte micro-tile as
+ * 4x2 32-bit texels and a macro-tile as 8x8 of those micro-tiles (32x16
+ * texels, 2 KiB).  Tiger's OpenGL stack uses the combined layout for Chess's
+ * board and piece textures.  Reading it as rows produces the characteristic
+ * repeated horizontal strips that originally filled the Chess window. */
 /* As r350_diag_once(), but keyed on a surface: one report per render target
  * geometry, so a misdrawn window can be told from a misdrawn desktop. */
 static bool r350_surface_once(uint32_t offset, uint32_t width, uint32_t height)
@@ -124,6 +131,29 @@ static bool r350_surface_once(uint32_t offset, uint32_t width, uint32_t height)
     static unsigned count;
     uint64_t key = ((uint64_t)offset << 26) | ((uint64_t)(width & 0x1fff) << 13) |
                    (height & 0x1fff);
+    for (unsigned i = 0; i < count; i++) {
+        if (seen[i] == key) {
+            return false;
+        }
+    }
+    if (count == ARRAY_SIZE(seen)) {
+        return false;
+    }
+    seen[count++] = key;
+    return true;
+}
+
+/* Bounded, opt-in evidence for application render targets.  Unlike the
+ * compositor-specific capture below, key this on the texture itself so a
+ * scene with hundreds of draws produces one raw/staged pair per resource. */
+static bool r350_scene_texture_once(uint32_t offset, uint32_t format1,
+                                    uint32_t width, uint32_t height)
+{
+    static uint64_t seen[64];
+    static unsigned count;
+    uint64_t key = ((uint64_t)offset << 32) ^ ((uint64_t)format1 << 16) ^
+                   ((uint64_t)width << 8) ^ height;
+
     for (unsigned i = 0; i < count; i++) {
         if (seen[i] == key) {
             return false;
@@ -944,6 +974,83 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
 enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
 #define r200_flush(s) r200_flush_at((s), R200_WHY_TAG(R200_WHY_OTHER))
 enum { R200_WHY_2D = 0x40 };
+
+/*
+ * Two coherency switches, for finding out who has to see finished drawing.
+ *
+ * The device used to render synchronously, so "the engine is idle" was
+ * always true and the wait registers could answer without doing anything.
+ * The Metal path batches: a draw is queued in a command buffer that may
+ * not have been committed, so VRAM does not hold the pixels yet.  A guest
+ * that waits for idle and then reads the surface with the CPU -- which is
+ * what a surface flush does when the driver does not use the blitter --
+ * reads whatever was there before.  Nothing in the device sees that read,
+ * so nothing makes it wait.
+ *
+ * SYNC flushes after every draw: a sledgehammer, to tell a coherency
+ * problem from a rendering one.  WAITSYNC flushes where the guest asks
+ * the engine to be idle, which is the honest answer to the same question.
+ */
+static bool r350_sync_draws(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_R350_SYNC");
+        on = e && *e != '0';
+    }
+    return on;
+}
+
+/* Does this guest ask the engine to be idle at all, and does anyone read
+ * the status register?  If not, the device is never told when the guest is
+ * about to look at a rendered surface with the CPU. */
+static uint64_t r350_wait_writes, r350_wait_reads, r350_status_reads;
+
+/*
+ * Has the application started drawing a 3D scene yet?  Everything
+ * interesting happens after this point; before it, the window server has
+ * been compositing the desktop since boot and fills any log cap with
+ * wallpaper.  Set by the first draw that uses depth or stencil.
+ */
+static bool r350_scene_started;
+
+/*
+ * The tiled four-byte texture path takes its bytes straight, where every
+ * other path composes the missing big-endian reversal that
+ * r350_vram_component_byte() names.  Chess's wood and piece textures are the
+ * only ones that take it, and they are the ones whose colours come out wrong
+ * while the desktop composited in the same frame is right.  A switch, so the
+ * two can be compared on one build rather than argued about.
+ */
+static bool r350_tiled_swap(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_R350_TILEDSWAP");
+        on = e && *e != '0';
+    }
+    return on;
+}
+
+static bool r350_vram_census(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_R350_VRAM");
+        on = e && *e != '0';
+    }
+    return on;
+}
+
+static bool r350_sync_waits(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_R350_WAITSYNC");
+        on = e && *e != '0';
+    }
+    return on;
+}
 
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
@@ -2361,6 +2468,36 @@ static void ppc_mac_gpu_dirty(PPCMacGPUState *s, ram_addr_t off, ram_addr_t len)
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+
+    /*
+     * A dump of VRAM taken from the refresh, not from a draw.
+     *
+     * The application finishes drawing its scene before its window is ever
+     * composited, so a dump triggered by a draw always runs too early to see
+     * the window -- three runs in a row caught the desktop and no window at
+     * all.  The refresh keeps running after the drawing stops, so asking it
+     * for the dump is the only way to get the right pixels and the wrong ones
+     * out of the same instant.  Counted in refreshes, which continue whether
+     * or not anything is being drawn.
+     */
+    {
+        const char *dump = getenv("POWEREMU_R350_VRAMDUMP");
+        const char *at = getenv("POWEREMU_R350_VRAMDUMPFRAME");
+        static bool dumped;
+        static uint64_t refreshes;
+        refreshes++;
+        if (dump && *dump && at && *at && !dumped &&
+            refreshes >= (uint64_t)atoll(at)) {
+            dumped = true;
+            g_autoptr(GError) err = NULL;
+            bool ok = g_file_set_contents(dump,
+                memory_region_get_ram_ptr(&s->vram), s->vram_size, &err);
+            fprintf(stderr, "R350_VRAMDUMP path=%s bytes=%" PRIu64
+                    " refresh=%" PRIu64 " crtc=%08x result=%s\n", dump,
+                    s->vram_size, refreshes, s->regs.crtc_offset,
+                    ok ? "ok" : err->message);
+        }
+    }
 
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
@@ -7119,6 +7256,9 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                r200_render_draw(s, vram, &pkt) == 0) {
         ppc_mac_gpu_dirty(s, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+        if (unlikely(r350_sync_draws())) {
+            r200_flush_at(s, R200_WHY_TAG(R200_WHY_T3));
+        }
         r200_perf_for(s)->draws++;
         r200_traffic.draws++;
         r200_perf_for(s)->drew = true;
@@ -7346,13 +7486,45 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
 
     /* Scissor coordinates carry a fixed bias on this generation. */
     if (x0 < 1440 || y0 < 1440 || x1 < x0 || y1 < y0) {
+        fprintf(stderr, "R350_RESOLVE reject=rect src=%08x/%u dst=%08x/%u "
+                "sc=%08x,%08x clip=%08x,%08x ctl=%08x\n",
+                src, src_pitch, dst, dst_pitch,
+                s->r300_shadow[0x43e0 / 4], s->r300_shadow[0x43e4 / 4],
+                s->r300_shadow[0x43b0 / 4], s->r300_shadow[0x43b4 / 4],
+                s->r300_shadow[0x4e88 / 4]);
         return false;
     }
     x0 -= 1440; y0 -= 1440; x1 -= 1440; y1 -= 1440;
+
+    /*
+     * The colour buffer pitch is allowed to be wider than the resolve
+     * buffer.  Apple's R300 driver does exactly that for a window drawable:
+     * Chess renders into a 704-pixel back buffer, then resolves the visible
+     * 640 pixels into its IOSurface.  RE_SCISSOR still describes the padded
+     * colour buffer, so treating it as a promise that both rows are equally
+     * wide rejects the swap and leaves the old desktop bytes in the window.
+     *
+     * Real hardware clips the resolve at the destination row boundary.  Do
+     * the same before calculating the copy size.  The left edge still has to
+     * fit both surfaces; silently wrapping it into the next row would corrupt
+     * the destination.
+     */
+    uint32_t row_pixels = MIN(src_pitch, dst_pitch) / 4;
+    if (x0 >= row_pixels) {
+        fprintf(stderr, "R350_RESOLVE reject=x-origin src=%08x/%u dst=%08x/%u "
+                "rect=%u..%u ctl=%08x\n", src, src_pitch, dst, dst_pitch,
+                x0, x1, s->r300_shadow[0x4e88 / 4]);
+        return false;
+    }
+    x1 = MIN(x1, row_pixels - 1);
     uint32_t w = x1 - x0 + 1, h = y1 - y0 + 1;
 
     if (!src_pitch || !dst_pitch || src < fb || dst < fb || !w || !h ||
         w > 4096 || h > 4096) {
+        fprintf(stderr, "R350_RESOLVE reject=layout src=%08x/%u dst=%08x/%u "
+                "rect=%u,%u+%ux%u fb=%08x ctl=%08x\n",
+                src, src_pitch, dst, dst_pitch, x0, y0, w, h, fb,
+                s->r300_shadow[0x4e88 / 4]);
         return false;
     }
     src -= fb;
@@ -7361,6 +7533,12 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
     uint64_t need_dst = (uint64_t)dst + (uint64_t)(y0 + h) * dst_pitch;
     if (need_src > s->regs.config_memsize || need_dst > s->regs.config_memsize ||
         (uint64_t)(x0 + w) * 4 > src_pitch || (uint64_t)(x0 + w) * 4 > dst_pitch) {
+        fprintf(stderr, "R350_RESOLVE reject=bounds src=%08x/%u dst=%08x/%u "
+                "rect=%u,%u+%ux%u need=%" PRIu64 ",%" PRIu64
+                " vram=%u ctl=%08x\n",
+                src, src_pitch, dst, dst_pitch, x0, y0, w, h,
+                need_src, need_dst, s->regs.config_memsize,
+                s->r300_shadow[0x4e88 / 4]);
         return false;
     }
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -7371,6 +7549,10 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
     }
     ppc_mac_gpu_dirty(s, dst + (uint64_t)y0 * dst_pitch, (uint64_t)h * dst_pitch);
     s->display_invalid = true;
+    fprintf(stderr, "R350_RESOLVE copied src=%08x/%u dst=%08x/%u "
+            "rect=%u,%u+%ux%u ctl=%08x\n",
+            src, src_pitch, dst, dst_pitch, x0, y0, w, h,
+            s->r300_shadow[0x4e88 / 4]);
     return true;
 }
 
@@ -8072,6 +8254,30 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         uint32_t texoffset=RG(0x4540+unit*4),filter=RG(0x4400+unit*4);
         unsigned tw=(format0&2047)+1,th=((format0>>11)&2047)+1;
         unsigned tp=(format0>>31) ? (format2&2047)+1 : tw;
+        /*
+         * Does the guest declare a row pitch that is not the width, and do we
+         * honour it?  Chess's window backing store is 672 wide in a 704-pitch
+         * surface; read at 672 every row starts 32 pixels early and the window
+         * on screen turns into horizontal streaks.  Logged whenever the two
+         * disagree, whatever the enable bit says, because the enable bit is
+         * exactly what is in question here.
+         */
+        if (unlikely(getenv("POWEREMU_R350_PITCH") != NULL)) {
+            unsigned declared = (format2 & 2047) + 1;
+            static unsigned plogged;
+            /* Only once the application is drawing: the desktop composites
+             * from the moment the machine boots, and its wallpaper tiles fill
+             * any cap long before the application allocates anything.  An
+             * address range was tried first and picked up the tiles too. */
+            if (r350_scene_started && plogged < 40) {
+                plogged++;
+                fprintf(stderr, "R350_PITCH draw=%u unit=%u off=%08x %ux%u "
+                        "declared_pitch=%u used_pitch=%u pitch_en=%u "
+                        "f0=%08x f2=%08x\n",
+                        s->r350->draws_seen, unit, texoffset & ~31u, tw, th,
+                        declared, tp, (format0 >> 31) & 1, format0, format2);
+            }
+        }
         unsigned texture_format=format1&31;
         unsigned texture_bpp=texture_format==0 ? 1 : texture_format==12 ? 4 : 0;
         unsigned levels=(format0>>26)&15;
@@ -8113,7 +8319,16 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 (swizzle[2]==0 || swizzle[2]>=4) &&
                 (swizzle[3]==0 || swizzle[3]>=4)),
                 "single-channel texture swizzle");
-        size_t bytes=(size_t)tp*th*texture_bpp, output=(size_t)tw*th*4;
+        unsigned endian_swap = texoffset & 3;
+        bool macro_tiled = texoffset & 4;
+        unsigned micro_tiled = (texoffset >> 3) & 3;
+        bool r350_rgba_tiled = texture_bpp == 4 && macro_tiled &&
+                               micro_tiled == 1 && endian_swap == 0;
+        /* Rows, not macro pages: these surfaces are read linearly.  The
+         * allocation behind a 32x32 glyph is 8 KiB where its pixels are 4 KiB,
+         * but the padding is not image data and nothing needs to read it. */
+        size_t bytes = (size_t)tp * th * texture_bpp;
+        size_t output=(size_t)tw*th*4;
         /* Byte order the texture's declared swap implies, per texel. */
         static const unsigned perm[4][4]={{0,1,2,3},{1,0,3,2},{3,2,1,0},{2,3,0,1}};
         /* Order this read against anything the GPU still has in flight. */
@@ -8155,9 +8370,14 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         REQUIRE(texture_total<=s->vram_size,"texture staging budget");
         g_autofree uint8_t *raw = g_malloc(bytes);
         REQUIRE(r350_read_bytes(s,texoffset&~31u,raw,bytes),"texture GPU address translation");
+        bool capture_scene_texture = s->r350_capture_dir &&
+            getenv("POWEREMU_R350_SCENE_CAPTURE") && width == 704 &&
+            height >= 580 && height <= 590 &&
+            r350_scene_texture_once(texoffset & ~31u, format1, tw, th);
         bool capture_texture = s->r350_capture_dir &&
             ((point_bypass && s->r350->draws_seen <= 16) ||
-             (dual_tex_route && s->r350->draws_seen <= 500));
+             (dual_tex_route && s->r350->draws_seen <= 500) ||
+             capture_scene_texture);
         if (capture_texture) {
             g_autofree char *name = g_strdup_printf("draw-%u-texture-%u-raw.bin",
                                                     s->r350->draws_seen,unit);
@@ -8167,17 +8387,107 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             fprintf(stderr,"R350_CAPTURE texture=%s bytes=%zu result=%s\n",
                     path,bytes,captured ? "ok" : capture_error->message);
         }
+        /*
+         * How each texture's components are decoded.  The desktop composites
+         * with correct colours in the same frame that the application's own
+         * textures come out wrong, so the difference is in the per-texture
+         * format, not in the output swizzle shared by both.
+         */
+        if (unlikely(getenv("POWEREMU_R350_TEXFMT") != NULL)) {
+            /* One line per distinct surface rather than the first N draws:
+             * the 32x32 label glyphs are drawn well after the wood, and a
+             * plain cap filled with the wood before they appeared. */
+            static uint64_t fseen[64];
+            static unsigned fcount;
+            uint64_t fkey = ((uint64_t)(texoffset & ~31u) << 26) |
+                            ((uint64_t)(tw & 0x1fff) << 13) | (th & 0x1fff);
+            /* Only the tiled path's own textures: WindowServer has dozens of
+             * linear surfaces and they filled all 64 slots before the
+             * application's glyphs were ever reached. */
+            bool fnew = r350_rgba_tiled;
+            for (unsigned fi = 0; fi < fcount && fnew; fi++) {
+                if (fseen[fi] == fkey) { fnew = false; }
+            }
+            if (fnew && fcount < ARRAY_SIZE(fseen)) {
+                fseen[fcount++] = fkey;
+                /* The bytes as they sit in VRAM and the RGBA they become,
+                 * for one texel: the mapping is four stages deep (declared
+                 * swizzle, endian permutation, tiling, VRAM byte order) and
+                 * reading it off the source has already gone wrong once. */
+                fprintf(stderr, "R350_TEXFMT draw=%u unit=%u off=%08x %ux%u "
+                        "bpp=%u f1=%08x swz=%u,%u,%u,%u endian=%u "
+                        "macro=%u micro=%u rgba_tiled=%u "
+                        "byte_for_sel=%u,%u,%u,%u\n",
+                        s->r350->draws_seen, unit, texoffset & ~31u, tw, th,
+                        texture_bpp, format1,
+                        swizzle[0], swizzle[1], swizzle[2], swizzle[3],
+                        endian_swap, macro_tiled, micro_tiled, r350_rgba_tiled,
+                        r350_rgba_tiled ? perm[endian_swap][swizzle[0]]
+                            : r350_vram_component_byte(perm[endian_swap][swizzle[0]]),
+                        r350_rgba_tiled ? perm[endian_swap][swizzle[1]]
+                            : r350_vram_component_byte(perm[endian_swap][swizzle[1]]),
+                        r350_rgba_tiled ? perm[endian_swap][swizzle[2]]
+                            : r350_vram_component_byte(perm[endian_swap][swizzle[2]]),
+                        r350_rgba_tiled ? perm[endian_swap][swizzle[3]]
+                            : r350_vram_component_byte(perm[endian_swap][swizzle[3]]));
+            }
+        }
         textures[unit]=g_malloc(output);
         for(unsigned y=0;y<th;y++) for(unsigned x=0;x<tw;x++) for(unsigned c=0;c<4;c++) {
             unsigned sel=swizzle[c];
+            /*
+             * Linear, for every one of these -- including the surfaces whose
+             * TX_OFFSET sets both tiling bits.
+             *
+             * Those bits are what r350_rgba_tiled detects, and detiling was
+             * applied on the strength of them.  Reading the texels straight
+             * out of the dump says otherwise: the 128x128 wood comes out as
+             * clean grain linearly and carries a cross-hatch tile cadence
+             * when detiled, and a 32x32 label glyph is a legible numeral
+             * linearly and two half-width copies when detiled.  Three page
+             * geometries were tried (32x16, 64x8, and one following the
+             * surface pitch) and all three doubled the glyph, so this is not
+             * the page shape being wrong.
+             *
+             * What r350_rgba_tiled still decides, correctly, is the byte
+             * order: these surfaces are read straight where WindowServer's
+             * linear ARGB resources need the big-endian reversal.  Tiling and
+             * byte order were one flag; only the byte order half was right.
+             */
+            size_t texel = ((size_t)y * tp + x) * texture_bpp;
             /* The swizzle names a component of the little-endian texel word,
              * so component 0 is the lowest-addressed byte of the texel as the
              * texture unit would fetch it.  This VRAM is the guest CPU's
-             * big-endian view: see r350_vram_component_byte(). */
+             * big-endian view: see r350_vram_component_byte().
+             *
+             * Apple's combined-tile uploads are already byte-addressed RGBA
+             * resources.  Their identity component map and transparent-white
+             * sprite texels (ff ff ff 00) provide direct evidence that a
+             * second aperture reversal is wrong for this storage path. */
             textures[unit][((size_t)y*tw+x)*4+c]=sel==4 ? 0:sel==5 ? 255:
-                raw[((size_t)y*tp+x)*texture_bpp+
+                raw[texel+
                     (texture_bpp==1 ? 0 :
-                     r350_vram_component_byte(perm[texoffset&3][sel]))];
+                     (r350_rgba_tiled && !r350_tiled_swap()) ?
+                        perm[endian_swap][sel] :
+                     r350_vram_component_byte(perm[endian_swap][sel]))];
+        }
+        if (capture_scene_texture) {
+            g_autofree char *name = g_strdup_printf(
+                "draw-%u-texture-%u-%08x-%ux%u-f1-%08x-rgba.bin",
+                s->r350->draws_seen, unit, texoffset & ~31u, tw, th, format1);
+            g_autofree char *path = g_build_filename(s->r350_capture_dir,
+                                                     name, NULL);
+            g_file_set_contents(path, (const char *)textures[unit], output,
+                                NULL);
+            fprintf(stderr, "R350_SCENE_TEXTURE draw=%u unit=%u off=%08x "
+                    "%ux%u pitch=%u f1=%08x raw=%02x,%02x,%02x,%02x "
+                    "rgba=%02x,%02x,%02x,%02x\n",
+                    s->r350->draws_seen, unit, texoffset & ~31u, tw, th, tp,
+                    format1, raw[0], texture_bpp > 1 ? raw[1] : 0,
+                    texture_bpp > 2 ? raw[2] : 0,
+                    texture_bpp > 3 ? raw[3] : 0,
+                    textures[unit][0], textures[unit][1],
+                    textures[unit][2], textures[unit][3]);
         }
         if (s->r350_shader_snapshots && r350_diag_once(format1,texoffset&3u,0)) {
             fprintf(stderr,"R350_TEXDIAG draw=%u unit=%u f0=%08x f1=%08x f2=%08x "
@@ -8220,7 +8530,13 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         draw.textures[unit]=(R300MetalTexture){.rgba=textures[unit],.size=output,
             .width=tw,.height=th,.linear_filter=min>=2,
             .address_s=clamp_s,.address_t=clamp_t,
-            .max_anisotropy=min==3 ? 1u<<aniso : 1};
+            .max_anisotropy=min==3 ? 1u<<aniso : 1,
+            /* Record where it came from and how it was read even when the
+             * texels are staged rather than viewed: these fields were left
+             * zero for staged textures, so the log said "pitch0" for every
+             * one of them and could not show a pitch being read wrong. */
+            .guest_offset=texoffset & ~31u,
+            .guest_pitch=tp*texture_bpp};
         if (capture_texture) {
             g_autofree char *name = g_strdup_printf("draw-%u-texture-%u-rgba.bin",
                                                     s->r350->draws_seen,unit);
@@ -8377,10 +8693,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         /* Only once the application's own scene has started being drawn:
          * the window server composites continuously from the moment the
          * desktop appears, and those fill any cap long before Chess runs. */
-        static bool scene_started;
-        if (draw.depth_enable || draw.stencil_enable) {
-            scene_started = true;
-        }
+
         /* Every draw once the scene has started, not only those landing on
          * the scan-out: the window server may composite into a backing store
          * at some other offset, and requiring crtc_offset logged nothing. */
@@ -8397,6 +8710,69 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
          * bound fills the cap with wallpaper tiles long before the
          * application draws anything.  The low bits of a texture offset
          * carry tiling flags, so compare the address only. */
+        /*
+         * Who paints the pixels the user is actually looking at.
+         *
+         * Filtering by the scene's address found nothing -- no draw samples
+         * it -- which says the scene is not what reaches the window.  So ask
+         * the question from the other end: every draw whose scissor covers a
+         * point inside the application's window, with the surface it reads.
+         * Whatever is sampled there is what is on screen, and that is the
+         * buffer to go and look at.
+         */
+        {
+            static int probe_x = -1, probe_y;
+            static int wlogged;
+            if (probe_x < 0) {
+                const char *e = getenv("POWEREMU_R350_WIN");
+                probe_x = 0;
+                if (e && *e) {
+                    if (sscanf(e, "%d,%d", &probe_x, &probe_y) != 2) {
+                        probe_x = 780; probe_y = 400;
+                    }
+                }
+            }
+            /* Only once the application has started drawing its scene: the
+             * window server composites the wallpaper in strips from the
+             * moment the desktop appears, and those fill any cap long before
+             * the window being looked for exists. */
+            if (probe_x > 0 && r350_scene_started && wlogged < 60 &&
+                (int)draw.scissor[0] <= probe_x && probe_x < (int)draw.scissor[2] &&
+                (int)draw.scissor[1] <= probe_y && probe_y < (int)draw.scissor[3]) {
+                wlogged++;
+                /*
+                 * The geometry we actually fetch each texture with, not just
+                 * its address.  The scissor on these composites is the whole
+                 * screen whatever part of it they paint, so the address alone
+                 * cannot say which window a draw is for -- but a surface
+                 * fetched at the wrong pitch is visible immediately, and a
+                 * wrong fetch is the remaining way correct pixels in VRAM
+                 * reach the screen scrambled.
+                 */
+                GString *tx = g_string_new(NULL);
+                for (unsigned u = 0; u < R200_MAX_TEX; u++) {
+                    if (!draw.textures[u].guest_source &&
+                        !draw.textures[u].rgba) {
+                        continue;
+                    }
+                    g_string_append_printf(tx,
+                        " t%u=%08x/%ux%u/pitch%u/%s", u,
+                        draw.textures[u].guest_offset,
+                        draw.textures[u].width, draw.textures[u].height,
+                        draw.textures[u].guest_pitch,
+                        draw.textures[u].guest_source ? "vram" : "staged");
+                }
+                fprintf(stderr, "R350_WIN draw=%u tgt=%08x %ux%u nonzero=%zu "
+                        "tex=%08x,%08x TXFORMAT0=%08x TXFORMAT2=%08x%s "
+                        "vp=%.0f,%.0f,%.0fx%.0f\n",
+                        s->r350->draws_seen, offset, width, height,
+                        nz, RG(0x4540), RG(0x4544), RG(0x4480), RG(0x4500),
+                        tx->str,
+                        draw.viewport_x, draw.viewport_y,
+                        draw.viewport_width, draw.viewport_height);
+                g_string_free(tx, TRUE);
+            }
+        }
         if ((RG(0x4540) & ~0xfffu) == 0x17f5000 ||
             (RG(0x4544) & ~0xfffu) == 0x17f5000) {
             if (logged < 40) {
@@ -8427,11 +8803,72 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             }
         }
     }
+    /* Unconditionally, not inside a log's own env gate: this flag is what
+     * the other logs gate on, and setting it only when one of them is enabled
+     * left them all silent and looking like evidence of absence. */
+    if (draw.depth_enable || draw.stencil_enable) {
+        r350_scene_started = true;
+    }
     if (!direct) {
         uint8_t *destination=(uint8_t *)memory_region_get_ram_ptr(&s->vram)+offset;
         for(size_t i=0;i<draw.target_size;i+=4) {
             destination[i]=target[i+3];destination[i+1]=target[i];
             destination[i+2]=target[i+1];destination[i+3]=target[i+2];
+        }
+        /*
+         * Read the pixels back out of VRAM, from the device side.
+         *
+         * A monitor dump of this surface read all zeroes while the draw's own
+         * census said it had written a megabyte of non-zero pixels, which left
+         * two incompatible stories and no way to choose between them: the dump
+         * goes through a BAR base that has to be worked out, and getting it
+         * wrong looks exactly like a lost write-back.  Counting here needs no
+         * address at all -- it is the same pointer the write-back just used --
+         * so it settles whether the scene reaches guest memory.
+         */
+        if (unlikely(r350_vram_census())) {
+            static unsigned logged;
+            size_t vnz = 0, snz = 0;
+            for (size_t i = 0; i < draw.target_size; i++) {
+                if (destination[i]) { vnz++; }
+                if (target[i]) { snz++; }
+            }
+            if (logged < 40 && (draw.depth_enable || draw.stencil_enable)) {
+                logged++;
+                fprintf(stderr, "R350_VRAM draw=%u tgt=%08x %ux%u "
+                        "staging_nonzero=%zu vram_nonzero=%zu/%zu "
+                        "US_OUT_FMT=%08x out_swizzle=%s\n",
+                        s->r350->draws_seen, offset, width, height,
+                        snz, vnz, draw.target_size,
+                        RG(0x46a4),
+                        fp.out_swizzle[0] ? fp.out_swizzle : "rgba(default)");
+            }
+            /*
+             * The whole of VRAM, once, late enough that the application's
+             * window is on screen.  The scene is known to be correct in here
+             * and the screen is known to be wrong, so both the right pixels
+             * and the wrong ones are in this one image: whatever turned one
+             * into the other can be found by looking, without guessing an
+             * address from outside.  Outside the log cap -- the first forty
+             * scene draws happen before the window ever opens.
+             */
+            {
+                const char *dump = getenv("POWEREMU_R350_VRAMDUMP");
+                const char *at = getenv("POWEREMU_R350_VRAMDUMPAT");
+                static bool dumped;
+                unsigned when = at && *at ? (unsigned)atoi(at) : 0;
+                if (dump && *dump && !dumped &&
+                    s->r350->draws_seen >= (when ? when : 1u)) {
+                    dumped = true;
+                    g_autoptr(GError) err = NULL;
+                    bool ok = g_file_set_contents(dump,
+                        memory_region_get_ram_ptr(&s->vram), s->vram_size, &err);
+                    fprintf(stderr, "R350_VRAMDUMP path=%s bytes=%" PRIu64
+                            " draw=%u crtc=%08x result=%s\n", dump,
+                            s->vram_size, s->r350->draws_seen,
+                            s->regs.crtc_offset, ok ? "ok" : err->message);
+                }
+            }
         }
     }
     ppc_mac_gpu_dirty(s,offset,draw.target_size);
@@ -10881,6 +11318,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 
     /* RBBM - report idle with 64 free FIFO entries */
     case R200_RBBM_STATUS:
+        r350_status_reads++;
         /* bits [6:0] = CMDFIFO_AVAIL (free entries)
          * bit 31 = GUI_ACTIVE (1=busy, 0=idle)
          * bits [30:7] = various pipeline busy flags
@@ -11231,6 +11669,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 
     /* Wait/sync */
     case R200_WAIT_UNTIL:
+        r350_wait_reads++;
         /*
          * WAIT_UNTIL is write-to-trigger / read-for-completion.
          *
@@ -12317,10 +12756,18 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* Wait/sync */
     case R200_WAIT_UNTIL:
-        /* Writing WAIT_UNTIL on real hardware causes the CP to stall until
-         * the specified conditions are met. Since we execute everything
-         * synchronously, all conditions are always met instantly.
-         * Store 0 to indicate all waits satisfied (not the pending mask). */
+        /*
+         * Writing WAIT_UNTIL on real hardware stalls the CP until the
+         * named conditions hold.  The engine is only idle here once the
+         * pending Metal batch has landed, so answering without waiting
+         * for it tells the guest that drawing it cannot yet see is done.
+         * Writes arrive both from MMIO and as a type-0 packet from the
+         * ring; both come through this case.
+         */
+        r350_wait_writes++;
+        if (unlikely(r350_sync_waits())) {
+            r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE));
+        }
         s->regs.wait_until = 0;
         break;
     case R200_ISYNC_CNTL:
@@ -13377,7 +13824,8 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_BOOL("x-r350-linear-render", PPCMacGPUState, r350_linear_render, false),
     DEFINE_PROP_BOOL("x-r350-gated-routes", PPCMacGPUState, r350_gated_routes, false),
     DEFINE_PROP_BOOL("x-r350-direct-vram", PPCMacGPUState, r350_direct_vram, false),
-    DEFINE_PROP_BOOL("x-r350-aa-resolve", PPCMacGPUState, r350_aa_resolve, false),
+    /* Windowed OpenGL swaps use RB3D_AARESOLVE on Apple's R300 driver. */
+    DEFINE_PROP_BOOL("x-r350-aa-resolve", PPCMacGPUState, r350_aa_resolve, true),
     DEFINE_PROP_BOOL("x-r350-decode-rs", PPCMacGPUState, r350_decode_rs, false),
     DEFINE_PROP_STRING("x-r350-capture-dir", PPCMacGPUState, r350_capture_dir),
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
@@ -13401,6 +13849,34 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("host-native-height", PPCMacGPUState, host_native_h, 0),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
 };
+
+/*
+ * "x-vram-dump": write a file path, get all of VRAM as it is right now.
+ *
+ * Every trigger tied to the device's own activity fired at the wrong time.
+ * The application finishes drawing before its window is composited, so a dump
+ * on a draw caught the desktop with no window; a dump on a refresh needs a
+ * frame number nobody can predict.  Letting the harness ask for it means the
+ * dump and the screenshot are the same instant, which is the only way to
+ * compare what is in memory against what is on screen.
+ */
+static void ppc_mac_gpu_set_vram_dump(Object *obj, const char *path,
+                                      Error **errp)
+{
+    PPCMacGPUState *s = PPC_MAC_GPU(obj);
+    g_autoptr(GError) err = NULL;
+
+    if (!path || !*path) {
+        return;
+    }
+    if (!g_file_set_contents(path, memory_region_get_ram_ptr(&s->vram),
+                             s->vram_size, &err)) {
+        error_setg(errp, "vram dump failed: %s", err->message);
+        return;
+    }
+    fprintf(stderr, "R350_VRAMDUMP path=%s bytes=%" PRIu64 " crtc=%08x "
+            "result=ok\n", path, s->vram_size, s->regs.crtc_offset);
+}
 
 /* Read-only "perf": the running totals behind PowerEmu's overlay. */
 /*
@@ -13531,6 +14007,10 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                            perf->tex_agp, perf->agp_bytes, perf->vram_high,
                            s->regs.config_memsize);
     if (s->r350_probe) {
+        g_string_append_printf(out, " r350_waitw=%" PRIu64 " r350_waitr=%" PRIu64
+                               " r350_statusr=%" PRIu64,
+                               r350_wait_writes, r350_wait_reads,
+                               r350_status_reads);
         g_string_append_printf(out, " r350_draws=%" PRIu64 " r350_rejected=%" PRIu64
                                " r350_draw_ns=%" PRIu64 " r350_target_bytes=%" PRIu64
                                " r350_texture_bytes=%" PRIu64,
@@ -13741,6 +14221,9 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_str(klass, "perf", ppc_mac_gpu_get_perf, NULL);
+    /* Write a path to dump VRAM at that exact moment -- see the setter. */
+    object_class_property_add_str(klass, "x-vram-dump", NULL,
+                                  ppc_mac_gpu_set_vram_dump);
     object_class_property_add_str(klass, "trace", ppc_mac_gpu_get_trace,
                                   ppc_mac_gpu_set_trace);
 }
