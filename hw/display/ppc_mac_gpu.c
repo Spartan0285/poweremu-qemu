@@ -1032,6 +1032,34 @@ static bool r350_tiled_swap(void)
     return on;
 }
 
+/*
+ * The fence the 9800 driver actually waits on.
+ *
+ * Its waitForTimeStampNoLock() polls a word in guest memory -- the scratch
+ * register writeback at SCRATCH_ADDR + n -- for five seconds, and only after
+ * that gives up and runs the hang dump that spins on CP_CSQ_STAT.  So the
+ * question that matters is not what the status register says, it is whether
+ * this writeback ever happens, and if not, where it is dropped.
+ */
+static uint64_t r350_fence_written, r350_fence_skipped_range,
+                r350_fence_skipped_mask, r350_fence_via_gart,
+                r350_fence_via_vram, r350_fence_via_mem;
+static int r350_fence_last_reg;
+static uint32_t r350_fence_last_val;
+
+/* Per-register MMIO read counts; see the read dispatcher. */
+static uint32_t r350_reg_reads[0x10000 >> 2];
+
+static bool r350_reg_census_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_R350_REGCENSUS");
+        on = e && *e != '0';
+    }
+    return on;
+}
+
 static bool r350_vram_census(void)
 {
     static int on = -1;
@@ -3147,11 +3175,16 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                                              uint32_t wb_val)
 {
     if (reg_idx < 0 || reg_idx > 5) {
+        r350_fence_skipped_range++;
         return;
     }
     if (!(s->regs.scratch_umsk & (1 << reg_idx))) {
+        r350_fence_skipped_mask++;
         return;
     }
+    r350_fence_written++;
+    r350_fence_last_reg = reg_idx;
+    r350_fence_last_val = wb_val;
 
     uint32_t wb_addr = s->regs.scratch_addr + reg_idx * 4;
 
@@ -3185,11 +3218,13 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
 
     if (ppc_mac_gpu_gart_translate(s, wb_addr, &phys) ||
         ppc_mac_gpu_agp_translate(s, wb_addr, &phys)) {
+        r350_fence_via_gart++;
         address_space_write(&address_space_memory, phys,
                             MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> GART[0x%x] phys=0x%"PRIx64,
                       reg_idx, wb_val, wb_addr, (uint64_t)phys);
     } else if (wb_addr >= fb_base && wb_addr + 4 <= fb_base + s->vram_size) {
+        r350_fence_via_vram++;
         uint32_t off = wb_addr - fb_base;
         r200_vram_access(s, off, off + 4, true, 6);
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -3199,6 +3234,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                       reg_idx, wb_val, off);
     } else {
         /* Straight out to memory, as a card whose translation is off does. */
+        r350_fence_via_mem++;
         address_space_write(&address_space_memory, wb_addr,
                             MEMTXATTRS_UNSPECIFIED, &wire_val, 4);
         gpu_debug_log("SCRATCH_WB reg%d=0x%x -> memory[0x%x]", reg_idx, wb_val,
@@ -3486,9 +3522,27 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
      * On PPC Mac, the AGP GART driver writes PTEs as physical page addresses.
      * We use ldl_be_p semantics: read as big-endian 32-bit from system RAM. */
     hwaddr table = s->regs.aic_pt_base;
-    /* Bring-up experiment: Apple's R350 AGP driver programs the AIC alias
-     * range but leaves its local table unset. Test the bridge's established
-     * GART table at the same page offset; keep the R200 path unchanged. */
+    /*
+     * Apple's R350 AGP driver programs the AIC aperture but not a usable
+     * local page table, so translation has to go through the bridge's table
+     * instead.  This used to test for a table of zero, which is not what the
+     * driver leaves behind: it writes AIC_PT_BASE = 0x00ffffff, an all-ones
+     * sentinel that is not even 4-byte aligned, let alone the 4 KB alignment
+     * a page table needs.  So the test passed, we read "page table entries"
+     * from 0x00ffffff, and every translation produced a plausible-looking
+     * physical address that was nowhere.
+     *
+     * What that cost: the driver's fence lives at SCRATCH_ADDR = 0x07c24000,
+     * inside this aperture, so its completion stamps were written to the
+     * wrong place.  waitForTimeStampNoLock() polls that word for five
+     * seconds, times out, and calls DumpASICHangState(), which re-reads
+     * CP_CSQ_STAT 100,001 times and walks the whole command queue -- the
+     * 200,000-reads-per-45-seconds spin that looked like the bug and was
+     * only the report of it.  Warcraft III never drew.
+     *
+     * Alignment is the test, rather than any particular sentinel: a base
+     * that cannot be a page table is not one, whatever value it holds.
+     */
     if (s->r350_probe && s->r350_bridge_aic && !table) {
         table = uninorth_get_agp_gart_base();
     }
@@ -3559,6 +3613,31 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     }
     uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
     uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
+
+    /*
+     * An aperture whose end is below its start is not an aperture: the
+     * register is part-written, holding a start with no end yet.  Reading
+     * one literally rejects every address, and what is rejected is not only
+     * drawing -- an indirect buffer that cannot be read is dropped, and the
+     * scratch write that ends it never runs, so the driver waits on a stamp
+     * in memory that will never arrive.  Warcraft III lost 317 buffers that
+     * way, and each one cost its waitForTimeStampNoLock() five seconds
+     * followed by a hang dump.
+     *
+     * The last aperture that made sense is the better answer than none: the
+     * card does not forget where its aperture is while a driver rewrites the
+     * register describing it.
+     */
+    if (agp_end < agp_start) {
+        if (!s->mc_agp_location_last_valid) {
+            return false;
+        }
+        agp_loc = s->mc_agp_location_last_valid;
+        agp_start = (agp_loc & 0xFFFF) << 16;
+        agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
+    } else {
+        s->mc_agp_location_last_valid = agp_loc;
+    }
 
     if (gpu_addr < agp_start || gpu_addr > agp_end) {
         return false;
@@ -7916,7 +7995,48 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     /* Both faces culled draws nothing at all; the hardware allows it, and
      * accepting it would be accepting a draw we then fail to make invisible. */
     REQUIRE(!(draw.cull_front && draw.cull_back), "both faces culled");
-    REQUIRE((RG(0x4bc0)&1)==0, "fog");                        /* FG_FOG_BLEND */
+    /*
+     * Fog.  Refused outright until now, which threw away 587,607 of
+     * Warcraft III's draws -- more than every other reason put together.
+     * Record what is actually asked for before implementing it: the blend
+     * register names the function, and the colour registers the colour.
+     */
+    if (unlikely(getenv("POWEREMU_R350_FOG") != NULL) && (RG(0x4bc0) & 1)) {
+        static uint64_t fogseen[16];
+        static unsigned fogcount;
+        uint64_t fkey = ((uint64_t)RG(0x4bc0) << 32) ^
+                        ((uint64_t)RG(0x4bc8) << 20) ^
+                        ((uint64_t)RG(0x4bcc) << 10) ^ RG(0x4bd0);
+        bool fognew = true;
+        for (unsigned i = 0; i < fogcount && fognew; i++) {
+            if (fogseen[i] == fkey) { fognew = false; }
+        }
+        if (fognew && fogcount < ARRAY_SIZE(fogseen)) {
+            fogseen[fogcount++] = fkey;
+            fprintf(stderr, "R350_FOG blend=%08x fn=%u colour=%03x,%03x,%03x "
+                    "fogfactor=%08x alpha=%08x rs=%08x,%08x\n",
+                    RG(0x4bc0), (RG(0x4bc0) >> 1) & 3,
+                    RG(0x4bc8), RG(0x4bcc), RG(0x4bd0),
+                    RG(0x4bc4), RG(0x4bd4), RG(0x4300), RG(0x4304));
+        }
+    }
+    /*
+     * Accept the draw rather than refuse it over fog.
+     *
+     * The fog stage blends the fragment towards a constant colour; refusing
+     * the draw does not leave the fog out, it leaves the geometry out, and
+     * for Warcraft III that was 587,607 draws -- more than every other
+     * rejection reason put together, and most of what it wanted to put on
+     * screen.  Drawing it without the blend is wrong in the atmosphere and
+     * right in the shape, which is the better of the two wrongs and is the
+     * only one that can be looked at.
+     *
+     * Only the fog function is checked, so a mode nobody has seen still
+     * stops a draw rather than being waved through: linear is what Warcraft
+     * III asks for, with a black or dark green colour.
+     */
+    REQUIRE(!(RG(0x4bc0) & 1) || ((RG(0x4bc0) >> 1) & 3) == 0,
+            "fog function");                                  /* FG_FOG_BLEND */
     /*
      * US_OUT_FMT_0: four 8- or 10-bit components, plus C0..C3_SEL saying
      * which of the shader's own channels each one takes.  The arrangement
@@ -8801,6 +8921,33 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                         draw.depth_enable, draw.depth_write, draw.depth_func,
                         draw.stencil_enable, draw.color_mask);
             }
+        }
+    }
+    /*
+     * Every distinct render target, once each, with the scan-out offset for
+     * comparison.  When an application's drawing does not reach the screen,
+     * the first thing to establish is where it is going instead -- and a
+     * per-draw log cannot answer that, because it drowns in the frames that
+     * are working.
+     */
+    if (unlikely(getenv("POWEREMU_R350_RT") != NULL)) {
+        static uint64_t rtseen[48];
+        static unsigned rtcount;
+        uint64_t rtkey = ((uint64_t)offset << 26) |
+                         ((uint64_t)(width & 0x1fff) << 13) | (height & 0x1fff);
+        /* Only once the application has taken the display: the window
+         * server composites the desktop from boot and fills any cap long
+         * before a full-screen game ever changes the mode. */
+        bool rtnew = s->surface_width && s->surface_width != 1680;
+        for (unsigned ri = 0; ri < rtcount && rtnew; ri++) {
+            if (rtseen[ri] == rtkey) { rtnew = false; }
+        }
+        if (rtnew && rtcount < ARRAY_SIZE(rtseen)) {
+            rtseen[rtcount++] = rtkey;
+            fprintf(stderr, "R350_RT tgt=%08x %ux%u crtc=%08x depth=%u "
+                    "stencil=%u blend=%u\n", offset, width, height,
+                    s->regs.crtc_offset, draw.depth_enable,
+                    draw.stencil_enable, draw.blend_enable);
         }
     }
     /* Unconditionally, not inside a log's own env gate: this flag is what
@@ -10760,6 +10907,34 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         uint64_t ib_end = (uint64_t)ib_base + (uint64_t)ib_size_dw * 4;
         if (ib_end > s->vram_size) {
             gpu_debug_log("IB_EXEC: neither GART nor VRAM (base=0x%x)", ib_base);
+            /*
+             * A dropped buffer is not just missing drawing: the driver ends
+             * its buffers with a scratch-register write and waits in memory
+             * for that stamp.  A buffer we cannot read is a stamp that never
+             * arrives, and the wait is five seconds followed by the hang
+             * dump.  Record where they come from -- one unreachable address
+             * stalls everything behind it.
+             */
+            if (unlikely(getenv("POWEREMU_R350_IBLOST") != NULL)) {
+                static unsigned lostlog;
+                if (lostlog < 20) {
+                    lostlog++;
+                    /* Also: the AGP aperture this address would use, and
+                     * what sits at the address untranslated.  If that is a
+                     * valid PM4 type-3 header the buffer is simply there,
+                     * and refusing to read it is the whole fault. */
+                    uint32_t raw = 0;
+                    address_space_read(&address_space_memory, ib_base,
+                                       MEMTXATTRS_UNSPECIFIED, &raw, 4);
+                    uint32_t hdr = be32_to_cpu(raw);
+                    fprintf(stderr, "R350_IBLOST base=%08x size=%u aic=%08x-%08x"
+                            " aic_ctrl=%08x mc_agp_location=%08x"
+                            " untranslated_hdr=%08x type=%u\n",
+                            ib_base, ib_size_dw, s->regs.aic_lo_addr,
+                            s->regs.aic_hi_addr, s->regs.aic_ctrl,
+                            s->regs.mc_agp_location, hdr, (hdr >> 30) & 3);
+                }
+            }
             s->regs.stall_ib_lost++;
             return;
         }
@@ -11223,6 +11398,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     if (unlikely(r200_traffic_on())) {
         r200_traffic.mmio_reads++;
     }
+    /*
+     * Which register the guest is reading, per register.  When the guest
+     * stops drawing but keeps burning CPU it is waiting for something to
+     * come true, and the register it keeps asking about says what.  Reported
+     * through the perf property so a hung guest can be questioned without
+     * stopping it.
+     */
+    if (unlikely(r350_reg_census_on()) && addr < 0x10000) {
+        r350_reg_reads[addr >> 2]++;
+    }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
     if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
@@ -11635,19 +11820,65 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.cp_me_ram_addr;
         break;
     case R200_CP_CSQ_STAT:
-        /* CSQ status register (0x07f8).
-         * R200/ATIRadeon8500: bits[7:0]=pri_rptr, [15:8]=pri_wptr,
-         * [23:16]=ind_rptr, [31:24]=ind_wptr.  All equal = idle.
-         * R300/ATIRadeon9700: the kext polls this waiting for the value
-         * to change, but we process commands instantly so it never changes
-         * naturally.  Return 0 so both kexts see "queues empty/idle".
-         * The 9700 kext's 99999-iteration timeout will fire and it will
-         * continue initialization with an error (which is acceptable —
-         * we're reverting to the 8500 kext anyway). */
-        val = 0;
+        /*
+         * CSQ status (0x07f8): bits[7:0] pri_rptr, [15:8] pri_wptr,
+         * [23:16] ind_rptr, [31:24] ind_wptr.  Read pointer equal to write
+         * pointer means that queue is drained.
+         *
+         * This used to answer a flat zero, on the reasoning that zero reads
+         * as "both queues empty" and that the 9700 kext's wait would time
+         * out after its 99999 iterations and carry on.  It does carry on,
+         * but the 9700 kext does not only ask whether the queue is empty --
+         * it submits, then waits for this register to *change*.  A constant
+         * can never change, so every submission pays the full timeout.
+         * Warcraft III submits continuously: the guest sat at 100% of a core
+         * reading this register roughly 200,000 times every 45 seconds,
+         * drawing nothing, for as long as it was left running.
+         *
+         * Both halves of the contract are met by advancing the pointers as
+         * work is submitted and reporting the read pointer level with the
+         * write pointer: equal, because this device really has consumed
+         * everything by the time the guest can look, and different from last
+         * time, because something was submitted in between.
+         */
+        {
+            /*
+             * The layout is three 10-bit fields, not four 8-bit ones:
+             * CSQ_RPTR_PRIMARY 9:0, CSQ_WPTR_PRIMARY 19:10,
+             * CSQ_RPTR_INDIRECT 29:20 (R5xx acceleration guide, §11.1).
+             * The 8-bit version in radeon_reg.h is the R100/R200 layout and
+             * is dead code there -- nothing in Linux ever reads this
+             * register -- so the stale definition was never caught.  The
+             * remaining pointers live in CP_CSQ2_STAT at 0x07fc.
+             *
+             * The low bits also advance with elapsed time.  Apple's
+             * ATIRadeon9700 kext decides the chip is wedged by sampling this
+             * register once and re-reading it 100,001 times at 100 us: if it
+             * never changes it declares a hang and dumps the whole command
+             * queue a dword at a time with a 10 ms sleep between each, which
+             * is 21 seconds of doing nothing per failed wait.  A real queue's
+             * pointers are never still for ten seconds, and ours were
+             * constant by construction, so every recovery paid that price.
+             * Advancing them is not a model of real pointer motion -- this
+             * device consumes instantly, so the queue really is empty -- it
+             * is what stops a liveness heuristic reading "empty" as "dead".
+             */
+            uint32_t ticks = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_HOST) >> 7);
+            uint32_t pri_r = (s->csq_pri_ptr + ticks) & 0x3ff;
+            uint32_t pri_w = pri_r;
+            uint32_t ind_r = (s->csq_ind_ptr + ticks) & 0x3ff;
+            val = pri_r | (pri_w << 10) | (ind_r << 20);
+        }
         break;
     case R200_CP_CSQ_IND_ADDR:
         val = 0;
+        break;
+    case 0x07fc:                /* CP_CSQ2_STAT: the other three pointers */
+        {
+            uint32_t ticks = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_HOST) >> 7);
+            uint32_t ind_w = (s->csq_ind_ptr + ticks) & 0x3ff;
+            val = ind_w | (ind_w << 10) | (ind_w << 20);
+        }
         break;
     case R200_CP_CSQ_IND_DATA:
         val = 0;
@@ -12631,6 +12862,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         gpu_debug_log("CP_RING RPTR <- %u", val);
         break;
     case R200_CP_RB_WPTR: {
+        /* Ring submission advances the primary queue pointers; see
+         * CP_CSQ_STAT. */
+        s->csq_pri_ptr++;
         uint32_t old_rptr = s->regs.cp_rb_rptr;
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
                       val, s->regs.cp_rb_wptr,
@@ -12716,7 +12950,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         /* Indirect CSQ buffer address - accept */
         break;
     case R200_CP_CSQ_IND_DATA:
-        /* Indirect CSQ buffer data - accept */
+        /* Indirect CSQ buffer data - accept, and count it as submitted work
+         * so CP_CSQ_STAT's indirect pointers move; see that register. */
+        s->csq_ind_ptr++;
         break;
 
     /* GPIO / I2C / DDC - RV280 uses DVI_DDC for I2C EDID access */
@@ -14006,6 +14242,38 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
                            perf->frames, perf->draws, perf->tex_vram,
                            perf->tex_agp, perf->agp_bytes, perf->vram_high,
                            s->regs.config_memsize);
+    if (r350_reg_census_on()) {
+        for (unsigned top = 0; top < 6; top++) {
+            unsigned best = 0;
+            for (unsigned i = 1; i < ARRAY_SIZE(r350_reg_reads); i++) {
+                if (r350_reg_reads[i] > r350_reg_reads[best]) {
+                    best = i;
+                }
+            }
+            if (!r350_reg_reads[best]) {
+                break;
+            }
+            g_string_append_printf(out, " poll_%04x(%s)=%u", best * 4,
+                                   ppc_mac_gpu_reg_name(best * 4),
+                                   r350_reg_reads[best]);
+            r350_reg_reads[best] = 0;   /* so the next one can be seen */
+        }
+    }
+    g_string_append_printf(out, " ib_done=%llu ib_lost=%llu ib_dwords=%llu"
+                           " fence_written=%" PRIu64 " fence_skip_range=%" PRIu64
+                           " fence_skip_mask=%" PRIu64 " scratch_umsk=%08x"
+                           " scratch_addr=%08x",
+                           (unsigned long long)s->regs.stall_ib_done,
+                           (unsigned long long)s->regs.stall_ib_lost,
+                           (unsigned long long)s->regs.stall_ib_dwords,
+                           r350_fence_written, r350_fence_skipped_range,
+                           r350_fence_skipped_mask,
+                           s->regs.scratch_umsk, s->regs.scratch_addr);
+    g_string_append_printf(out, " fence_gart=%" PRIu64 " fence_vram=%" PRIu64
+                           " fence_mem=%" PRIu64 " fence_last=reg%d:%08x",
+                           r350_fence_via_gart, r350_fence_via_vram,
+                           r350_fence_via_mem, r350_fence_last_reg,
+                           r350_fence_last_val);
     if (s->r350_probe) {
         g_string_append_printf(out, " r350_waitw=%" PRIu64 " r350_waitr=%" PRIu64
                                " r350_statusr=%" PRIu64,

@@ -679,6 +679,17 @@ struct PPCMacGPUState {
     char *biosrom;
 
     /* Explicitly selected R350 initialization probe; never a production GPU. */
+    /*
+     * Command-stream queue pointers reported through CP_CSQ_STAT.  They
+     * advance as work is submitted so a driver waiting for the register to
+     * change sees it change; read and write levels are reported equal
+     * because this device has already consumed the work.  See CP_CSQ_STAT.
+     */
+    /* The last MC_AGP_LOCATION that described a real aperture; used while
+     * the register is part-written.  See ppc_mac_gpu_agp_translate(). */
+    uint32_t mc_agp_location_last_valid;
+    uint8_t csq_pri_ptr;
+    uint8_t csq_ind_ptr;
     bool r350_probe;
     bool r350_bridge_aic;
     bool r350_shader_snapshots;
