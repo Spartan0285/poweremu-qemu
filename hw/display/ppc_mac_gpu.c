@@ -4298,6 +4298,23 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         return;
     }
 
+    /*
+     * The MMIO blit path.  The 9200 issues 377 of these for the same
+     * workload and the 9800 issues none, which is the difference between a
+     * window that shows the application's scene and one that does not.
+     */
+    if (getenv("POWEREMU_R350_BLIT")) {
+        static unsigned said;
+        if (said < 24) {
+            said++;
+            fprintf(stderr, "R350_MMIO src=%08x/%u (%u,%u) dst=%08x/%u (%u,%u)"
+                    " %ux%u rop=%02x srctype=%u\n",
+                    src_offset, src_pitch, src_x, src_y,
+                    dst_offset, dst_pitch, dst_x, dst_y,
+                    blit_w, blit_h, rop3, src_type);
+        }
+    }
+
     /* Path instrumentation: log MMIO combined blit with its packed state */
     g_blit_stats.mmio_count++;
     {
@@ -4911,6 +4928,24 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
             uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
             src_is_agp = (src_offset >= agp_start && src_offset <= agp_end);
+        }
+    }
+
+    /*
+     * The composite, when it comes through this path.  The existing log above
+     * stops at the first 500 blits, which is early boot; the copy that
+     * carries an application's off-screen surface to its window happens much
+     * later and never appeared in it.
+     */
+    if (getenv("POWEREMU_R350_BLIT") && src_offset >= 0x1000000 &&
+        src_offset < 0x8000000) {
+        static unsigned said;
+        if (said < 24) {
+            said++;
+            fprintf(stderr, "R350_SEP src=%08x/%u (%u,%u) dst=%08x/%u (%u,%u)"
+                    " %ux%u rop=%02x\n",
+                    src_offset, src_pitch, src_x, src_y,
+                    dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h, rop3);
         }
     }
 
@@ -8346,14 +8381,33 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         if (draw.depth_enable || draw.stencil_enable) {
             scene_started = true;
         }
-        if (offset == s->regs.crtc_offset && scene_started) {
-            if (logged < 60) {
+        /* Every draw once the scene has started, not only those landing on
+         * the scan-out: the window server may composite into a backing store
+         * at some other offset, and requiring crtc_offset logged nothing. */
+        /* The composite that paints the application's window: a draw onto
+         * the framebuffer that samples a surface up in the off-screen
+         * region, which is where the scene lives. */
+        /* Every draw onto the framebuffer, whatever it samples: the filter
+         * on texture unit 0 found nothing, and the composite may use another
+         * unit. */
+        /* Any draw that SAMPLES the application's 3D surface, wherever it
+         * writes: that is the flush from the scene into the window's backing
+         * store, which the compositor then paints onto the framebuffer. */
+        /* The scene surface exactly, not merely "somewhere high": a loose
+         * bound fills the cap with wallpaper tiles long before the
+         * application draws anything.  The low bits of a texture offset
+         * carry tiling flags, so compare the address only. */
+        if ((RG(0x4540) & ~0xfffu) == 0x17f5000 ||
+            (RG(0x4544) & ~0xfffu) == 0x17f5000) {
+            if (logged < 40) {
                 logged++;
-                fprintf(stderr, "R350_COMP draw=%u tgt=%08x %ux%u nonzero=%zu "
-                        "tex0=%08x fmt0=%08x fmt1=%08x fmt2=%08x "
+                fprintf(stderr, "R350_COMP draw=%u tgt=%08x crtc=%08x %ux%u nonzero=%zu "
+                        "tex=%08x,%08x,%08x,%08x fmt0=%08x fmt2=%08x pitch=%08x "
                         "scissor=%u,%u,%u,%u vp=%.0f,%.0f,%.0fx%.0f\n",
-                        s->r350->draws_seen, offset, width, height, nz,
-                        RG(0x4540), RG(0x44c0), RG(0x44e0), RG(0x4500),
+                        s->r350->draws_seen, offset, s->regs.crtc_offset,
+                        width, height, nz,
+                        RG(0x4540), RG(0x4544), RG(0x4548), RG(0x454c),
+                        RG(0x44c0), RG(0x4500), RG(0x4580),
                         draw.scissor[0], draw.scissor[1],
                         draw.scissor[2], draw.scissor[3],
                         draw.viewport_x, draw.viewport_y,
@@ -9301,6 +9355,22 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                      * Record all SRCCOPY BLITs from off-screen RTs.
                      * This captures the RT→screen mapping that the 3D
                      * renderer needs for coordinate transforms. */
+                    /* The composite: the window server copying an
+                     * application's off-screen surface to the screen.  This
+                     * is the step that carries Chess's scene to its window,
+                     * and the one the picture says is going wrong. */
+                    if (rop3 == 0xCC && src_offset >= 0x100000 &&
+                        getenv("POWEREMU_R350_BLIT")) {
+                        static unsigned said;
+                        if (said < 30) {
+                            said++;
+                            fprintf(stderr, "R350_BLIT src=%08x/%u (%u,%u) "
+                                    "dst=%08x/%u (%u,%u) %ux%u\n",
+                                    src_offset, src_pitch, src_x, src_y,
+                                    dst_offset, dst_pitch, dst_x, dst_y,
+                                    blit_w, blit_h);
+                        }
+                    }
                     if (rop3 == 0xCC && src_offset >= 0x100000) {
                         blit_region_record(src_offset, src_pitch,
                                            src_x, src_y,
