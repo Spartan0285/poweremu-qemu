@@ -7824,7 +7824,15 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * that physical row length before presenting it.  Reading the same bytes
      * at the visible width advances every following row too early and turns
      * an otherwise valid desktop into horizontal bands. */
-    if (offset == s->regs.crtc_offset && width * 4 >= s->disp.width * 4) {
+    /*
+     * POWEREMU_R350_NOPITCH leaves the card's present pitch alone, to test
+     * whether this is the origin of the banding.  Any scan-out-targeted draw
+     * rewrites global display state from its own RB3D_COLORPITCH here, and a
+     * present pitch that does not match the scan-out renders as exactly the
+     * horizontal banding both applications show.
+     */
+    if (offset == s->regs.crtc_offset && width * 4 >= s->disp.width * 4
+        && !getenv("POWEREMU_R350_NOPITCH")) {
         r200_set_present_pitch(s, width * 4);
     }
     int x0 = MAX(0,MAX((int)(RG(0x43e0)&8191)-1440,
@@ -7904,7 +7912,18 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             uint32_t half=(a&1) ? packed>>16 : packed&0xffff;
             array_count[a]=half&255;array_stride[a]=(half>>8)&255;
             array_address[a]=RG(0x20c8+(a/2)*12+(a&1)*4);
-            REQUIRE(array_count[a] && array_stride[a]>=array_count[a] &&
+            /*
+             * A stride of zero is not a malformed array: it is how the
+             * hardware expresses an attribute that does not advance, so every
+             * vertex reads the same element.  Chess uses one on 76 of its
+             * draws -- the last thing this path refused -- and the fetch
+             * below already does the right thing with it, because it
+             * multiplies the vertex index by the stride and zero keeps it on
+             * the first element.  Only this check stood in the way.
+             */
+            REQUIRE(array_count[a] &&
+                    (array_stride[a] == 0 ||
+                     array_stride[a] >= array_count[a]) &&
                     total+array_count[a]<=64,"invalid vertex array layout");
             total+=array_count[a];
         }
@@ -8291,6 +8310,69 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * framebuffer write until target lifetime/synchronization is modeled. */
     REQUIRE(s->r350_gated_routes || !dual_tex_route,
             "dual-texture output validation pending");
+    /*
+     * Did the render produce anything at all?
+     *
+     * The staging buffer is seeded from this same VRAM and written back
+     * verbatim, so an all-zero surface afterwards says nothing about whether
+     * the writeback works -- a draw that rasterises nothing leaves exactly
+     * the same bytes.  Counting non-zero bytes in the staged result separates
+     * "rendered nothing" from "lost on the way back", which reading VRAM
+     * cannot.
+     */
+    if (!direct && getenv("POWEREMU_R350_OUT")) {
+        static unsigned logged;
+        size_t nz = 0;
+        for (size_t i = 0; i < draw.target_size; i++) {
+            if (target[i]) { nz++; }
+        }
+        /* Only the off-screen targets: the desktop's own draws fill the cap
+         * long before the application starts, and they are not in question --
+         * they produce pixels. */
+        /* Only the draws in question: depth or stencil.  Everything else --
+         * the window server's composite quads, which have neither -- fills
+         * the cap long before the application's scene is drawn, and those are
+         * known to produce pixels. */
+        /*
+         * The composite: draws that land on the scan-out.  Chess's scene is
+         * rendered off-screen and something has to carry it to the window --
+         * if that is a textured quad, one of these samples the scene buffer,
+         * and its texture offset says so.
+         */
+        /* Only once the application's own scene has started being drawn:
+         * the window server composites continuously from the moment the
+         * desktop appears, and those fill any cap long before Chess runs. */
+        static bool scene_started;
+        if (draw.depth_enable || draw.stencil_enable) {
+            scene_started = true;
+        }
+        if (offset == s->regs.crtc_offset && scene_started) {
+            if (logged < 60) {
+                logged++;
+                fprintf(stderr, "R350_COMP draw=%u tgt=%08x %ux%u nonzero=%zu "
+                        "tex0=%08x fmt0=%08x fmt1=%08x fmt2=%08x "
+                        "scissor=%u,%u,%u,%u vp=%.0f,%.0f,%.0fx%.0f\n",
+                        s->r350->draws_seen, offset, width, height, nz,
+                        RG(0x4540), RG(0x44c0), RG(0x44e0), RG(0x4500),
+                        draw.scissor[0], draw.scissor[1],
+                        draw.scissor[2], draw.scissor[3],
+                        draw.viewport_x, draw.viewport_y,
+                        draw.viewport_width, draw.viewport_height);
+            }
+        }
+        if (draw.depth_enable || draw.depth_write || draw.stencil_enable) {
+            if (logged < 400) {
+                logged++;
+                fprintf(stderr, "R350_OUT draw=%u tgt=%08x %ux%u nonzero=%zu/%zu "
+                        "cull=%u/%u/%u z=%u/%u/%u st=%u mask=%x\n",
+                        s->r350->draws_seen, offset, width, height,
+                        nz, draw.target_size,
+                        draw.cull_front, draw.cull_back, draw.front_is_cw,
+                        draw.depth_enable, draw.depth_write, draw.depth_func,
+                        draw.stencil_enable, draw.color_mask);
+            }
+        }
+    }
     if (!direct) {
         uint8_t *destination=(uint8_t *)memory_region_get_ram_ptr(&s->vram)+offset;
         for(size_t i=0;i<draw.target_size;i+=4) {

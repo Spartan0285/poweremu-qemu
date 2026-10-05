@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ppc_mac_gpu_r300_vp.h"
+#include "ati_r350_pvs.h"   /* cat7/qemu's decoder, for cross-checking */
 
 typedef struct VPWriter {
     char *out;
@@ -390,6 +391,42 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
     }
     return true;
 fail:
+    /*
+     * Ask cat7/qemu's decoder what it makes of the same program.
+     *
+     * Theirs (ati_r350_pvs.c) was built against a live capture corpus from
+     * Mac OS X's own ATIRadeon9700 driver; this one was reconstructed from
+     * AMD's register documents and has been wrong about field widths three
+     * times today.  When this translator refuses a program and theirs calls
+     * it valid, the fault is here -- which is the fastest way to find out
+     * before swapping one for the other.
+     *
+     * Read-only: nothing downstream uses the result yet.
+     */
+    {
+        static bool compared;
+        if (!compared) {
+            R300PvsProgram theirs;
+            uint32_t slot_valid[R300_VP_MAX_INSTRUCTIONS / 32] = {0};
+            unsigned q;
+
+            compared = true;
+            /* theirs keeps one bit per slot; this one keeps a nibble. */
+            for (q = 0; q < R300_VP_MAX_INSTRUCTIONS; q++) {
+                if (p->code_valid[q] == 15) {
+                    slot_valid[q / 32] |= 1u << (q % 32);
+                }
+            }
+            memset(&theirs, 0, sizeof(theirs));
+            r300_pvs_analyse(&theirs, &p->code[0][0], slot_valid,
+                             R300_VP_MAX_INSTRUCTIONS, NULL, 0,
+                             p->control[0], p->control[1], 0);
+            fprintf(stderr, "[R350_VP_XCHECK] ours refused (%s); cat7: "
+                    "valid=%d range=%u..%u out_mask=%08x\n",
+                    reason, (int)theirs.valid, theirs.first, theirs.last,
+                    theirs.out_mask);
+        }
+    }
     /*
      * The program itself, once, whatever turned it away.
      *

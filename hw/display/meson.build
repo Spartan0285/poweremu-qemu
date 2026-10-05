@@ -62,6 +62,12 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
 system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
+  # cat7/qemu's R300/R350 shader translators (see their headers for the
+  # authorship).  Only the translators: they take raw program words and
+  # depend on nothing but osdep and their own headers, so they drop in
+  # without cat7's device, its OpenGL backend, or a Mac Edition FCode ROM.
+  'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c',
+  'ati_r350_us.c', 'ati_r350_us_glsl.c',
   'ppc_mac_gpu.c',
   'ppc_mac_gpu_renderer_sw.c',
   'ppc_mac_gpu_vp.c',

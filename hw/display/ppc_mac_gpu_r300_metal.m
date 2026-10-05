@@ -227,7 +227,7 @@ static id<MTLDepthStencilState> r300_dss(id<MTLDevice> dev, const R300MetalDraw 
     unsigned func = d->depth_enable ? (d->depth_func & 7) : 7;
     uint64_t key = func | (d->depth_write ? 8u : 0u);
 
-    if (d->stencil_enable) {
+    if (d->stencil_enable && !getenv("POWEREMU_R350_NOSTENCIL")) {
         key |= 1ull << 4;
         for (int f = 0; f < 2; f++) {
             key |= (uint64_t)(d->stencil_func[f] & 7)  << (5 + f * 12);
@@ -524,6 +524,21 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
              * guest's own clear is a draw with the compare set to ALWAYS,
              * which lands on the cleared texture and agrees with it.
              */
+            /*
+             * Bisect switches, each isolating one thing introduced today:
+             *   POWEREMU_R350_NOCULL   -- cull nothing (the winding convention
+             *                             has never run on a path that
+             *                             produced correct pixels)
+             *   POWEREMU_R350_ZCLEAR   -- clear depth and stencil every pass,
+             *                             rather than once per buffer
+             *   POWEREMU_R350_NOSTENCIL-- ignore the stencil test
+             */
+            static int no_cull = -1, always_clear = -1, no_stencil = -1;
+            if (no_cull < 0) {
+                no_cull = getenv("POWEREMU_R350_NOCULL") != NULL;
+                always_clear = getenv("POWEREMU_R350_ZCLEAR") != NULL;
+                no_stencil = getenv("POWEREMU_R350_NOSTENCIL") != NULL;
+            }
             id<MTLTexture> depth_tex = nil;
             bool depth_fresh = false;
             if (d->depth_enable || d->depth_write || d->stencil_enable) {
@@ -532,6 +547,7 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
                 if (!depth_tex) {
                     return fail(error,error_size,"depth buffer unavailable");
                 }
+                if (always_clear) { depth_fresh = true; }
             }
             MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
             if (depth_tex) {
@@ -555,14 +571,15 @@ bool r300_metal_draw(void *renderer, const R300MetalDraw *d,
             [encoder setRenderPipelineState:pipeline];
             if (depth_tex) {
                 [encoder setDepthStencilState:r300_dss(ctx->device, d)];
-                if (d->stencil_enable) {
+                if (d->stencil_enable && !no_stencil) {
                     [encoder setStencilReferenceValue:d->stencil_ref];
                 }
             }
             [encoder setViewport:(MTLViewport){d->viewport_x,d->viewport_y,d->viewport_width ?: d->width,
                 d->viewport_height ?: d->height,0,1}];
             [encoder setScissorRect:(MTLScissorRect){d->scissor[0],d->scissor[1],d->scissor[2],d->scissor[3]}];
-            [encoder setCullMode:d->cull_front ? MTLCullModeFront :
+            [encoder setCullMode:no_cull ? MTLCullModeNone :
+                                 d->cull_front ? MTLCullModeFront :
                                  d->cull_back ? MTLCullModeBack : MTLCullModeNone];
             [encoder setFrontFacingWinding:d->front_is_cw ?
                 MTLWindingClockwise : MTLWindingCounterClockwise];
