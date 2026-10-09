@@ -23,6 +23,8 @@ typedef struct R300VPProgram {
     uint32_t flow_control;       /* 0x22dc: reject branching until implemented */
     uint32_t attribute_mask;     /* host linkage: populated float4 attributes */
     uint32_t varying_mask;
+    uint32_t varying_colour_mask; /* RS colour inputs, clamped before interpolation */
+    uint8_t colour_clamp_mode;   /* GA_ROUND_MODE bits 4/5: extended RGB/alpha */
     uint8_t varying_output[R300_FP_MAX_INPUTS]; /* VP output feeding each FS input */
     uint32_t varying_constant_mask; /* RS-generated constants feeding FS inputs */
     float varying_constant[R300_FP_MAX_INPUTS][4];
@@ -30,8 +32,19 @@ typedef struct R300VPProgram {
     float point_half_clip_x;      /* rectangle expansion from point center */
     float point_half_clip_y;
     bool expand_point_rect;       /* six duplicated inputs become two triangles */
+    /*
+     * A dedicated varying carrying the fog source, outside the v0..vN
+     * register file.  It cannot ride in that file: a fragment input there
+     * costs a temporary register the program did not declare, and the Metal
+     * backend also requires the varying and input masks to match exactly.
+     */
+    bool fog_varying;
+    uint8_t fog_output;           /* vertex output index feeding it */
     bool zero_initialize_temporaries; /* captured Apple programs read unwritten lanes */
     bool flip_y;                 /* adapt positive guest viewport Y scale to Metal */
+    unsigned window_position_width, window_position_height;
+    /* Nonzero for clip-disabled, unit-scale programmable screen-space points.
+     * Their Z is already window depth in [0,1], not GL clip depth. */
 } R300VPProgram;
 
 /* Appends a vertex shader to MSL emitted by r300_fp_compile_msl, which defines

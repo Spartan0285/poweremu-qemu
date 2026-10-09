@@ -160,6 +160,10 @@ static bool r300_pvs_math(unsigned opcode, const float a[4], const float b[4],
             res[3] = 1.0f;
         }
         return true;
+    case R300_ME_POWER_FUNC_FF:
+        y = c[3] == 0.0f ? 1.0f :
+            x < 0.0f ? -powf(-x, c[3]) : powf(x, c[3]);
+        break;
     case R300_ME_RECIP_DX:
         y = x != 0.0f ? 1.0f / x : FLT_MAX;
         break;
@@ -180,6 +184,9 @@ static bool r300_pvs_math(unsigned opcode, const float a[4], const float b[4],
         break;
     case R300_ME_LOG_BASE2_FULL_DX:
         y = x != 0.0f ? log2f(fabsf(x)) : -FLT_MAX;
+        break;
+    case R300_ME_POWER_FUNC_FF_CLAMP_01:
+        y = x <= 0.0f ? 0.0f : x > 1.0f ? 1.0f : powf(x, b[3]);
         break;
     default:
         return false;

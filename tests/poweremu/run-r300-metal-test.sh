@@ -13,7 +13,11 @@ clang -std=c11 -Wall -Wextra -Werror -DR300_FP_STANDALONE \
 clang -std=c11 -Wall -Wextra -Werror -I"$root/hw/display" \
     "$root/tests/poweremu/r300-data-test.c" "$out/data.o" -o "$out/data-test"
 "$out/data-test"
+clang -fno-objc-arc -Wno-deprecated-declarations -I"$root/hw/display" \
+    -c "$root/hw/display/ppc_mac_gpu_r300_metal.m" -o "$out/backend.o"
+clang -fno-objc-arc -I"$root/hw/display" \
+    -c "$root/hw/display/ppc_mac_gpu_submit.m" -o "$out/submit.o"
 clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations \
-    -I"$root/hw/display" "$root/tests/poweremu/r300-metal-test.m" "$out/fp.o" "$out/vp.o" "$out/data.o" \
+    -I"$root/hw/display" "$root/tests/poweremu/r300-metal-test.m" "$out/fp.o" "$out/vp.o" "$out/data.o" "$out/backend.o" "$out/submit.o" \
     -framework Foundation -framework Metal -o "$out/test"
 "$out/test"

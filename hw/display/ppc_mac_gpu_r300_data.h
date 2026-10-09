@@ -14,6 +14,19 @@ typedef struct R300VertexInput {
  * exponent-all-ones encodings are rejected pending hardware validation. */
 bool r300_float24_decode(uint32_t word, float *value);
 
+/* Map a declared byte component (0..3) and texture swap (0..3) to storage.
+ * aperture_reversed describes our CPU-facing local VRAM contract; AGP
+ * client storage has not crossed that CPU aperture and must pass false. */
+unsigned r300_texture_byte_lane(unsigned component, unsigned byte_swap,
+                                bool aperture_reversed);
+
+/* Packed U,Y0,V,Y1 video-range BT.601 to RGBA8. Pitch is in pixels;
+ * byte_swap is the texture's four-byte group permutation (0..3).
+ * Validate both buffers and the complete row layout before writing. */
+bool r300_yvyu422_decode(const uint8_t *source, size_t source_bytes,
+                         unsigned width, unsigned height, unsigned pitch,
+                         unsigned byte_swap, uint8_t *rgba, size_t rgba_bytes);
+
 /* Input words are canonical host uint32_t values after PM4 byte swapping.
  * Stream entries describe packed fields in order; EXT selects vector lanes.
  * Supported: FLOAT1..4 and unsigned BYTE/D3DCOLOR, normalized or integer.

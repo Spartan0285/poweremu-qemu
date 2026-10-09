@@ -83,11 +83,10 @@ typedef struct R300MetalDraw {
      *
      * The guest's depth buffer is in VRAM and Metal cannot alias a depth
      * texture onto a buffer, so one private texture per (offset, pitch)
-     * stands in for it -- the arrangement the R200 backend already uses.
-     * Nothing is written back to the guest's own buffer yet: Chess clears
-     * depth by drawing a full-screen pass with the compare set to ALWAYS, so
-     * the private copy is kept in step without having to mirror the guest's
-     * memory.
+     * stands in for it. Guest readback/export is experimental until layout
+     * support and allocation ownership are complete. Full-screen
+     * ALWAYS draws and the 3D_CLEAR_ZMASK handler both update the private
+     * attachment; writing a clear into VRAM alone cannot update it.
      *
      * depth_func is the hardware's own encoding, which is the same eight
      * values as the colour compare: 0 never, 1 less, ... 7 always.
@@ -124,13 +123,27 @@ typedef struct R300MetalDraw {
     bool depth_write;        /* write results into it */
     unsigned depth_func;     /* 0..7, meaningful when depth_enable */
     uint32_t depth_offset;   /* VRAM offset of the guest's buffer */
+    const void *depth_guest_vram; /* verify singleton shared-buffer ownership */
+    uint32_t depth_guest_offset; /* byte offset in host shared VRAM */
     uint32_t depth_pitch;    /* pixels per row */
+    unsigned depth_format;  /* 0: Z16, 2: Z24S8 */
+    bool depth_tiled_export; /* experimental two-sample R350 Z24S8 export */
+    uint64_t depth_guest_size;
 } R300MetalDraw;
 
 void *r300_metal_create(void);
 void r300_metal_destroy(void *renderer);
-/* Synchronous correctness path: only premultiplied-over blending; no depth/stencil/tiling.
- * Device-side decoding must reject such state until an implementation exists.
+/* Full fast clear of the private depth/stencil attachment used by R350. */
+bool r300_metal_clear_depth(void *renderer, uint32_t offset, uint32_t pitch,
+                            double depth, unsigned stencil, bool clear_stencil,
+                            char *error, size_t error_size);
+/* Materialize rows of private depth that overlap a guest VRAM read. */
+bool r300_metal_read_depth(void *renderer, uint32_t fb_base, uint8_t *vram,
+                           uint64_t vram_size, uint64_t lo, uint64_t hi,
+                           char *error, size_t error_size);
+/* Synchronous correctness path, with validated blending and private depth/
+ * stencil attachments. Physical guest tiling and depth readback are not
+ * implemented; device-side decoding must restrict unsupported state.
  * Viewport covers the target; vertex shader supplies GL clip coordinates.
  * May be used by offline replay and, later, the isolated R350 device. */
 bool r300_metal_draw(void *renderer, const R300MetalDraw *draw,

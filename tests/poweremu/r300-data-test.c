@@ -7,6 +7,59 @@
 
 int main(void)
 {
+    /* Captured Warcraft glyph storage: white RGB with smooth alpha in
+     * byte 3. The former extra AGP reversal made alpha opaque and moved
+     * coverage into blue, giving jagged yellow lettering. Also verify a
+     * non-gray texel and the corresponding CPU-aperture VRAM encoding. */
+    const uint8_t glyphs[3][4][4] = {
+        {{255,255,255,0}, {255,255,0,255}, {0,255,255,255}, {255,0,255,255}},
+        {{255,255,255,32}, {255,255,32,255}, {32,255,255,255}, {255,32,255,255}},
+        {{30,20,10,64}, {20,30,64,10}, {64,10,20,30}, {10,64,30,20}}
+    };
+    const uint8_t glyph_expected[3][4] = {{255,255,255,0}, {255,255,255,32},
+                                    {10,20,30,64}};
+    const unsigned bgra[4] = {2,1,0,3};
+    for (unsigned pixel=0; pixel<3; pixel++) {
+        for (unsigned swap=0; swap<4; swap++) {
+            uint8_t local[4];
+            const uint8_t *agp = glyphs[pixel][swap];
+            for (unsigned c=0; c<4; c++) local[3-c] = agp[c];
+            for (unsigned c=0; c<4; c++) {
+                assert(agp[r300_texture_byte_lane(bgra[c],swap,false)] == glyph_expected[pixel][c]);
+                assert(local[r300_texture_byte_lane(bgra[c],swap,true)] == glyph_expected[pixel][c]);
+            }
+        }
+    }
+    puts("PASS captured AGP glyph alpha and local VRAM byte-order contracts");
+    /* BT.601 reference black/white/red, shared chroma, padded rows and
+     * texture byte permutations. Padding must never become picture data. */
+    const uint8_t video[16] = {128,16,128,235, 1,2,3,4,
+                               90,81,240,81, 5,6,7,8};
+    const uint8_t picture[16] = {0,0,0,255, 254,254,254,255,
+                                 254,0,0,255, 254,0,0,255};
+    uint8_t rgba[20], encoded[16];
+    static const unsigned orders[4][4] = {
+        {0,1,2,3}, {1,0,3,2}, {3,2,1,0}, {2,3,0,1}
+    };
+    for (unsigned swap = 0; swap < 4; swap++) {
+        for (unsigned pair = 0; pair < 4; pair++) {
+            for (unsigned c = 0; c < 4; c++) {
+                encoded[pair * 4 + orders[swap][c]] = video[pair * 4 + c];
+            }
+        }
+        memset(rgba, 0x5a, sizeof(rgba));
+        assert(r300_yvyu422_decode(encoded,16,2,2,4,swap,rgba,16));
+        assert(!memcmp(rgba,picture,16));
+        for (unsigned i = 16; i < sizeof(rgba); i++) assert(rgba[i] == 0x5a);
+    }
+    memset(rgba, 0x5a, sizeof(rgba));
+    assert(!r300_yvyu422_decode(video,15,2,2,4,0,rgba,16));
+    assert(!r300_yvyu422_decode(video,16,2,2,4,0,rgba,15));
+    assert(!r300_yvyu422_decode(video,16,3,2,4,0,rgba,16));
+    assert(!r300_yvyu422_decode(video,16,2,2,1,0,rgba,16));
+    assert(!r300_yvyu422_decode(video,16,2,2,4,4,rgba,16));
+    for (unsigned i = 0; i < sizeof(rgba); i++) assert(rgba[i] == 0x5a);
+    puts("PASS YVYU422 video colors, padded rows, byte swaps and buffer bounds");
     const uint32_t constants[] = {0,0x800000,0x3f0000,0xbf0000,0x3e0000,0x400000,0x3d8000};
     const float expected[] = {0,-0.0f,1,-1,0.5f,2,0.375f};
     for (unsigned i = 0; i < sizeof(constants)/sizeof(constants[0]); i++) {

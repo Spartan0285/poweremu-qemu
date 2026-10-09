@@ -7,6 +7,16 @@
 #include <stdlib.h>
 #include "ppc_mac_gpu_r300_data.h"
 
+unsigned r300_texture_byte_lane(unsigned component, unsigned byte_swap,
+                                bool aperture_reversed)
+{
+    static const unsigned order[4][4] = {
+        {0,1,2,3}, {1,0,3,2}, {3,2,1,0}, {2,3,0,1}
+    };
+    unsigned lane = order[byte_swap][component];
+    return aperture_reversed ? 3 - lane : lane;
+}
+
 bool r300_float24_decode(uint32_t word, float *value)
 {
     unsigned exp = (word >> 16) & 127, mantissa = word & 65535;
@@ -266,6 +276,42 @@ static bool window_program(R300VPProgram *p, float c[256][4],
         c[4][0]=c[4][1]=c[4][2]=c[4][3]=1;
         p->varying_mask=1;
         p->varying_output[0]=1;
+    }
+    return true;
+}
+
+bool r300_yvyu422_decode(const uint8_t *source, size_t source_bytes,
+                         unsigned width, unsigned height, unsigned pitch,
+                         unsigned byte_swap, uint8_t *rgba, size_t rgba_bytes)
+{
+    static const unsigned order[4][4] = {
+        {0, 1, 2, 3}, {1, 0, 3, 2}, {3, 2, 1, 0}, {2, 3, 0, 1}
+    };
+    if (!source || !rgba || !width || !height || byte_swap > 3 ||
+        (width & 1) || pitch < width || pitch > SIZE_MAX / 2 / height ||
+        width > SIZE_MAX / 4 / height ||
+        source_bytes < (size_t)pitch * height * 2 ||
+        rgba_bytes < (size_t)width * height * 4) {
+        return false;
+    }
+    for (unsigned y = 0; y < height; y++) {
+        const uint8_t *row = source + (size_t)y * pitch * 2;
+        for (unsigned x = 0; x < width; x += 2) {
+            const uint8_t *pair = row + (size_t)x * 2;
+            int u = pair[order[byte_swap][0]] - 128;
+            int v = pair[order[byte_swap][2]] - 128;
+            for (unsigned k = 0; k < 2; k++) {
+                float luma = 1.164f * (pair[order[byte_swap][1 + 2 * k]] - 16);
+                float rgb[3] = {luma + 1.596f * v,
+                               luma - 0.813f * v - 0.391f * u,
+                               luma + 2.018f * u};
+                uint8_t *out = rgba + ((size_t)y * width + x + k) * 4;
+                for (unsigned c = 0; c < 3; c++) {
+                    out[c] = rgb[c] < 0 ? 0 : rgb[c] > 255 ? 255 : rgb[c];
+                }
+                out[3] = 255;
+            }
+        }
     }
     return true;
 }

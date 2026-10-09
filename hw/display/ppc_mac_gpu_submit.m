@@ -69,6 +69,17 @@ void gpu_submit_set_pass_ender(void (*end_pass)(void))
     g_end_pass = end_pass;
 }
 
+id<MTLCommandBuffer> gpu_submit_buffer_for(void (*end_pass)(void))
+{
+    if (g_end_pass != end_pass) {
+        if (g_end_pass) {
+            g_end_pass();
+        }
+        g_end_pass = end_pass;
+    }
+    return gpu_submit_buffer();
+}
+
 bool gpu_submit_have_buffer(void)
 {
     return g_cb != nil;
@@ -217,10 +228,11 @@ static struct {
 } g_written[MAX_WRITTEN];
 static int g_nwritten;
 
-#define MAX_READ 64
-static struct { uint64_t lo, hi; } g_read[MAX_READ];
+#define MAX_READ 1024
+static struct { uint64_t lo, hi; uint32_t epoch; } g_read[MAX_READ];
 static int g_nread;
 static bool g_read_overflow;
+static uint32_t g_read_overflow_epoch;
 
 void gpu_note_written(uint64_t lo, uint64_t hi, const GPUSurfaceKey *through)
 {
@@ -246,13 +258,16 @@ void gpu_note_read(uint64_t lo, uint64_t hi)
 {
     for (int i = 0; i < g_nread; i++) {
         if (g_read[i].lo == lo && g_read[i].hi == hi) {
+            g_read[i].epoch = g_epoch;
             return;
         }
     }
     if (g_nread == MAX_READ) {
         g_read_overflow = true;              /* be conservative */
+        g_read_overflow_epoch = g_epoch;
         return;
     }
+    g_read[g_nread].epoch = g_epoch;
     g_read[g_nread].lo = lo;
     g_read[g_nread++].hi = hi;
 }
@@ -287,6 +302,17 @@ bool gpu_range_busy(uint64_t lo, uint64_t hi, bool write_access)
 
 bool gpu_batch_conflict(uint64_t lo, uint64_t hi, const GPUSurfaceKey *same)
 {
+    /* A target may overwrite bytes sampled earlier through an alias. The
+     * earlier reader must finish before this writer starts, even when no
+     * previous GPU writer exists for those bytes. Keep CPU read tracking
+     * across commits, but check only this batch for GPU ordering. */
+    if (same) {
+        if (g_read_overflow && g_read_overflow_epoch == g_epoch) return true;
+        for (int i = 0; i < g_nread; i++) {
+            if (g_read[i].epoch == g_epoch &&
+                lo < g_read[i].hi && g_read[i].lo < hi) return true;
+        }
+    }
     for (int i = 0; i < g_nwritten; i++) {
         if (g_written[i].epoch != g_epoch) {
             continue;        /* an earlier batch: the GPU orders it before this one */

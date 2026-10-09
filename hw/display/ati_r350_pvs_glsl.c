@@ -263,6 +263,9 @@ static bool pvs_math(PvsBuf *b, unsigned opcode)
                     " log2(abs(a.w)), 1.0);\n"
                     "    }\n");
         return true;
+    case R300_ME_POWER_FUNC_FF:
+        y = "cc.w == 0.0 ? 1.0 : (a.w < 0.0 ? -pvs_powf(-a.w, cc.w) : pvs_powf(a.w, cc.w))";
+        break;
     case R300_ME_RECIP_DX:
         y = "a.w != 0.0 ? 1.0 / a.w : 3.402823466e38";
         break;
@@ -283,6 +286,9 @@ static bool pvs_math(PvsBuf *b, unsigned opcode)
         break;
     case R300_ME_LOG_BASE2_FULL_DX:
         y = "a.w != 0.0 ? log2(abs(a.w)) : -3.402823466e38";
+        break;
+    case R300_ME_POWER_FUNC_FF_CLAMP_01:
+        y = "a.w <= 0.0 ? 0.0 : (a.w > 1.0 ? 1.0 : pvs_powf(a.w, bb.w))";
         break;
     default:
         return false;

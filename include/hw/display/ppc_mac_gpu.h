@@ -216,7 +216,7 @@ struct R200Vertex;
 #define R200_SC_BOTTOM_RIGHT          0x16F0
 
 /* CP (command processor) - Phase 4 */
-#define R200_CP_ME_CNTL               0x0086
+#define R200_CP_ME_CNTL               0x07D0
 #define R200_CP_RB_BASE                0x0700
 #define R200_CP_RB_CNTL               0x0704
 #define R200_CP_RB_RPTR_ADDR          0x070C
@@ -250,6 +250,8 @@ struct R200Vertex;
 #define R200_SCRATCH_REG3             0x15EC
 #define R200_SCRATCH_REG4             0x15F0
 #define R200_SCRATCH_REG5             0x15F4
+#define R200_SCRATCH_REG6             0x15F8
+#define R200_SCRATCH_REG7             0x15FC
 #define R200_CP_ME_RAM_ADDR           0x07D4
 #define R200_CP_ME_RAM_RADDR          0x07D8
 #define R200_CP_ME_RAM_DATAH          0x07DC
@@ -532,7 +534,7 @@ typedef struct PPCMacGPURegs {
     uint32_t cp_ib_bufsz;          /* 0x073C: Indirect Buffer size (dwords) */
 
     /* Scratch registers + writeback */
-    uint32_t scratch_reg[6];       /* SCRATCH_REG0-5 (0x15E0-0x15F4) */
+    uint32_t scratch_reg[8];       /* SCRATCH_REG0-7 (0x15E0-0x15FC) */
     uint32_t scratch_umsk;         /* 0x0770: which scratch regs to writeback */
     uint32_t scratch_addr;         /* 0x0774: VRAM addr for writeback */
     uint64_t stall_draws;          /* draws carried out, for the stall trace */

@@ -105,6 +105,7 @@
 #define R300_ME_EXP_BASE2_DX          1
 #define R300_ME_LOG_BASE2_DX          2
 #define R300_ME_LIGHT_COEFF_DX        4
+#define R300_ME_POWER_FUNC_FF         5
 #define R300_ME_RECIP_DX              6
 #define R300_ME_RECIP_FF              7
 #define R300_ME_RECIP_SQRT_DX         8
@@ -112,6 +113,7 @@
 #define R300_ME_MULTIPLY              10
 #define R300_ME_EXP_BASE2_FULL_DX     11
 #define R300_ME_LOG_BASE2_FULL_DX     12
+#define R300_ME_POWER_FUNC_FF_CLAMP_01 15
 
 /*
  * A program as the control registers describe it, plus what a static

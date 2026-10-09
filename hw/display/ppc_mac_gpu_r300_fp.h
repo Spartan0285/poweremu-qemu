@@ -82,6 +82,30 @@ typedef struct R300FPProgram {
      * compiles exactly as before.
      */
     char out_swizzle[5];
+    /*
+     * Fog, applied after the shader output and before the alpha test, which
+     * is where the FG block sits in the pipeline.  The factor does not come
+     * through RS: GB_SELECT names its source and GA_FOG_SCALE/OFFSET map it,
+     * so the source arrives here as one fragment input's alpha (or straight
+     * from the fragment position for the Z and 1/W selections).
+     *
+     * f = saturate(source * fog_scale + fog_offset), the amount of fog.
+     * Alpha is not fogged.
+     */
+    bool fog_enable;
+    float fog_colour[3];
+    float fog_scale, fog_offset;
+    int8_t fog_input;          /* fragment input carrying the source, or -1 */
+    uint8_t fog_source;        /* GB_SELECT.FOG_SELECT, for the -1 cases */
+    /* Which fragment input each vertex colour was routed to, 0xff if none,
+     * and which vertex-program output carries it.  Only meaningful when
+     * colour_map_valid: the other routing paths do not fill these in. */
+    uint8_t colour_input[4];
+    uint8_t colour_vp_output[4];
+    bool colour_map_valid;
+    /* Experimental second color attachment mirrors passing depth writes.
+     * 0 disabled, 1 guest Z16, 2 guest Z24S8; native depth/stencil stays active. */
+    uint8_t depth_mirror;
 } R300FPProgram;
 
 /* Current gate: one node, MAD ALU, TEX/TXP 2D sampling, full final output 0.
@@ -92,6 +116,17 @@ typedef struct R300FPProgram {
  * nonzero capacities are required. Generated entry is r300_fragment, with
  * R300FragmentInput varyings and texture/sampler bindings matching image IDs.
  */
+/* Fragment buffer 0 contains 32 guest constants followed by two host-only
+ * fog vectors. Lighting parameters are uniforms, not shader variants. */
+#define R300_FP_HOST_CONSTANT_COUNT 34
+void r300_fp_pack_constants(const R300FPProgram *p,
+                            const float guest[32][4],
+                            float host[R300_FP_HOST_CONSTANT_COUNT][4]);
+
+/* Texture units referenced by every active node of a validated program.
+ * First-node texture enable does not suppress later nodes' fetches. */
+uint16_t r300_fp_texture_mask(const R300FPProgram *p);
+
 bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
                          char *error, size_t error_capacity);
 #endif

@@ -6529,7 +6529,7 @@ static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch
             rp.stencilAttachment.clearStencil = 0;
             rp.stencilAttachment.loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> e = [gpu_submit_buffer() renderCommandEncoderWithDescriptor:rp];
+            id<MTLRenderCommandEncoder> e = [gpu_submit_buffer_for(r200_end_pass) renderCommandEncoderWithDescriptor:rp];
             R200DrawPacket q = { 0 };
             q.depth_enable = 1;
             q.zstencil = (7u << 4) | (1u << 30);               /* ALWAYS, write */
@@ -6962,7 +6962,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
-            g_r200_enc = [[gpu_submit_buffer() renderCommandEncoderWithDescriptor:rp] retain];
+            g_r200_enc = [[gpu_submit_buffer_for(r200_end_pass) renderCommandEncoderWithDescriptor:rp] retain];
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];

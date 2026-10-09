@@ -89,16 +89,19 @@ static void emit(MSLWriter *w, const char *fmt, ...)
 
 static bool operand(char *out, size_t cap, const R300FPInstruction *p,
                     unsigned field, bool alpha, const uint8_t defined[32],
-                    unsigned highest)
+                    unsigned highest, unsigned rgb_components)
 {
     unsigned sel = field & 31, source = 0, needed = 0;
     uint32_t addresses = p->rgb_addr;
     const char *swizzle = NULL;
     char base[64];
-    if ((!alpha && (sel == 20 || sel == 21)) ||
-        (alpha && (sel == 16 || sel == 17))) {
+    if ((!alpha && sel >= 20 && sel <= 22) ||
+        (alpha && sel >= 16 && sel <= 18)) {
+        /* R300 ARGC/ARGA literal selectors are zero, one, and half.
+         * Final Cut's preview shaders use HALF without a constant register. */
+        unsigned literal = sel - (alpha ? 16 : 20);
         snprintf(base, sizeof(base), "%s(%s)", alpha ? "float" : "float3",
-                 (sel == 21 || sel == 17) ? "1.0" : "0.0");
+                 (const char *[]) {"0.0", "1.0", "0.5"}[literal]);
     } else if ((!alpha && sel >= 15 && sel <= 19) ||
                (alpha && sel >= 12 && sel <= 15)) {
         bool use_alpha = (!alpha && sel == 19) || (alpha && sel == 15);
@@ -136,7 +139,7 @@ static bool operand(char *out, size_t cap, const R300FPInstruction *p,
         } else if (sel <= 11) {
             source = sel / 4;
             swizzle = (const char *[]) {"xyz", "xxx", "yyy", "zzz"}[sel % 4];
-            needed = (const unsigned[]) {7, 1, 2, 4}[sel % 4];
+            needed = (const unsigned[]) {rgb_components, 1, 2, 4}[sel % 4];
         } else if (sel <= 14) {
             source = sel - 12;
             addresses = p->alpha_addr;
@@ -145,7 +148,12 @@ static bool operand(char *out, size_t cap, const R300FPInstruction *p,
         } else if (sel >= 23 && sel <= 28) {
             source = (sel - 23) % 3;
             swizzle = sel < 26 ? "yzx" : "zxy";
-            needed = 7;
+            needed = 0;
+            for (unsigned i = 0; i < 3; i++) {
+                if (rgb_components & (1u << i)) {
+                    needed |= 1u << ((i + (sel < 26 ? 1 : 2)) % 3);
+                }
+            }
         }
         if (!swizzle) {
             return false;
@@ -184,16 +192,22 @@ static const char *emit_alu(MSLWriter *w, const R300FPInstruction *p,
     bool rgb_supported = rgb_op <= 2 || rgb_op == 4 || rgb_op == 5 ||
                          rgb_op == 7 || rgb_op == 8 || rgb_op == 9;
     if ((p->rgb_inst|p->alpha_inst)&0x80000000u || !rgb_supported ||
-        (alpha_op > 1 && !alpha_unary) ||
+        (alpha_op > 1 && alpha_op != 6 && !alpha_unary) ||
         rgb_mod==7 || alpha_mod==7) {
         return "unsupported ALU operation or modifier";
     }
     char rgb[3][96], alpha[3][96];
+    /* Componentwise ALUs only consume lanes that they write. A YZ copy
+     * from a temporary with an undefined X is valid (Final Cut does this).
+     * Dot products still require all RGB lanes. */
+    unsigned rgb_components = (rgb_op == 1 || rgb_op == 2 || alpha_op == 1)
+                              ? 7 : cmask | cout;
     for (unsigned i = 0; i < 3; i++) {
         if (((cmask || cout || alpha_op == 1) && !operand(rgb[i], sizeof(rgb[i]), p,
-             (p->rgb_inst >> (7 * i)) & 127, false, defined, highest)) ||
+             (p->rgb_inst >> (7 * i)) & 127, false, defined, highest,
+             rgb_components)) ||
             ((amask || aout || rgb_op == 2) && !operand(alpha[i], sizeof(alpha[i]), p,
-             (p->alpha_inst >> (7 * i)) & 127, true, defined, highest))) {
+             (p->alpha_inst >> (7 * i)) & 127, true, defined, highest, 7))) {
             return "unsupported operand or read of undefined temporary components";
         }
     }
@@ -234,6 +248,11 @@ static const char *emit_alu(MSLWriter *w, const R300FPInstruction *p,
     if (amask || aout) {
         if (alpha_op == 1) {
             emit(w, " float a = dp;\n");
+        } else if (alpha_op == 6) {
+            /* OUTA_CMP uses the third operand as the sign test, matching
+             * OUTC_CMP. Final Cut uses this to bound preview alpha. */
+            emit(w, " float a = (%s) >= 0.0f ? (%s) : (%s);\n",
+                 alpha[2], alpha[0], alpha[1]);
         } else if (alpha_op == 7) {
             emit(w, " float a = fract(%s);\n", alpha[0]);
         } else if (alpha_op == 8) {
@@ -276,6 +295,22 @@ static const char *emit_alu(MSLWriter *w, const R300FPInstruction *p,
     *output_mask |= cout | (aout << 3);
     emit(w, " }\n");
     return NULL;
+}
+
+uint16_t r300_fp_texture_mask(const R300FPProgram *p)
+{
+    unsigned first = 3 - (p->control[0] & 3);
+    unsigned base = (p->control[2] >> 13) & 31;
+    uint16_t mask = 0;
+    for (unsigned node = first; node < 4; node++) {
+        if (node == first && !(p->control[0] & 8)) continue;
+        unsigned start = (p->node[node] >> 12) & 31;
+        unsigned count = ((p->node[node] >> 17) & 31) + 1;
+        for (unsigned i = 0; i < count; i++) {
+            mask |= 1u << ((p->tex[base + start + i] >> 11) & 15);
+        }
+    }
+    return mask;
 }
 
 bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
@@ -328,16 +363,30 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
                 reason = "unsupported texture opcode or source addressing";
                 goto fail;
             }
-            textures |= 1u << ((inst >> 11) & 15);
+
         }
     }
+    textures = r300_fp_texture_mask(p);
     emit(&w, "#include <metal_stdlib>\nusing namespace metal;\n"
-             "struct R300FragmentInput { float4 position [[position]];\n");
+             "struct R300FragmentInput { float4 position [[position]];\n"
+             " float4 vfog [[user(locnfog)]];\n");
     for (unsigned i = 0; i < R300_FP_MAX_INPUTS; i++) {
         emit(&w, " float4 v%u [[user(locn%u)]];\n", i, i);
     }
-    emit(&w, "};\nfragment float4 r300_fragment(R300FragmentInput in [[stage_in]], "
-             "constant float4 *c [[buffer(0)]]");
+    emit(&w, "};\n");
+    if (p->depth_mirror > 2) {
+        reason = "unsupported depth mirror format";
+        goto fail;
+    }
+    if (p->depth_mirror) {
+        emit(&w, "struct R300FragmentOutput { float4 color [[color(0)]]; uint z [[color(1)]]; };\n");
+    }
+    emit(&w, "fragment %s r300_fragment(R300FragmentInput in [[stage_in]], "
+             "constant float4 *c [[buffer(0)]]",
+             p->depth_mirror ? "R300FragmentOutput" : "float4");
+    if (p->depth_mirror) {
+        emit(&w, ", uint oldz [[color(1)]], constant uint &zwrite [[buffer(1)]]");
+    }
     if (p->blend_in_shader) {
         /* Framebuffer fetch: the destination has to be read in the shader
          * because it cannot be blended by the pipeline in guest order. */
@@ -349,7 +398,9 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
                      "sampler s%u [[sampler(%u)]]", i, i, i, i);
         }
     }
-    emit(&w, ") {\n float4 r[32];\n float4 output;\n");
+    /* Inactive vector lanes may appear in generated expressions; give them
+     * deterministic values without admitting undefined active-lane reads. */
+    emit(&w, ") {\n float4 r[32] = {};\n float4 output;\n");
     for (unsigned i = 0; i < R300_FP_MAX_INPUTS; i++) {
         if (p->input_mask & (1u << i)) {
             if (i > highest) {
@@ -428,6 +479,34 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
         reason = "program does not define all output color components";
         goto fail;
     }
+    if (p->fog_enable) {
+        /*
+         * The fog unit sits between the shader and the alpha test, so this
+         * goes here rather than with the blend further down.
+         *
+         * GA produces fog amount, not OpenGL's remaining visibility.
+         * Warcraft's unfogged UI emits C1A=1 with GA scale=-1, offset=1;
+         * amount zero must preserve that UI. Disabling FG fog bypasses the
+         * blend and does not establish either endpoint's meaning.
+         * Alpha is left alone.
+         */
+        const char *src;
+        switch (p->fog_source) {
+        case 4:     /* 1/(1/W): Metal's fragment position carries 1/w. */
+            src = "(1.0f / in.position.w)";
+            break;
+        case 5:     /* Z straight off the scan converter. */
+            src = "in.position.z";
+            break;
+        default:    /* the alpha of one of the vertex colours, carried in
+                     * the dedicated fog varying */
+            src = "in.vfog.a";
+            break;
+        }
+        emit(&w, " {\n  float fogf = saturate(%s * c[33].x + c[33].y);\n"
+                 "  output.rgb = output.rgb * (1.0f - fogf)"
+                 " + c[32].rgb * fogf;\n }\n", src);
+    }
     if (p->alpha_func & 0x800) {
         static const char *ops[8] = {NULL, "<", "==", "<=", ">", "!=", ">=", NULL};
         unsigned op = (p->alpha_func >> 8) & 7;
@@ -483,7 +562,25 @@ bool r300_fp_compile_msl(const R300FPProgram *p, char *out, size_t capacity,
     if (strcmp(out_swizzle, "rgba") != 0) {
         emit(&w, " output = output.%s;\n", out_swizzle);
     }
-    emit(&w, " return %s;\n}\n", p->guest_order ? "output.yxwz" : "output");
+    if (p->depth_mirror) {
+        emit(&w, " R300FragmentOutput result; result.color = %s; result.z = oldz;\n",
+             p->guest_order ? "output.yxwz" : "output");
+        /* Native depth/stencil decides whether this output is committed.
+         * R350 Z24S8 has depth in the upper 24 bits, stencil in the low byte.
+         * Integer attachments view little-endian words; the guest stores BE.
+         * Stencil is preserved here; its authoritative state remains native. */
+        emit(&w, " if (zwrite != 0u) { uint z = min(uint(rint(saturate(in.position.z) * %s)), %s);\n",
+             p->depth_mirror == 1 ? "65535.0f" : "16777215.0f",
+             p->depth_mirror == 1 ? "65535u" : "16777215u");
+        if (p->depth_mirror == 1) {
+            emit(&w, " result.z = ((z & 255u) << 8) | (z >> 8); }\n");
+        } else {
+            emit(&w, " result.z = (oldz & 0xff000000u) | ((z & 255u) << 16) | (z & 0xff00u) | (z >> 16); }\n");
+        }
+        emit(&w, " return result;\n}\n");
+    } else {
+        emit(&w, " return %s;\n}\n", p->guest_order ? "output.yxwz" : "output");
+    }
     if (w.failed) {
         reason = "MSL output buffer too small";
         goto fail;
@@ -493,4 +590,16 @@ fail:
     out[0] = 0;
     snprintf(error, error_capacity, "%s", reason);
     return false;
+}
+
+void r300_fp_pack_constants(const R300FPProgram *p,
+                            const float guest[32][4],
+                            float host[R300_FP_HOST_CONSTANT_COUNT][4])
+{
+    memcpy(host, guest, 32 * 4 * sizeof(float));
+    memcpy(host[32], p->fog_colour, sizeof(p->fog_colour));
+    host[32][3] = 0;
+    host[33][0] = p->fog_scale;
+    host[33][1] = p->fog_offset;
+    host[33][2] = host[33][3] = 0;
 }

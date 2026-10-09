@@ -135,7 +135,8 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         goto fail;
     }
     emit(&w, "\nstruct R300VertexInput { float4 a[16]; };\n"
-             "struct R300VertexOutput { float4 position [[position]];\n");
+             "struct R300VertexOutput { float4 position [[position]];\n"
+             " float4 vfog [[user(locnfog)]];\n");
     for (unsigned i = 0; i < R300_FP_MAX_INPUTS; i++) {
         emit(&w, " float4 v%u [[user(locn%u)]];\n", i, i);
     }
@@ -173,28 +174,13 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         bool dual = (code[0] >> 28) & 1;
         /* 68 is the math engine's lighting coefficient: three operands,
          * W components only. */
-        unsigned count = (op == 4 || op == 128 || op == 68) ? 3 : 2;
-        /*
-         * Bit 28 stays refused, and the reason is worth keeping.
-         *
-         * It was let through on the reasoning that the top bits of the
-         * destination word are modifiers and that the one at 28 selects
-         * between the halves of a *math* instruction, which a dot product is
-         * not -- so it should be inert.  The 434 draws that set it then
-         * failed at the next step instead, reading a source of kind 3.
-         *
-         * Kind 3 is the alternate temporary file, and that is what settles
-         * it: ATRM exists for pair scheduling and is the only file the math
-         * half of a dual instruction can write.  So bit 28 is not inert on
-         * these instructions at all -- they are dual, a vector op and a math
-         * op issued together, and this translator emits only the vector half.
-         * Allowing the bit buys a draw that runs with half its arithmetic
-         * missing, which is worse than one that does not run.
-         *
-         * Supporting them means decoding both halves and giving the
-         * translator the second register file.  Until then they are refused,
-         * which is what the census says.
-         */
+        bool scalar = op & R300_PVS_DST_MATH_INST;
+        unsigned count = (op == (R300_PVS_DST_MATH_INST | R300_ME_RECIP_FF) ||
+                          op == (R300_PVS_DST_MATH_INST | R300_ME_RECIP_SQRT_FF)) ? 1 :
+            (op == 4 || op == 128 || op == 68) ? 3 : 2;
+        /* Dual instructions have independent vector and math halves; the
+         * third operand word carries the latter, not another vector source.
+         * Source kind 3 and destination kind 4 address alternate temporaries. */
         /*
          * Accepted: opcode, destination, write enables, and the dual-math
          * bit.  Still refused, because none of it is translated: relative
@@ -206,10 +192,18 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
          * three-source opcode cannot be one.
          */
         if (p->code_valid[pc] != 15 || (code[0] & ~0x10ffefffu) ||
-            (kind != 0 && kind != 2) || !mask || dst >= 32 ||
+            (kind != 0 && kind != 2 && kind != 3 && kind != 4) || !mask ||
+            (kind == 4 ? dst >= R300_VP_ALT_TEMP_WRITABLE : dst >= 32) ||
             (dual && count == 3) ||
-            (op != 1 && op != 2 && op != 3 && op != 4 && op != 128 &&
-             op != 68)) {
+            (op != R300_VE_DOT_PRODUCT && op != R300_VE_MULTIPLY &&
+             op != R300_VE_ADD && op != R300_VE_MULTIPLY_ADD &&
+             op != R300_VE_MAXIMUM &&
+             op != R300_VE_SET_GREATER_THAN_EQUAL && op != 128 && op != 68 &&
+             op != (R300_PVS_DST_MATH_INST | R300_ME_RECIP_FF) &&
+             op != (R300_PVS_DST_MATH_INST | R300_ME_RECIP_SQRT_FF) &&
+             op != (R300_PVS_DST_MATH_INST | R300_ME_POWER_FUNC_FF) &&
+             op != (R300_PVS_DST_MATH_INST |
+                    R300_ME_POWER_FUNC_FF_CLAMP_01))) {
             /*
              * Say which of these it was, and for which opcode.  As one name
              * it covered five unrelated conditions -- a program uploaded
@@ -220,29 +214,59 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
              */
             snprintf(detail, sizeof(detail), "vertex %s op=%u kind=%u bits=%08x",
                      p->code_valid[pc] != 15 ? "program incomplete" :
-                     (code[0] & ~0x00f3ffffu) ? "reserved bits" :
-                     (kind != 0 && kind != 2) ? "destination kind" :
+                     (code[0] & ~0x10ffefffu) ? "reserved bits" :
+                     (kind != 0 && kind != 2 && kind != 3 && kind != 4) ? "destination kind" :
                      !mask ? "empty write mask" : "opcode",
-                     op, kind, code[0] & ~0x00f3ffffu);
+                     op, kind, code[0] & ~0x10ffefffu);
             reason = detail;
             goto fail;
         }
         char operands[3][256];
         for (unsigned i = 0; i < count; i++) {
+            /* FF power's exponent is source C, not the unused source B.
+             * AMD's equation labels it B but explicitly notes the C routing. */
+            unsigned source_word = i + 1;
+            if (i == 1 && op == (R300_PVS_DST_MATH_INST | R300_ME_POWER_FUNC_FF)) {
+                source_word = 3;
+            }
             /* A dot product mixes all four components into every output;
              * everything else here is component-wise. */
-            if (!source(operands[i], sizeof(operands[i]), code[i + 1],
+            if (!source(operands[i], sizeof(operands[i]), code[source_word],
                         p->attribute_mask, temps, param_base, param_max,
-                        (op == 1 || op == 68) ? 15u : mask)) {
+                        scalar ? 8u : op == R300_VE_DOT_PRODUCT ? 15u :
+                        kind == R300_PVS_DST_REG_OUT_REPL_X ? 1u : mask)) {
                 snprintf(detail, sizeof(detail),
                          "undefined vertex source pc=%u operand=%u word=%08x attributes=%04x",
-                         pc, i, code[i + 1], p->attribute_mask);
+                         pc, i, code[source_word], p->attribute_mask);
                 reason = detail;
                 goto fail;
             }
         }
-        emit(&w, " { float4 va = %s; float4 vb = %s;\n", operands[0], operands[1]);
-        if (op == 68) {
+        emit(&w, " { float4 va = %s;\n", operands[0]);
+        if (count > 1) {
+            emit(&w, " float4 vb = %s;\n", operands[1]);
+        }
+        if (op == (R300_PVS_DST_MATH_INST | R300_ME_RECIP_FF)) {
+            emit(&w, " float scalar = va.w == 0.0f ? 0.0f : 1.0f / va.w;\n");
+            emit(&w, " float4 value = float4(scalar);\n");
+        } else if (op == (R300_PVS_DST_MATH_INST | R300_ME_RECIP_SQRT_FF)) {
+            emit(&w, " float scalar = va.w == 0.0f ? 0.0f : rsqrt(abs(va.w));\n");
+            emit(&w, " float4 value = float4(scalar);\n");
+        } else if (op == (R300_PVS_DST_MATH_INST | R300_ME_POWER_FUNC_FF)) {
+            emit(&w, " float scalar = vb.w == 0.0f ? 1.0f : "
+                     "(va.w == 0.0f ? (vb.w < 0.0f ? INFINITY : 0.0f) : "
+                     "(va.w < 0.0f ? -pow(-va.w, vb.w) : pow(va.w, vb.w)));\n");
+            emit(&w, " float4 value = float4(scalar);\n");
+        } else if (op == (R300_PVS_DST_MATH_INST |
+                   R300_ME_POWER_FUNC_FF_CLAMP_01)) {
+            /* ME_POWER_FUNC_FF_CLAMP_01: clamp the base before applying
+             * the ordinary FF power function.  Warcraft III uses this for
+             * its transformed lighting values. */
+            emit(&w, " float base = va.w; float exponent = vb.w;\n");
+            emit(&w, " float scalar = base <= 0.0f ? 0.0f : "
+                     "(base > 1.0f ? 1.0f : pow(base, exponent));\n");
+            emit(&w, " float4 value = float4(scalar);\n");
+        } else if (op == 68) {
             /*
              * ME_LIGHT_COEFF_DX, the lighting coefficients:
              *
@@ -263,16 +287,25 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         } else if (count == 3) {
             emit(&w, " float4 vc = %s; float4 value = va * vb + vc;\n", operands[2]);
         } else {
-            emit(&w, " float4 value = %s;\n", op == 1 ? "float4(dot(va, vb))" :
-                 op == 2 ? "va * vb" : "va + vb");
+            emit(&w, " float4 value = %s;\n",
+                 op == R300_VE_DOT_PRODUCT ? "float4(dot(va, vb))" :
+                 op == R300_VE_MULTIPLY ? "va * vb" :
+                 op == R300_VE_SET_GREATER_THAN_EQUAL ?
+                    "select(float4(0.0f), float4(1.0f), va >= vb)" :
+                 op == R300_VE_MAXIMUM ? "max(va, vb)" : "va + vb");
         }
         for (unsigned i = 0; i < 4; i++) {
             if (mask & (1u << i)) {
-                emit(&w, " %c[%u].%c = value.%c;\n", kind == 0 ? 't' : 'o',
-                     dst, "xyzw"[i], "xyzw"[i]);
+                emit(&w, " %c[%u].%c = value.%c;\n",
+                     kind == 0 ? 't' : (kind == 2 || kind == 3) ? 'o' : 'm', dst,
+                     "xyzw"[i], kind == 3 ? 'x' : "xyzw"[i]);
             }
         }
-        (kind == 0 ? temps : results)[dst] |= mask;
+        if (kind == 0) {
+            temps[dst] |= mask;
+        } else if (kind == 2 || kind == 3) {
+            results[dst] |= mask;
+        }
         /*
          * The math half of a dual instruction.
          *
@@ -286,9 +319,10 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
          *   12:5  source offset    25/26 negate first/second operand
          *   15:13 first operand    28:27 which component to write
          *
-         * Only opcode 9 is translated.  It is the one Chess uses, on all
-         * three of its dual instructions, and the others are a scalar unit's
-         * worth of work that nothing has yet asked for.
+         * Warcraft III also uses opcode 7 (ME_RECIP_FF) in this slot.  Keep
+         * this list explicit: the dual word has fewer source fields than a
+         * normal math instruction, so each added opcode must be expressible
+         * from the two swizzled scalars it actually carries.
          */
         if (dual) {
             uint32_t d = code[3];
@@ -304,7 +338,7 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
                 reason = detail;
                 goto fail;
             }
-            if (mop != 9) {
+            if (mop != R300_ME_RECIP_FF && mop != R300_ME_RECIP_SQRT_FF) {
                 snprintf(detail, sizeof(detail), "dual math opcode %u", mop);
                 reason = detail;
                 goto fail;
@@ -331,15 +365,20 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
                     goto fail;
                 }
             }
-            /*
-             * ME_RECIP_SQRT_FF: 1.0 / sqrt(abs(x)), and an input of zero
-             * gives zero -- not infinity, and not the MAX_FLOAT its _DX
-             * sibling returns.  rsqrt(0) in Metal is infinity, so the zero
-             * case is written out rather than left to the intrinsic.
-             */
-            emit(&w, " { float ms = abs((%s).x);\n", operand);
-            emit(&w, " m[%u].%c = ms == 0.0f ? 0.0f : rsqrt(ms); }\n",
-                 mdst, "xyzw"[mwe]);
+            if (mop == R300_ME_RECIP_FF) {
+                /* FF reciprocal returns zero for zero, unlike the DX form's
+                 * largest-finite result.  Metal division would produce an
+                 * infinity, so preserve the hardware's zero case here. */
+                emit(&w, " { float ms = (%s).x;\n", operand);
+                emit(&w, " m[%u].%c = ms == 0.0f ? 0.0f : 1.0f / ms; }\n",
+                     mdst, "xyzw"[mwe]);
+            } else {
+                /* ME_RECIP_SQRT_FF: 1.0 / sqrt(abs(x)), with zero mapped to
+                 * zero rather than the infinity returned by Metal rsqrt. */
+                emit(&w, " { float ms = abs((%s).x);\n", operand);
+                emit(&w, " m[%u].%c = ms == 0.0f ? 0.0f : rsqrt(ms); }\n",
+                     mdst, "xyzw"[mwe]);
+            }
         }
         emit(&w, " }\n");
         if (pc == position_end && results[0] != 15) {
@@ -352,10 +391,18 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
         goto fail;
     }
     /* OpenGL guest clip depth is -w..w, whereas Metal uses 0..w. */
+    if (p->window_position_width && p->window_position_height) {
+        emit(&w, " R300VertexOutput result = {};\n"
+                 " result.position = float4((2.0f * o[0].x / %u.0f - 1.0f) * o[0].w, "
+                 "(1.0f - 2.0f * o[0].y / %u.0f) * o[0].w, o[0].z * o[0].w, o[0].w);\n"
+                 " result.point_size = %.9ff;\n", p->window_position_width,
+                 p->window_position_height, p->point_size > 0 ? p->point_size : 1.0f);
+    } else {
     emit(&w, " R300VertexOutput result = {};\n"
              " result.position = float4(o[0].x, %so[0].y, (o[0].z + o[0].w) * 0.5f, o[0].w);\n"
              " result.point_size = %.9ff;\n", p->flip_y ? "-" : "",
              p->point_size > 0 ? p->point_size : 1.0f);
+    }
     if (p->expand_point_rect) {
         emit(&w, " constexpr float2 corners[6] = {float2(-1,-1),float2(1,-1),float2(-1,1),"
                  "float2(-1,1),float2(1,-1),float2(1,1)};\n"
@@ -382,6 +429,27 @@ bool r300_vp_compile_msl(const R300VPProgram *p, char *out, size_t capacity,
                 goto fail;
             }
             emit(&w, " result.v%u = o[%u];\n", i, output);
+            if (p->varying_colour_mask & (1u << i)) {
+                float rgb_min = p->colour_clamp_mode & 1 ? -7.9999f : 0.0f;
+                float rgb_max = p->colour_clamp_mode & 1 ? 7.9999f : 1.0f;
+                float alpha_min = p->colour_clamp_mode & 2 ? -7.9999f : 0.0f;
+                float alpha_max = p->colour_clamp_mode & 2 ? 7.9999f : 1.0f;
+                emit(&w, " result.v%u = clamp(result.v%u, "
+                         "float4(%.9ff, %.9ff, %.9ff, %.9ff), "
+                         "float4(%.9ff, %.9ff, %.9ff, %.9ff));\n",
+                     i, i, rgb_min, rgb_min, rgb_min, alpha_min,
+                     rgb_max, rgb_max, rgb_max, alpha_max);
+            }
+        }
+    }
+    if (p->fog_varying) {
+        /* Fog consumes alpha only; an alpha-only output is sufficient.
+         * The fallback for an unwritten alpha remains experimental. */
+        if (p->fog_output < 32 && (results[p->fog_output] & 8)) {
+            emit(&w, " result.vfog = float4(0, 0, 0, o[%u].a);\n",
+                 p->fog_output);
+        } else {
+            emit(&w, " result.vfog = float4(0.0f);\n");
         }
     }
     emit(&w, " return result;\n}\n");

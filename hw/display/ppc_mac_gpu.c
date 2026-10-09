@@ -44,6 +44,7 @@
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
 #include "ppc_mac_gpu_r300_fp.h"
+#include "ati_r350_pvs.h"
 #include "ppc_mac_gpu_r300_metal.h"
 #include "ppc_mac_gpu_submit.h"
 #include "ppc_mac_gpu_surface.h"
@@ -185,7 +186,9 @@ static bool r350_diag_once(uint32_t a, uint32_t b, uint32_t c)
 
 static void r350_probe_shader_snapshot(PPCMacGPUState *s, uint32_t draw, bool failure)
 {
-    if (!s->r350_shader_snapshots || (draw > 8 && !failure)) {
+    if ((!s->r350_shader_snapshots &&
+         !(failure && getenv("POWEREMU_R350_FAILURE_TRACE"))) ||
+        (draw > 8 && !failure)) {
         return;
     }
     R300FPProgram p = {0};
@@ -1047,6 +1050,47 @@ static uint64_t r350_fence_written, r350_fence_skipped_range,
 static int r350_fence_last_reg;
 static uint32_t r350_fence_last_val;
 
+/*
+ * What each card actually sampled.
+ *
+ * Success on the 9200 has only ever been judged by looking at a screenshot
+ * and at a draw count, which says nothing about which textures reached the
+ * scene.  Both cards fill this table, so the working one can be used as a
+ * reference: a surface the 9200 samples and the 9800 never does is a missing
+ * texture, named and sized, rather than a thing noticed by eye.
+ *
+ * Keyed on the surface, not the draw, so it stays small whatever the frame
+ * rate.  Read it with
+ *     qom-get /machine/peripheral/gpu0 x-tex-inventory
+ */
+typedef struct R350TexSeen {
+    uint32_t offset, width, height, pitch, fmt;
+    uint64_t draws;
+    bool agp;
+} R350TexSeen;
+static R350TexSeen r350_tex_seen[512];
+static unsigned r350_tex_seen_n;
+
+static void r350_tex_inventory(uint32_t offset, uint32_t w, uint32_t h,
+                               uint32_t pitch, uint32_t fmt, bool agp)
+{
+    for (unsigned i = 0; i < r350_tex_seen_n; i++) {
+        R350TexSeen *e = &r350_tex_seen[i];
+        if (e->offset == offset && e->width == w && e->height == h &&
+            e->fmt == fmt) {
+            e->draws++;
+            return;
+        }
+    }
+    if (r350_tex_seen_n == ARRAY_SIZE(r350_tex_seen)) {
+        return;
+    }
+    r350_tex_seen[r350_tex_seen_n++] = (R350TexSeen){
+        .offset = offset, .width = w, .height = h, .pitch = pitch,
+        .fmt = fmt, .draws = 1, .agp = agp,
+    };
+}
+
 /* Per-register MMIO read counts; see the read dispatcher. */
 static uint32_t r350_reg_reads[0x10000 >> 2];
 
@@ -1111,6 +1155,21 @@ static uint64_t r200_scanout_bytes(PPCMacGPUState *s)
 static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                              bool write_access, uint32_t tag)
 {
+#ifdef __APPLE__
+    /* Diagnostic while identifying the guest's GL depth-read command.
+     * Keep opt-in until allocation reuse/CPU access ownership is modelled:
+     * a cached depth attachment must not overwrite a repurposed color buffer. */
+    if (!write_access && s->r350_probe && s->r350->renderer &&
+        getenv("POWEREMU_R350_DEPTH_READBACK")) {
+        char error[192];
+        if (!r300_metal_read_depth(s->r350->renderer,
+                (s->regs.mc_fb_location & 0xffff) << 16,
+                memory_region_get_ram_ptr(&s->vram), s->vram_size,
+                lo, hi, error, sizeof(error))) {
+            fprintf(stderr, "R350_ZREAD failed: %s\n", error);
+        }
+    }
+#endif
     if (write_access && tag <= 5) {
         r200_rate.ops2d++;
         if (lo < (uint64_t)s->regs.crtc_offset + r200_scanout_bytes(s) &&
@@ -1842,6 +1901,8 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_SCRATCH_REG3:        return "SCRATCH_REG3";
     case R200_SCRATCH_REG4:        return "SCRATCH_REG4";
     case R200_SCRATCH_REG5:        return "SCRATCH_REG5";
+    case R200_SCRATCH_REG6:        return "SCRATCH_REG6";
+    case R200_SCRATCH_REG7:        return "SCRATCH_REG7";
     case R200_CP_ME_RAM_ADDR:      return "CP_ME_RAM_ADDR";
     case R200_CP_ME_RAM_DATAH:     return "CP_ME_RAM_DATAH";
     case R200_CP_ME_RAM_DATAL:     return "CP_ME_RAM_DATAL";
@@ -3174,7 +3235,7 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
 static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                                              uint32_t wb_val)
 {
-    if (reg_idx < 0 || reg_idx > 5) {
+    if (reg_idx < 0 || reg_idx > 7) {
         r350_fence_skipped_range++;
         return;
     }
@@ -3284,7 +3345,7 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
 
 static void ppc_mac_gpu_scratch_writeback(PPCMacGPUState *s, int reg_idx)
 {
-    if (reg_idx >= 0 && reg_idx <= 5) {
+    if (reg_idx >= 0 && reg_idx <= 7) {
         ppc_mac_gpu_scratch_writeback_val(s, reg_idx, s->regs.scratch_reg[reg_idx]);
     }
 }
@@ -3608,8 +3669,17 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
      *   bits [15:0] = AGP start >> 16
      *   bits [31:16] = AGP end >> 16 */
     uint32_t agp_loc = s->regs.mc_agp_location;
-    if (agp_loc == 0) {
-        return false;
+    /* A mode set temporarily clears MC_AGP_LOCATION before restoring it,
+     * while commands already queued in the old aperture are still allowed
+     * to finish.  Treat zero like the other transient, invalid register
+     * image below.  Forgetting the aperture here dropped Warcraft III's
+     * mode-switch IBs, including the scratch fence the driver then waited
+     * for forever. */
+    if (agp_loc == 0 || agp_loc == 0x80000000u) {
+        if (!s->mc_agp_location_last_valid) {
+            return false;
+        }
+        agp_loc = s->mc_agp_location_last_valid;
     }
     uint32_t agp_start = (agp_loc & 0xFFFF) << 16;
     uint32_t agp_end = (((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF;
@@ -3703,35 +3773,64 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
  * Returns a g_malloc'd buffer of ib_size_dw DWORDs (in CPU byte order),
  * or NULL if translation fails.  Caller must g_free.
  */
+/* Snapshot command RAM a page at a time. Keep translation local to this
+ * submission: a later PTE rewrite must be visible to the next buffer. Device
+ * memory retains the original four-byte transaction size and side effects. */
+static bool ppc_mac_gpu_read_command_words(PPCMacGPUState *s, uint32_t address,
+                                           uint32_t *out, uint32_t words)
+{
+    static int word_reads = -1;
+    if (word_reads < 0) {
+        word_reads = getenv("POWEREMU_GPU_WORD_READS") != NULL;
+    }
+    AddressSpace *as = pci_get_address_space(&s->pci);
+    for (uint32_t done = 0; done < words;) {
+        uint32_t a = address + done * 4;
+        hwaddr phys;
+        bool aic = ppc_mac_gpu_gart_translate(s, a, &phys);
+        if (!aic && !ppc_mac_gpu_agp_translate(s, a, &phys)) {
+            return false;
+        }
+        uint32_t n = 1;
+        if (!word_reads) {
+            uint64_t span = MIN((uint64_t)(words - done) * 4,
+                                4096 - (phys & 4095));
+            span = MIN(span, 4096 - (a & 4095));
+            if (aic) {
+                span = MIN(span, (uint64_t)s->regs.aic_hi_addr + 1 - a);
+            } else if ((s->regs.aic_ctrl & 1) && a < s->regs.aic_lo_addr) {
+                /* Do not skip a higher-priority AIC mapping starting inside
+                 * this AGP page, including an unaligned aperture. */
+                span = MIN(span, (uint64_t)s->regs.aic_lo_addr - a);
+            }
+            RCU_READ_LOCK_GUARD();
+            hwaddr xlat, available = span;
+            MemoryRegion *mr = address_space_translate(as, phys, &xlat,
+                &available, false, MEMTXATTRS_UNSPECIFIED);
+            if (memory_region_is_ram(mr)) {
+                n = MAX(1, MIN(span, available) / 4);
+            }
+        }
+        if (address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED,
+                               out + done, n * 4) != MEMTX_OK) {
+            return false;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            out[done + i] = be32_to_cpu(out[done + i]);
+        }
+        done += n;
+    }
+    return true;
+}
+
 static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
                                                 uint32_t ib_base,
                                                 uint32_t ib_size_dw)
 {
     uint32_t *buf = g_malloc(ib_size_dw * 4);
-    AddressSpace *as = pci_get_address_space(&s->pci);
-
-    for (uint32_t i = 0; i < ib_size_dw; i++) {
-        uint32_t gpu_addr = ib_base + i * 4;
-        hwaddr phys;
-
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
-            g_free(buf);
-            return NULL;
-        }
-
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
-        if (r != MEMTX_OK) {
-            g_free(buf);
-            return NULL;
-        }
-
-        /* Data in guest memory is big-endian (PPC native).
-         * PM4 commands are written in CPU byte order.
-         * Convert to host byte order for parsing. */
-        buf[i] = be32_to_cpu(raw);
+    if (!ppc_mac_gpu_read_command_words(s, ib_base, buf, ib_size_dw)) {
+        g_free(buf);
+        return NULL;
     }
     return buf;
 }
@@ -6179,6 +6278,96 @@ static void r200_light_vertex(PPCMacGPUState *s, const float p_eye[4],
 }
 
 
+static void r350_clear_zmask(PPCMacGPUState *s, const uint32_t *d,
+                             uint32_t ndw)
+{
+    uint32_t pitch = s->r300_shadow[0x4f24 / 4] & 0x3ffc;
+    uint32_t base = s->r300_shadow[0x4f20 / 4];
+    uint32_t value = s->r300_shadow[0x4f28 / 4];
+    uint32_t format = s->r300_shadow[0x4f10 / 4] & 15;
+    uint32_t fb = (s->regs.mc_fb_location & 0xffff) << 16;
+    int height = ((s->r300_shadow[0x43e4 / 4] >> 13) & 8191) - 1440 + 1;
+    uint64_t blocks = ((pitch + 31) / 32) * (uint64_t)((MAX(height, 0) + 15) / 16);
+    unsigned bpp = format == 0 ? 2 : 4;
+
+    /* As with CMASK, accept only the full zero-status fast clears seen in
+     * the guest. The R350 renderer keeps depth in a private Metal texture:
+     * filling the R200 VRAM depth buffer does not clear that attachment. */
+    if (ndw != 3 || d[0] || d[2] || !pitch || pitch > 4096 ||
+        height <= 0 || height > 2048 || d[1] < blocks ||
+        (format != 0 && format != 2) || base < fb ||
+        (uint64_t)(base - fb) + (uint64_t)pitch * height * bpp > s->vram_size) {
+        fprintf(stderr, "R350_ZMASK unsupported full clear\n");
+        return;
+    }
+#ifdef __APPLE__
+    if (!s->r350->renderer) {
+        s->r350->renderer = r300_metal_create();
+    }
+    double depth = format == 0 ? (value & 0xffff) / 65535.0 :
+                                   (value >> 8) / 16777215.0;
+    char error[192];
+    if (!r300_metal_clear_depth(s->r350->renderer, base, pitch, depth,
+                               value & 255, format == 2, error, sizeof(error))) {
+        fprintf(stderr, "R350_ZMASK failed: %s\n", error);
+        return;
+    }
+    if (getenv("POWEREMU_R350_SHARED_DEPTH")) {
+        uint32_t off = base - fb;
+        uint64_t bytes = (uint64_t)pitch * height * bpp;
+        r200_vram_access(s, off, off + bytes, true, 6);
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+        for (uint64_t i = 0; i < bytes; i += bpp) {
+            if (bpp == 2) stw_be_p(vram + off + i, value & 0xffff);
+            else stl_be_p(vram + off + i, value);
+        }
+        ppc_mac_gpu_dirty(s, off, bytes);
+    }
+#endif
+}
+
+static void r350_clear_cmask(PPCMacGPUState *s, const uint32_t *d,
+                             uint32_t ndw)
+{
+    /* On a two-pipe R350 each CMASK dword describes a 32x16 pixel block
+     * (Mesa r300_setup_cmask_properties). A zero mask makes those pixels
+     * read as RB3D_COLOR_CLEAR_VALUE. Our render targets are linear and
+     * uncompressed, so materialize the observed full-surface fast clear.
+     * Partial/status-only updates need an actual CMASK model; never expand
+     * them into a destructive full clear. Scissor bounds supply the active
+     * drawable height, not the padded allocation height in the mask count.
+     */
+    uint32_t pitch = s->r300_shadow[0x4e38 / 4];
+    uint32_t width = pitch & 0x3ffe;
+    uint32_t base = s->r300_shadow[0x4e28 / 4];
+    uint32_t fb = (s->regs.mc_fb_location & 0xffff) << 16;
+    int height = ((s->r300_shadow[0x43e4 / 4] >> 13) & 8191) - 1440 + 1;
+    uint32_t value = s->r300_shadow[0x4e14 / 4];
+    uint64_t bytes = (uint64_t)width * MAX(height, 0) * 4;
+    uint64_t blocks = ((width + 31) / 32) * (uint64_t)((MAX(height, 0) + 15) / 16);
+
+    if (ndw != 3 || d[0] != 0 || d[2] != 0 || !width ||
+        height <= 0 || height > 4096 || width > 4096 ||
+        d[1] < blocks || ((pitch >> 21) & 15) != 6 ||
+        base < fb || (uint64_t)(base - fb) + bytes > s->vram_size) {
+        fprintf(stderr, "R350_CMASK unsupported start=%08x count=%08x "
+                "mask=%08x target=%08x pitch=%08x height=%d\n",
+                ndw > 0 ? d[0] : 0, ndw > 1 ? d[1] : 0,
+                ndw > 2 ? d[2] : 0, base, pitch, height);
+        return;
+    }
+    uint64_t off = base - fb;
+    r200_vram_access(s, off, off + bytes, true, 5);
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    for (uint64_t i = 0; i < bytes; i += 4) {
+        stl_be_p(vram + off + i, value);
+    }
+    if (getenv("POWEREMU_R350_POINT")) {
+        fprintf(stderr, "R350_CMASK clear target=%08x %ux%d value=%08x "
+                "blocks=%u\n", base, width, height, value, d[1]);
+    }
+}
+
 /* Fill the current 3D depth buffer with RB3D_DEPTHCLEARVALUE (see the
  * 3D_CLEAR_ZMASK handler). */
 static void r200_clear_depth_buffer(PPCMacGPUState *s)
@@ -7351,6 +7540,9 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 continue;
             }
             uint64_t bytes = (uint64_t)pkt.tex[t].pitch * pkt.tex[t].height;
+            r350_tex_inventory(pkt.tex[t].offset, pkt.tex[t].width,
+                               pkt.tex[t].height, pkt.tex[t].pitch,
+                               pkt.tex[t].format, pkt.tex[t].host_data != NULL);
             if (pkt.tex[t].host_data) {
                 r200_perf_for(s)->tex_agp++;
                 r200_perf_for(s)->agp_bytes += bytes;
@@ -7521,6 +7713,15 @@ static struct {
 } r350_taken_census[R350_TAKEN_KINDS];
 static unsigned r350_taken_kinds;
 
+/* Recent multisample resolves, used only by the opt-in compositor trace.
+ * Keeping the GPU address lets the later WindowServer texture draw be tied
+ * to the exact application surface that produced it. */
+typedef struct R350ResolvedSurface {
+    uint32_t gpu_offset, pitch, width, height;
+} R350ResolvedSurface;
+static R350ResolvedSurface r350_resolved_surface[16];
+static unsigned r350_resolved_surface_next;
+
 static void r350_taken_record(PPCMacGPUState *s, unsigned prim)
 {
     uint32_t f0 = s->r300_shadow[0x2090 / 4], f1 = s->r300_shadow[0x2094 / 4];
@@ -7606,6 +7807,7 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
                 s->r300_shadow[0x4e88 / 4]);
         return false;
     }
+    uint32_t gpu_dst = dst;
     src -= fb;
     dst -= fb;
     uint64_t need_src = (uint64_t)src + (uint64_t)(y0 + h) * src_pitch;
@@ -7620,6 +7822,12 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
                 s->r300_shadow[0x4e88 / 4]);
         return false;
     }
+    /* This resolve is a CPU copy. Direct Metal rendering can still have
+     * unfinished scene draws in the source, and the destination may be in
+     * use by the compositor. Apply the same read/write ownership barriers
+     * as a 2D blit before touching either allocation. */
+    r200_vram_access(s, R200_ROWS(src, src_pitch, y0, h), false, 1);
+    r200_vram_access(s, R200_ROWS(dst, dst_pitch, y0, h), true, 1);
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     for (uint32_t y = 0; y < h; y++) {
         memcpy(vram + dst + (uint64_t)(y0 + y) * dst_pitch + (uint64_t)x0 * 4,
@@ -7628,6 +7836,10 @@ static bool r350_resolve_copy(PPCMacGPUState *s)
     }
     ppc_mac_gpu_dirty(s, dst + (uint64_t)y0 * dst_pitch, (uint64_t)h * dst_pitch);
     s->display_invalid = true;
+    r350_resolved_surface[r350_resolved_surface_next++ %
+        ARRAY_SIZE(r350_resolved_surface)] = (R350ResolvedSurface) {
+            gpu_dst, dst_pitch, w, h
+        };
     fprintf(stderr, "R350_RESOLVE copied src=%08x/%u dst=%08x/%u "
             "rect=%u,%u+%ux%u ctl=%08x\n",
             src, src_pitch, dst, dst_pitch, x0, y0, w, h,
@@ -7679,6 +7891,10 @@ static bool r350_decode_rs_routing(PPCMacGPUState *s, R300VPProgram *vp,
     uint32_t fmt1 = s->r300_shadow[0x2094 / 4];
     unsigned colours = 0, coords = 0;
     uint8_t colour_out[4], coord_out[8];
+    for (unsigned i = 0; i < 4; i++) {
+        fp->colour_input[i] = 0xff;
+        fp->colour_vp_output[i] = 0xff;
+    }
     unsigned next = 1;                    /* output 0 is always position */
 
     if (!(fmt0 & 1)) {
@@ -7686,6 +7902,7 @@ static bool r350_decode_rs_routing(PPCMacGPUState *s, R300VPProgram *vp,
     }
     for (unsigned c = 0; c < 4; c++) {
         if (fmt0 & (2u << c)) {
+            fp->colour_vp_output[colours] = next;
             colour_out[colours++] = next++;
         }
     }
@@ -7719,6 +7936,11 @@ static bool r350_decode_rs_routing(PPCMacGPUState *s, R300VPProgram *vp,
             }
             out[col_addr] = colour_out[col_id];
             mask |= 1u << col_addr;
+            /* Remember where each colour landed: fog's factor is one of
+             * their alphas, and it has to be found as a fragment input. */
+            if (col_id < 4) {
+                fp->colour_input[col_id] = col_addr;
+            }
         }
         if (tex_cn) {
             if (tex_addr >= R300_FP_MAX_INPUTS || tex_id >= coords) {
@@ -7731,6 +7953,7 @@ static bool r350_decode_rs_routing(PPCMacGPUState *s, R300VPProgram *vp,
     if (!mask) {
         return false;
     }
+    fp->colour_map_valid = true;
     vp->varying_mask = fp->input_mask = mask;
     for (unsigned i = 0; i < R300_FP_MAX_INPUTS; i++) {
         vp->varying_output[i] = out[i];
@@ -7747,6 +7970,32 @@ static void r350_read_barrier(PPCMacGPUState *s, uint64_t address, size_t length
     }
     r200_vram_access(s, address - fb, address - fb + length, false, 4);
 }
+
+#ifdef __APPLE__
+/* The early gate precedes texture-bank indexing. Cache only successful
+ * validation of exact program bytes; a changed operand/linkage still goes
+ * through the full compiler. R350 draw dispatch holds the BQL, so this
+ * pure-program cache is serialized even with multiple guest CPUs/cards. */
+static bool r350_fp_validate(const R300FPProgram *fp, char *error, size_t size)
+{
+    static R300FPProgram valid[64];
+    static unsigned count, next;
+    R300FPProgram shader_fp = *fp;
+    /* These values are uniforms and no longer affect generated source. */
+    memset(shader_fp.fog_colour, 0, sizeof(shader_fp.fog_colour));
+    shader_fp.fog_scale = shader_fp.fog_offset = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (!memcmp(&valid[i], &shader_fp, sizeof(shader_fp))) return true;
+    }
+    g_autofree char *source = g_malloc(R300_FP_MSL_CAPACITY);
+    if (!r300_fp_compile_msl(fp, source, R300_FP_MSL_CAPACITY, error, size))
+        return false;
+    memcpy(&valid[next], &shader_fp, sizeof(shader_fp));
+    next = (next + 1) % ARRAY_SIZE(valid);
+    count = MIN(count + 1, ARRAY_SIZE(valid));
+    return true;
+}
+#endif
 
 static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                              unsigned count, int source)
@@ -7778,13 +8027,27 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
 #define REQUIRE(c, why, ...) \
     do { if (!(c)) { reason = (why); __VA_ARGS__; goto done; } } while (0)
     REQUIRE((source == R200_SRC_IMMD && count > 1) ||
-            (source == R200_SRC_VBUF && count == 1),
+            (source == R200_SRC_VBUF && count == 1) ||
+            (source == R200_SRC_INDX && count > 1),
             "unsupported geometry source or packet length");
     unsigned vertices = words[0] >> 16, prim = words[0] & 15;
-    REQUIRE(vertices && vertices <= 16384 &&
+    bool valid_walk = vertices && vertices <= 16384 &&
             ((source==R200_SRC_IMMD && (words[0]&0xfff0)==0x30) ||
-             (source==R200_SRC_VBUF && (words[0]&0xfff0)==0x820)),
+             (source==R200_SRC_VBUF && (words[0]&0xfff0)==0x820) ||
+             (source==R200_SRC_INDX &&
+              ((words[0]&0xfff0)==0x10 || (words[0]&0xfff0)==0x810)));
+    if (!valid_walk && unlikely(getenv("POWEREMU_R350_GEOMETRY") != NULL)) {
+        static unsigned walk_logged;
+        if (walk_logged++ < 32) {
+            fprintf(stderr, "R350_GEOMETRY reject=walk src=%d words=%u "
+                    "vf_cntl=%08x vertices=%u flags=%03x\n", source, count,
+                    words[0], vertices, words[0] & 0xfff0);
+        }
+    }
+    REQUIRE(valid_walk,
             "vertex count or walk flags");
+    REQUIRE(source != R200_SRC_INDX || count - 1 >= (vertices + 1) / 2,
+            "short inline index list");
     bool bypass = (RG(0x2140)&0x100)!=0;
     bool solid_bypass = bypass && RG(0x2090)==1 && RG(0x2094)==4 &&
         RG(0x4300)==4 && RG(0x4304)==0 && RG(0x4310)==0xd10000 &&
@@ -7950,10 +8213,6 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * drawing with the compare set to 7 (always) and tests with 1 (less),
      * and 80 of its draws write depth without testing, which is the always
      * compare with writes left on.
-     *
-     * Stencil is still refused.  It is 338 of Chess's 827 depth draws and a
-     * separate piece of work; keeping it out means what is accepted here is
-     * drawn correctly rather than drawn wrongly.
      */
     if (RG(0x4f00) & 7) {
         r350_zb_record(RG(0x4f00), RG(0x4f04), RG(0x4f20), RG(0x4f24), RG(0x4f10));
@@ -7985,6 +8244,20 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     draw.depth_func   = RG(0x4f04) & 7;
     draw.depth_offset = RG(0x4f20);
     draw.depth_pitch  = RG(0x4f24) & 0x3fff;
+    draw.depth_format = RG(0x4f10) & 15;
+    draw.depth_guest_offset = draw.depth_offset -
+                             ((s->regs.mc_fb_location & 0xffff) << 16);
+    draw.depth_tiled_export = getenv("POWEREMU_R350_TILED_DEPTH") &&
+        (RG(0x4020) & 7) == 1 && RG(0x4f24) >> 16 == 0x13 &&
+        draw.depth_format == 2 && draw.depth_write;
+    draw.depth_guest_size = s->vram_size;
+    if (!draw.depth_tiled_export && getenv("POWEREMU_R350_SHARED_DEPTH") &&
+        (draw.depth_enable || draw.depth_write || draw.stencil_enable)) {
+        fp.depth_mirror = draw.depth_format == 0 ? 1 : 2;
+    }
+    REQUIRE(!(draw.depth_enable || draw.depth_write || draw.stencil_enable) ||
+            draw.depth_format == 0 || draw.depth_format == 2,
+            "depth buffer format");
     REQUIRE(!(draw.depth_enable || draw.depth_write) || draw.depth_pitch,
             "depth buffer pitch");
     REQUIRE((RG(0x4bd4)&~0xfffu)==0, "alpha test state");     /* FG_ALPHA_FUNC */
@@ -8013,11 +8286,29 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         }
         if (fognew && fogcount < ARRAY_SIZE(fogseen)) {
             fogseen[fogcount++] = fkey;
+            /*
+             * The factor for linear/exp fog does not come through RS at all.
+             * GB_SELECT.FOG_SELECT names its source -- the alpha of one of
+             * the four vertex colours, or 1/(1/W), or Z -- and GA_FOG_SCALE
+             * and GA_FOG_OFFSET (both IEEE floats) map it onto 0..1.
+             * FG_FOG_FACTOR applies only to the constant function, so reading
+             * zero from it on a linear draw says nothing.
+             */
+            uint32_t gb = RG(0x401c), fs_raw = RG(0x4294), fo_raw = RG(0x4298);
+            float fscale, foff;
+            memcpy(&fscale, &fs_raw, 4);
+            memcpy(&foff, &fo_raw, 4);
             fprintf(stderr, "R350_FOG blend=%08x fn=%u colour=%03x,%03x,%03x "
-                    "fogfactor=%08x alpha=%08x rs=%08x,%08x\n",
+                    "fogfactor=%08x alpha=%08x rs=%08x,%08x "
+                    "GB_SELECT=%08x fog_select=%u stuff_en=%u "
+                    "GA_FOG_SCALE=%08x(%g) GA_FOG_OFFSET=%08x(%g) "
+                    "US_OUT_FMT=%08x\n",
                     RG(0x4bc0), (RG(0x4bc0) >> 1) & 3,
                     RG(0x4bc8), RG(0x4bcc), RG(0x4bd0),
-                    RG(0x4bc4), RG(0x4bd4), RG(0x4300), RG(0x4304));
+                    RG(0x4bc4), RG(0x4bd4), RG(0x4300), RG(0x4304),
+                    gb, gb & 7, (gb >> 5) & 1,
+                    fs_raw, (double)fscale, fo_raw, (double)foff,
+                    RG(0x46a4));
         }
     }
     /*
@@ -8135,6 +8426,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      */
     unsigned height=MAX(1,MIN(4096, window_bypass ? active_bottom :
         MAX(active_bottom,(int)ceil(viewport_y_offset+fabsf(ys)))));
+    /* Clip-disabled programmable clears emit screen coordinates with unit
+     * viewport scale and no offsets. Normalize after executing their real
+     * shader; treating them as clip coordinates silently discards the clear. */
+    bool window_program_point = program_point && (RG(0x221c) & (1u << 16)) &&
+        vte == 0x405 && xs == 1.0f && ys == 1.0f;
     /* Only the two swap modes Leopard uses are accepted.  Neither changes how
      * the buffer is laid out here: VRAM keeps the big-endian order every other
      * consumer expects, for the reason r350_vram_component_byte() gives.  A
@@ -8196,6 +8492,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         memcpy(vc[i],s->r350->pvs[512+i],sizeof(vc[i]));
     }
     vp.flip_y=ys>0;
+    if (window_program_point) {
+        vp.window_position_width = width;
+        vp.window_position_height = height;
+        vp.flip_y = false;
+    }
     /*
      * The adapter's job is to put a window coordinate back where it started,
      * so it maps against the target itself rather than against the viewport
@@ -8240,7 +8541,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     input=g_new(R300VertexInput,vertices);
     const uint32_t *vertex_words=words+1;
     size_t vertex_word_count=count-1;
-    if(source==R200_SRC_VBUF) {
+    if(source==R200_SRC_VBUF || source==R200_SRC_INDX) {
         unsigned narrays=RG(0x20c0)&31,total=0;
         unsigned array_count[16],array_stride[16];uint32_t array_address[16];
         REQUIRE(narrays && narrays<=16,"invalid vertex array count");
@@ -8269,11 +8570,16 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         array_words=g_new(uint32_t,vertex_word_count);
         size_t cursor=0;
         for(unsigned v=0;v<vertices;v++) for(unsigned a=0;a<narrays;a++) {
+            unsigned element = v;
+            if (source == R200_SRC_INDX) {
+                uint32_t packed = words[1 + v / 2];
+                element = (v & 1) ? packed >> 16 : packed & 0xffff;
+            }
             uint8_t raw[255*4];size_t bytes=array_count[a]*4;
             r350_read_barrier(s, (uint64_t)array_address[a] +
-                              (uint64_t)v * array_stride[a] * 4, bytes);
+                              (uint64_t)element * array_stride[a] * 4, bytes);
             REQUIRE(r350_read_bytes(s,(uint64_t)array_address[a]+
-                    (uint64_t)v*array_stride[a]*4,raw,bytes),
+                    (uint64_t)element*array_stride[a]*4,raw,bytes),
                     "vertex array GPU address translation");
             for(unsigned i=0;i<array_count[a];i++)
                 array_words[cursor++]=ldl_be_p(raw+i*4);
@@ -8298,6 +8604,56 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         unsigned divisor=(RG(0x4018)&(1u<<16)) ? 16 : 12;
         float half_width=(RG(0x421c)>>16)/(float)divisor;
         float half_height=(RG(0x421c)&0xffff)/(float)divisor;
+        /*
+         * Before deciding what a zero size means, record what the guest
+         * actually programmed.  "Programmable point size" names points whose
+         * size the vertex program supplies, in which case a zero in the fixed
+         * GA_POINT_SIZE register is not a broken state but the normal one --
+         * but it could equally be a degenerate draw or a state word we are
+         * decoding wrongly, and those want opposite treatments.
+         */
+        if (unlikely(getenv("POWEREMU_R350_POINT") != NULL)) {
+            static unsigned plogged;
+            if (plogged < 24) {
+                plogged++;
+                fprintf(stderr, "R350_POINT draw=%u verts=%u GA_POINT_SIZE=%08x"
+                        " half=%.3fx%.3f divisor=%u GA_POINT_MINMAX=%08x"
+                        " VAP_CNTL=%08x VTE=%08x VAP_OUT_VTX_FMT0=%08x"
+                        " VAP_OUT_VTX_FMT1=%08x vp_varying=%08x"
+                        " GA_POINT_S0=%08x GA_POINT_T0=%08x\n",
+                        s->r350->draws_seen, vertices, RG(0x421c),
+                        (double)half_width, (double)half_height, divisor,
+                        RG(0x4230), RG(0x2080), RG(0x20b0), RG(0x2090),
+                        RG(0x2094), vp.varying_mask,
+                        RG(0x4200), RG(0x4204));
+                /* What it would actually paint: a full-screen point with
+                 * colour writes on is a clear; one with the mask off, or
+                 * blended to nothing, is not. */
+                fprintf(stderr, "R350_POINT+ draw=%u tgt=%08x %ux%u mask=%x"
+                        " blend=%u src=%u dst=%u depth=%u/%u clearval=%08x"
+                        " cctl=%08x vtx0=(%.1f,%.1f,%.3f) rgba=%.3f,%.3f,%.3f,%.3f\n",
+                        s->r350->draws_seen, offset, width, height,
+                        draw.color_mask, draw.blend_enable,
+                        draw.blend_src_rgb, draw.blend_dst_rgb,
+                        draw.depth_enable, draw.depth_write,
+                        RG(0x4e14), RG(0x4e00),
+                        (double)input[0].a[0][0], (double)input[0].a[0][1],
+                        (double)input[0].a[0][2],
+                        (double)input[0].a[1][0], (double)input[0].a[1][1],
+                        (double)input[0].a[1][2], (double)input[0].a[1][3]);
+                R300PvsProgram cp = {.code=&vp.code[0][0], .cnst=&s->r350->pvs[512][0],
+                    .code_slots=256, .const_slots=256, .first=start, .last=end,
+                    .cbase=vp.control[1]&255, .cmax=(vp.control[1]>>16)&255,
+                    .bounded=vp.control[1]!=0, .valid=true};
+                R300PvsRegs cr = {0};
+                memcpy(cr.in,input[0].a,sizeof(cr.in));
+                r300_pvs_run(&cp,&cr,NULL);
+                fprintf(stderr,"R350_POINTCLIP draw=%u pos=%.6f,%.6f,%.6f,%.6f "
+                        "viewport=%.3f,%.3f,%.3f,%.3f zs=%08x alpha=%08x stencil=%08x\n",
+                        s->r350->draws_seen,cr.out[0][0],cr.out[0][1],cr.out[0][2],cr.out[0][3],
+                        xs,ys,xo,yo,RG(0x4f04),RG(0x4bd4),RG(0x4f08));
+            }
+        }
         REQUIRE(half_width>0 && half_height>0 && half_width<=2048 && half_height<=2048,
                 "invalid programmable point size");
         vp.varying_mask=fp.input_mask=1;vp.varying_output[0]=1;
@@ -8308,8 +8664,8 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             nv=vertices;draw.primitive_points=true;
         } else {
             vp.expand_point_rect=true;
-            vp.point_half_clip_x=half_width/xs;
-            vp.point_half_clip_y=half_height/fabsf(ys);
+            vp.point_half_clip_x=half_width/(window_program_point ? width/2.0f : xs);
+            vp.point_half_clip_y=half_height/(window_program_point ? height/2.0f : fabsf(ys));
             triangles=g_new(R300VertexInput,vertices*6);
             for (unsigned i=0;i<vertices;i++) for (unsigned j=0;j<6;j++)
                 triangles[i*6+j]=input[i];
@@ -8352,28 +8708,154 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
     } else if (!solid_bypass) {
         vp.varying_mask=fp.input_mask=3;vp.varying_output[0]=1;vp.varying_output[1]=2;
     }
+    /* GA clamps vertex colours before rasterizer interpolation. Texture
+     * coordinates must retain their full range; identify colours through the
+     * output format even when the legacy routing table was selected. */
+    unsigned colour_output = 1;
+    uint32_t colour_outputs = 0;
+    for (unsigned c = 0; c < 4; c++) {
+        if (RG(0x2090) & (2u << c)) {
+            colour_outputs |= 1u << colour_output++;
+        }
+    }
+    for (unsigned i = 0; i < R300_FP_MAX_INPUTS; i++) {
+        if ((vp.varying_mask & (1u << i)) &&
+            !(vp.varying_constant_mask & (1u << i)) &&
+            (colour_outputs & (1u << vp.varying_output[i]))) {
+            vp.varying_colour_mask |= 1u << i;
+        }
+    }
+    vp.colour_clamp_mode = (RG(0x428c) >> 4) & 3;
     if (!point_bypass && !program_point) {
         triangles=g_new(R300VertexInput,nv);
         for(unsigned i=0;i<nv;i++) triangles[i]=input[indices[i]];
     }
-    /* Compile first so texture bank ranges and operand use are validated. */
-    msl = g_malloc(R300_FP_MSL_CAPACITY);
-    REQUIRE(r300_fp_compile_msl(&fp,msl,R300_FP_MSL_CAPACITY,metal_error,sizeof(metal_error)),metal_error);
-    unsigned used = 0;
-    if(fp.control[0]&8) {
-        unsigned base=((fp.control[2]>>13)&31)+((fp.node[3]>>12)&31);
-        unsigned n=((fp.node[3]>>17)&31)+1;
-        for(unsigned i=0;i<n;i++) used|=1u<<((fp.tex[base+i]>>11)&15);
+    if (RG(0x4bc0) & 1) {
+        /*
+         * Linear fog.  f = saturate(source * GA_FOG_SCALE + GA_FOG_OFFSET),
+         * where f is the amount of fog. Warcraft's unfogged UI emits C1A=1
+         * with scale=-1, offset=1, hence f=0. Alpha is not fogged.
+         *
+         * The source is named by GB_SELECT, not by anything in RS: Warcraft
+         * III selects C1A, so the fog amount rides in vertex colour 1's alpha
+         * with scale -1 and offset 1, i.e. f = 1 - alpha.  FG_FOG_FACTOR is
+         * the constant-function input only and is zero here, which means
+         * nothing.
+         *
+         * The colours are ten-bit, not eight: Warcraft's 02c,050,02c is the
+         * dark green its sky is supposed to fade into.
+         */
+        uint32_t gb = RG(0x401c), sc = RG(0x4294), of = RG(0x4298);
+        float fscale, foff;
+        memcpy(&fscale, &sc, 4);
+        memcpy(&foff, &of, 4);
+        fp.fog_source = gb & 7;
+        fp.fog_scale = fscale;
+        fp.fog_offset = foff;
+        /* AMD declares the color registers as (0.9), not the (0.10)
+         * format used by the separate constant fog factor. */
+        fp.fog_colour[0] = (RG(0x4bc8) & 0x3ff) / 512.0f;
+        fp.fog_colour[1] = (RG(0x4bcc) & 0x3ff) / 512.0f;
+        fp.fog_colour[2] = (RG(0x4bd0) & 0x3ff) / 512.0f;
+        fp.fog_input = -1;
+        /*
+         * Off unless asked for while the corrected fog endpoints and
+         * vertex-alpha routing are validated against the 9200 control.
+         * POWEREMU_R350_FOG=1 enables the experimental linear fog path.
+         */
+        static unsigned fog_generation;
+        static bool fogon;
+        if (fog_generation != pe_env_generation) {
+            const char *e = getenv("POWEREMU_R350_FOG");
+            fogon = e && *e != '0';
+            fog_generation = pe_env_generation;
+        }
+        fp.fog_enable = fogon && fp.fog_source <= 5;
+        if (fp.fog_enable && fp.fog_source < 4) {
+            /*
+             * Carry the source in a varying of its own rather than in the
+             * v0..vN register file.  A fragment input there is pre-loaded
+             * into a temporary the program declared, so claiming a spare
+             * index refused 369,975 draws; and the Metal backend requires
+             * the fragment input mask and the vertex varying mask to be
+             * identical, so setting one without the other refused 94,061
+             * more.  A separate field answers to neither rule.
+             *
+             * If the vertex program turns out not to define that output, the
+             * varying comes through as zero, which reads as "no fog" -- wrong
+             * in the haze, right in the geometry.
+             */
+            if (fp.colour_map_valid &&
+                fp.colour_vp_output[fp.fog_source] != 0xff) {
+                vp.fog_varying = true;
+                vp.fog_output = fp.colour_vp_output[fp.fog_source];
+            } else {
+                fp.fog_enable = false;
+            }
+        }
+        if (PE_ENV_ON("POWEREMU_R350_FOG_VERTEX") && vertices && !bypass) {
+            static uint64_t seen[64];
+            static unsigned seen_count;
+            uint64_t key = ((uint64_t)RG(0x2090) << 32) ^ RG(0x4e04) ^
+                           ((uint64_t)RG(0x4bc8) << 20) ^ RG(0x4bcc);
+            for (unsigned pc = start; pc <= end; pc++) {
+                for (unsigned c = 0; c < 4; c++) {
+                    key = (key ^ vp.code[pc][c]) * 1099511628211ull;
+                }
+            }
+            bool known = false;
+            for (unsigned i = 0; i < seen_count; i++) known |= seen[i] == key;
+            if (!known && seen_count < ARRAY_SIZE(seen)) {
+                seen[seen_count++] = key;
+                R300PvsProgram cp = {.code=&vp.code[0][0],
+                    .cnst=&s->r350->pvs[512][0], .code_slots=256,
+                    .const_slots=256, .first=start, .last=end,
+                    .cbase=vp.control[1]&255, .cmax=(vp.control[1]>>16)&255,
+                    .bounded=vp.control[1]!=0, .valid=true};
+                R300PvsRegs cr = {0};
+                memcpy(cr.in, input[0].a, sizeof(cr.in));
+                r300_pvs_run(&cp, &cr, NULL);
+                fprintf(stderr, "R350_FOG_VERTEX draw=%u fmt=%08x source=%u "
+                        "output=%u enabled=%u blend=%08x "
+                        "alpha_out1=%g out2=%g out3=%g out4=%g\n",
+                        s->r350->draws_seen, RG(0x2090), fp.fog_source,
+                        fp.colour_vp_output[fp.fog_source & 3], fp.fog_enable,
+                        RG(0x4e04), cr.out[1][3], cr.out[2][3],
+                        cr.out[3][3], cr.out[4][3]);
+            }
+        }
     }
+    /* Compile first so texture bank ranges and operand use are validated. */
+    REQUIRE(r350_fp_validate(&fp, metal_error, sizeof(metal_error)), metal_error);
+    /* Later nodes can fetch even when the first node starts with ALU.
+     * Use the compiler's validated node walk, not only node[3]/bit 3. */
+    unsigned used = r300_fp_texture_mask(&fp);
     REQUIRE((used & ~RG(0x4104))==0, "disabled texture unit");
     size_t texture_total = 0;
-    bool guest_textures = false;
     for(unsigned unit=0;unit<16;unit++) {
         if(!(used&(1u<<unit))) continue;
         uint32_t format0=RG(0x4480+unit*4),format1=RG(0x44c0+unit*4),format2=RG(0x4500+unit*4);
         uint32_t texoffset=RG(0x4540+unit*4),filter=RG(0x4400+unit*4);
         unsigned tw=(format0&2047)+1,th=((format0>>11)&2047)+1;
         unsigned tp=(format0>>31) ? (format2&2047)+1 : tw;
+        if (unlikely(getenv("POWEREMU_R350_RESOLVE_TEX") != NULL)) {
+            static unsigned logged;
+            for (unsigned ri = 0; ri < ARRAY_SIZE(r350_resolved_surface); ri++) {
+                const R350ResolvedSurface *rs = &r350_resolved_surface[ri];
+                if (rs->gpu_offset && rs->gpu_offset == (texoffset & ~31u) &&
+                    logged++ < 100) {
+                    fprintf(stderr, "R350_RESOLVE_TEX draw=%u unit=%u "
+                            "off=%08x resolved=%ux%u/%u sampled=%ux%u/%u "
+                            "f0=%08x f1=%08x f2=%08x filter=%08x "
+                            "cblend=%08x ablend=%08x target=%08x/%08x\n",
+                            s->r350->draws_seen, unit, texoffset & ~31u,
+                            rs->width, rs->height, rs->pitch, tw, th, tp,
+                            format0, format1, format2, filter,
+                            RG(0x4e04), RG(0x4e08), RG(0x4e28), RG(0x4e38));
+                    break;
+                }
+            }
+        }
         /*
          * Does the guest declare a row pitch that is not the width, and do we
          * honour it?  Chess's window backing store is 672 wide in a 704-pitch
@@ -8399,11 +8881,33 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             }
         }
         unsigned texture_format=format1&31;
-        unsigned texture_bpp=texture_format==0 ? 1 : texture_format==12 ? 4 : 0;
+        /* Observed QuickTime client-storage path: YVYU422 with clamped
+         * YUV conversion over AGP. YUV channel selectors are ignored by
+         * hardware; this path produces RGBA before fragment sampling. */
+        bool yuv = texture_format == 21 && ((format1 >> 22) & 3) == 1 &&
+                   !r350_address_is_local(s, texoffset & ~31u) &&
+                   !(texoffset & 28) && !(tw & 1);
+        unsigned texture_bpp = yuv ? 2 : texture_format == 0 ? 1 :
+                               texture_format == 12 ? 4 : 0;
+        uint32_t format_mask = yuv ? 0xf85ffe1fu : 0xf81ffe1fu;
         unsigned levels=(format0>>26)&15;
+        if (unlikely(getenv("POWEREMU_R350_IBLOST")) &&
+            !((format0 & 0x03c00000) == 0 && texture_bpp &&
+              (format1 & ~format_mask) == 0 && (format2 & ~0x3fffu) == 0 &&
+              tp >= tw && (texoffset & 16) == 0 &&
+              (yuv || texture_bpp == 4 || !(texoffset & 3)))) {
+            static unsigned rejected_formats;
+            if (rejected_formats++ < 24) {
+                fprintf(stderr, "R350_TEXTURE_REJECT draw=%u unit=%u "
+                        "f0=%08x f1=%08x f2=%08x off=%08x "
+                        "size=%ux%u pitch=%u bpp=%u\n",
+                        s->r350->draws_seen, unit, format0, format1, format2,
+                        texoffset, tw, th, tp, texture_bpp);
+            }
+        }
         REQUIRE((format0&0x03c00000)==0 && texture_bpp &&
-                (format1&~0xf81ffe1fu)==0 && (format2&~0x3fffu)==0 && tp>=tw &&
-                (texoffset&16)==0 && (texture_bpp==4 || !(texoffset&3)),
+                (format1&~format_mask)==0 && (format2&~0x3fffu)==0 && tp>=tw &&
+                (texoffset&16)==0 && (yuv || texture_bpp==4 || !(texoffset&3)),
                 "texture format, pitch, mipmaps or microtiling");
         /* Render-to-texture must use the same explicit linear storage contract
          * as targets and the inherited 2D engine. Macro bit 2 and ordinary
@@ -8433,8 +8937,8 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         REQUIRE(aniso<=4, "sampler anisotropy");
         REQUIRE((filter&0x0f000000)==0, "sampler filter high bits");
         unsigned swizzle[4]={(format1>>12)&7,(format1>>15)&7,(format1>>18)&7,(format1>>9)&7};
-        REQUIRE(swizzle[0]<=5 && swizzle[1]<=5 && swizzle[2]<=5 && swizzle[3]<=5,"texture channel swizzle");
-        REQUIRE(texture_bpp==4 || ((swizzle[0]==0 || swizzle[0]>=4) &&
+        REQUIRE(yuv || (swizzle[0]<=5 && swizzle[1]<=5 && swizzle[2]<=5 && swizzle[3]<=5),"texture channel swizzle");
+        REQUIRE(yuv || texture_bpp==4 || ((swizzle[0]==0 || swizzle[0]>=4) &&
                 (swizzle[1]==0 || swizzle[1]>=4) &&
                 (swizzle[2]==0 || swizzle[2]>=4) &&
                 (swizzle[3]==0 || swizzle[3]>=4)),
@@ -8442,17 +8946,37 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         unsigned endian_swap = texoffset & 3;
         bool macro_tiled = texoffset & 4;
         unsigned micro_tiled = (texoffset >> 3) & 3;
+        /* Chess's identity-swizzled combined-tile resources are bytewise
+         * RGBA.  Warcraft III sets the same two tiling bits but uses the
+         * B,G,R,A selector and stores ordinary big-endian ARGB (its first
+         * texels are characteristically ff,RR,GG,BB).  Applying Chess's
+         * direct-byte exception to those surfaces maps alpha into blue and
+         * blue into alpha, producing the saturated blue/white menu. */
         bool r350_rgba_tiled = texture_bpp == 4 && macro_tiled &&
-                               micro_tiled == 1 && endian_swap == 0;
+                               micro_tiled == 1 && endian_swap == 0 &&
+                               swizzle[0] == 0 && swizzle[1] == 1 &&
+                               swizzle[2] == 2 && swizzle[3] == 3;
+        /* SURFACE_CNTL's CPU aperture reversal applies only to local VRAM.
+         * AGP client-storage bytes never crossed that aperture. Reversing
+         * them again turns a BGRA glyph's smooth alpha into blue and its
+         * blue (white) into opaque alpha when copied into the glyph cache. */
+        bool texture_native_bytes =
+            !r350_address_is_local(s, texoffset & ~31u) ||
+            (r350_rgba_tiled && !r350_tiled_swap());
+        unsigned byte_lane[4] = {0};
+        if (!yuv && texture_bpp == 4) {
+            for (unsigned c = 0; c < 4; c++) {
+                if (swizzle[c] < 4) {
+                    byte_lane[c] = r300_texture_byte_lane(swizzle[c], endian_swap,
+                                                          !texture_native_bytes);
+                }
+            }
+        }
         /* Rows, not macro pages: these surfaces are read linearly.  The
          * allocation behind a 32x32 glyph is 8 KiB where its pixels are 4 KiB,
          * but the padding is not image data and nothing needs to read it. */
         size_t bytes = (size_t)tp * th * texture_bpp;
         size_t output=(size_t)tw*th*4;
-        /* Byte order the texture's declared swap implies, per texel. */
-        static const unsigned perm[4][4]={{0,1,2,3},{1,0,3,2},{3,2,1,0},{2,3,0,1}};
-        /* Order this read against anything the GPU still has in flight. */
-        r350_read_barrier(s, texoffset & ~31u, bytes);
         /*
          * Sampling in place, when the texels are in local VRAM and Metal will
          * take a view at that alignment.  The guest's channel swizzle and this
@@ -8464,7 +8988,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
          * green, byte 2 in red and byte 3 in alpha; a single-byte texture is
          * viewed as R8Unorm and arrives in red.
          */
-        if (s->r350_direct_vram &&
+        /* Keep the compositor's established synchronization contract while
+         * validating in-place view ordering. Programmable application draws
+         * can rely on the backend's GPU dependency tracking. */
+        if (window_bypass) r350_read_barrier(s, texoffset & ~31u, bytes);
+        if (!yuv && s->r350_direct_vram &&
             r350_address_is_local(s, texoffset & ~31u) &&
             gpu_view_available(texoffset & ~31u, tp * texture_bpp, th,
                                texture_bpp)) {
@@ -8473,11 +9001,9 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 unsigned sel = swizzle[c];
                 fp.tex_swizzle[unit][c] = sel >= 4 ? sel :
                     texture_bpp == 1 ? 0 :
-                    lane_of_byte[r350_vram_component_byte(
-                        perm[texoffset & 3][sel])];
+                    lane_of_byte[byte_lane[c]];
             }
             fp.tex_swizzled = true;
-            guest_textures = true;
             draw.textures[unit]=(R300MetalTexture){
                 .width=tw,.height=th,.linear_filter=min>=2,
                 .address_s=clamp_s,.address_t=clamp_t,
@@ -8486,6 +9012,10 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 .guest_pitch=tp * texture_bpp,.guest_bpp=texture_bpp};
             continue;
         }
+        /* Only CPU staging needs completed pixels. Direct views are ordered
+         * by the Metal backend's texture conflict checks and shared queue;
+         * waiting here would serialize every render-to-texture dependency. */
+        r350_read_barrier(s, texoffset & ~31u, bytes);
         texture_total += bytes + output;
         REQUIRE(texture_total<=s->vram_size,"texture staging budget");
         g_autofree uint8_t *raw = g_malloc(bytes);
@@ -8537,23 +9067,32 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 fprintf(stderr, "R350_TEXFMT draw=%u unit=%u off=%08x %ux%u "
                         "bpp=%u f1=%08x swz=%u,%u,%u,%u endian=%u "
                         "macro=%u micro=%u rgba_tiled=%u "
-                        "byte_for_sel=%u,%u,%u,%u\n",
+                        "byte_for_sel=%u,%u,%u,%u raw0=%02x,%02x,%02x,%02x\n",
                         s->r350->draws_seen, unit, texoffset & ~31u, tw, th,
                         texture_bpp, format1,
                         swizzle[0], swizzle[1], swizzle[2], swizzle[3],
                         endian_swap, macro_tiled, micro_tiled, r350_rgba_tiled,
-                        r350_rgba_tiled ? perm[endian_swap][swizzle[0]]
-                            : r350_vram_component_byte(perm[endian_swap][swizzle[0]]),
-                        r350_rgba_tiled ? perm[endian_swap][swizzle[1]]
-                            : r350_vram_component_byte(perm[endian_swap][swizzle[1]]),
-                        r350_rgba_tiled ? perm[endian_swap][swizzle[2]]
-                            : r350_vram_component_byte(perm[endian_swap][swizzle[2]]),
-                        r350_rgba_tiled ? perm[endian_swap][swizzle[3]]
-                            : r350_vram_component_byte(perm[endian_swap][swizzle[3]]));
+                        byte_lane[0], byte_lane[1], byte_lane[2], byte_lane[3],
+                        raw[0], raw[1], raw[2], raw[3]);
             }
         }
         textures[unit]=g_malloc(output);
-        for(unsigned y=0;y<th;y++) for(unsigned x=0;x<tw;x++) for(unsigned c=0;c<4;c++) {
+        if (yuv) {
+            REQUIRE(r300_yvyu422_decode(raw, bytes, tw, th, tp, endian_swap,
+                                        textures[unit], output),
+                    "YVYU video texture layout");
+            if (PE_ENV_ON("POWEREMU_R350_IBLOST")) {
+                static unsigned video_logged;
+                if (video_logged++ < 8) {
+                    fprintf(stderr, "R350_VIDEO_TEXTURE %ux%u pitch=%u "
+                            "off=%08x raw=%02x,%02x,%02x,%02x "
+                            "rgba=%02x,%02x,%02x,%02x\n",
+                            tw, th, tp, texoffset, raw[0], raw[1], raw[2], raw[3],
+                            textures[unit][0], textures[unit][1],
+                            textures[unit][2], textures[unit][3]);
+                }
+            }
+        } else for(unsigned y=0;y<th;y++) for(unsigned x=0;x<tw;x++) for(unsigned c=0;c<4;c++) {
             unsigned sel=swizzle[c];
             /*
              * Linear, for every one of these -- including the surfaces whose
@@ -8577,19 +9116,16 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             size_t texel = ((size_t)y * tp + x) * texture_bpp;
             /* The swizzle names a component of the little-endian texel word,
              * so component 0 is the lowest-addressed byte of the texel as the
-             * texture unit would fetch it.  This VRAM is the guest CPU's
-             * big-endian view: see r350_vram_component_byte().
+             * texture unit would fetch it. Local VRAM is the guest CPU's
+             * big-endian aperture view; AGP bytes did not cross that
+             * aperture and retain the declared component order.
              *
              * Apple's combined-tile uploads are already byte-addressed RGBA
              * resources.  Their identity component map and transparent-white
              * sprite texels (ff ff ff 00) provide direct evidence that a
              * second aperture reversal is wrong for this storage path. */
             textures[unit][((size_t)y*tw+x)*4+c]=sel==4 ? 0:sel==5 ? 255:
-                raw[texel+
-                    (texture_bpp==1 ? 0 :
-                     (r350_rgba_tiled && !r350_tiled_swap()) ?
-                        perm[endian_swap][sel] :
-                     r350_vram_component_byte(perm[endian_swap][sel]))];
+                raw[texel + byte_lane[c]];
         }
         if (capture_scene_texture) {
             g_autofree char *name = g_strdup_printf(
@@ -8639,6 +9175,8 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                     texture_bpp,format0,format2,levels);
         }
         r350_perf.texture_bytes += bytes + output;   /* staged, not viewed */
+        r350_tex_inventory(texoffset & ~31u, tw, th, tp, format1,
+                           !r350_address_is_local(s, texoffset & ~31u));
         if (r350_address_is_local(s, texoffset & ~31u)) {
             r200_perf_for(s)->tex_vram++;
             r200_perf_high(s, (uint64_t)((texoffset & ~31u) -
@@ -8665,6 +9203,11 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         }
     }
     draw.vertices=triangles;draw.vertex_count=nv;draw.width=width;draw.height=height;
+    REQUIRE(!fp.depth_mirror || (draw.depth_pitch >= width &&
+            (uint64_t)draw.depth_guest_offset + (uint64_t)draw.depth_pitch *
+                height * (draw.depth_format == 0 ? 2 : 4) <= s->vram_size),
+            "shared depth buffer bounds");
+
     if (s->r350_shader_snapshots && r350_surface_once(offset,width,height)) {
         fprintf(stderr,"R350_SURFACE draw=%u off=%08x crtc=%08x %ux%u endian=%u "
                 "vp=(%.1f,%.1f %.1fx%.1f) ys=%.2f xs=%.2f vte=%08x "
@@ -8675,10 +9218,10 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                 RG(0x20b0),RG(0x43b4),RG(0x43e4),RG(0x43d0),nv,
                 (int)draw.primitive_points);
     }
-    draw.viewport_x=window_bypass ? 0 : viewport_x_offset-xs;
-    draw.viewport_y=window_bypass ? 0 : viewport_y_offset-fabsf(ys);
-    draw.viewport_width=window_bypass ? width : vw;
-    draw.viewport_height=window_bypass ? height : vh;
+    draw.viewport_x=(window_bypass || window_program_point) ? 0 : viewport_x_offset-xs;
+    draw.viewport_y=(window_bypass || window_program_point) ? 0 : viewport_y_offset-fabsf(ys);
+    draw.viewport_width=(window_bypass || window_program_point) ? width : vw;
+    draw.viewport_height=(window_bypass || window_program_point) ? height : vh;
     draw.scissor[0]=x0;draw.scissor[1]=y0;draw.scissor[2]=x1-x0;draw.scissor[3]=y1-y0;
     uint32_t mask=RG(0x4e0c);
     draw.color_mask=((mask&4)>>2)|(mask&2)|((mask&1)<<2)|(mask&8);
@@ -8690,6 +9233,10 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
      * program has to be compiled for guest byte order, and to do its own
      * blending, because neither survives Metal's view of a swizzled target.
      */
+    if (fp.depth_mirror || draw.depth_tiled_export) {
+        REQUIRE(ppc_mac_gpu_metal_submit_ready(), "shared depth VRAM unavailable");
+        draw.depth_guest_vram = memory_region_get_ram_ptr(&s->vram);
+    }
     bool direct = s->r350_direct_vram && ppc_mac_gpu_metal_submit_ready();
     if (direct) {
         draw.guest_target=true;
@@ -8702,9 +9249,12 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
         fp.blend_src_alpha=draw.blend_src_alpha;
         fp.blend_dst_alpha=draw.blend_dst_alpha;
     }
-    if (direct || guest_textures) {
-        /* Recompile: byte order, blending and the texel reorder are all
-         * compiled into the shader, not set on the pipeline. */
+    if (getenv("R350_VPDUMP") || PE_ENV_ON("POWEREMU_R350_PIPELINE_TRACE") ||
+        PE_ENV_ON("POWEREMU_R350_UI_TRACE") ||
+        PE_ENV_ON("POWEREMU_R350_VIDEO_TRACE")) {
+        /* Only diagnostics need the final source here. The Metal backend
+         * validates and compiles the fully linked variant before rendering. */
+        msl = g_malloc(R300_FP_MSL_CAPACITY);
         REQUIRE(r300_fp_compile_msl(&fp,msl,R300_FP_MSL_CAPACITY,
                                     metal_error,sizeof(metal_error)),metal_error);
     }
@@ -8761,6 +9311,15 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             r350_perf.target_bytes += (uint64_t)draw.target_size * 2;
         }
         REQUIRE(drew_ok, metal_error);
+        if (fp.depth_mirror) {
+            ppc_mac_gpu_dirty(s, draw.depth_guest_offset,
+                             (uint64_t)draw.depth_pitch * height *
+                             (draw.depth_format == 0 ? 2 : 4));
+        }
+        if (draw.depth_tiled_export) {
+            ppc_mac_gpu_dirty(s, draw.depth_guest_offset,
+                             (uint64_t)draw.depth_pitch * ((height + 7u) & ~7u) * 8);
+        }
     }
     if (diag) {
         size_t o = ((size_t)draw.scissor[1]*width + draw.scissor[0])*4;
@@ -9078,6 +9637,8 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
                     program_point ? "program_point" : "other");
             logged++;
         }
+    }
+    {
         /*
          * The window-content draws in full: the vertex program we compiled
          * for them, the constants it reads, and the positions it is fed.
@@ -9088,15 +9649,83 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
          */
         static unsigned dumped;
         const char *vpdump = getenv("R350_VPDUMP");
-        if (vpdump && dumped < 6 && width > 500 &&
-            !window_bypass && nv >= 6 &&
-            s->r350->draws_seen >= (unsigned)atoi(vpdump)) {
+        bool pipeline_trace = PE_ENV_ON("POWEREMU_R350_PIPELINE_TRACE");
+        bool ui_trace = PE_ENV_ON("POWEREMU_R350_UI_TRACE");
+        bool video_trace = PE_ENV_ON("POWEREMU_R350_VIDEO_TRACE");
+        unsigned pipeline_limit = ui_trace ? 32 : 6;
+        unsigned projection_base = vp.control[1] & 255;
+        bool orthographic = projection_base + 3 < 256 &&
+            vc[projection_base + 3][0] == 0 &&
+            vc[projection_base + 3][1] == 0 &&
+            vc[projection_base + 3][2] == 0 &&
+            vc[projection_base + 3][3] == 1;
+        pipeline_trace |= ui_trace || video_trace;
+        static unsigned pipeline_generation;
+        static uint32_t pipeline_seen[32];
+        if (pipeline_generation != pe_env_generation) {
+            pipeline_generation = pe_env_generation;
+            dumped = 0;
+            memset(pipeline_seen, 0, sizeof(pipeline_seen));
+        }
+        if ((vpdump || pipeline_trace) && dumped < pipeline_limit && width > 500 &&
+            (!ui_trace || window_bypass || orthographic) &&
+            (ui_trace || video_trace || !window_bypass) && nv >= 6 &&
+            (!video_trace || ((fp.control[2] >> 6) & 63) >= 15) &&
+            (pipeline_trace || s->r350->draws_seen >= (unsigned)atoi(vpdump))) {
             char *vmsl = g_malloc(65536);
             if (r300_vp_compile_msl(&vp, vmsl, 65536, metal_error,
                                     sizeof(metal_error))) {
+                uint32_t pipeline_key = g_str_hash(vmsl) ^ g_str_hash(msl);
+                if (ui_trace) {
+                    pipeline_key = pipeline_key * 33u ^ RG(0x4540);
+                }
+                bool pipeline_duplicate = false;
+                for (unsigned k = 0; pipeline_trace && k < dumped; k++) {
+                    pipeline_duplicate |= pipeline_seen[k] == pipeline_key;
+                }
+                if (pipeline_duplicate) {
+                    g_free(vmsl);
+                    goto pipeline_trace_done;
+                }
+                pipeline_seen[dumped] = pipeline_key;
                 fprintf(stderr, "R350_VP %u tgt=%08x %ux%u vp=%g,%g,%g,%g\n%s\n",
                         dumped, offset, width, height, (double)xs, (double)xo,
                         (double)ys, (double)yo, vmsl);
+                if (pipeline_trace) {
+                    fprintf(stderr, "R350_LINK %u rs=%08x,%08x,%08x "
+                            "gb=%08x vte=%08x pvs=%08x,%08x,%08x\n", dumped,
+                            RG(0x4300), RG(0x4330), RG(0x4320), RG(0x401c),
+                            RG(0x20b0), vp.control[0], vp.control[1], vp.control[2]);
+                    fprintf(stderr, "R350_FP %u mask=%x colour=%x clamp=%u alpha=%08x "
+                            "blend=%u:%u,%u:%u,%u\n%s\n", dumped,
+                            vp.varying_mask, vp.varying_colour_mask, vp.colour_clamp_mode,
+                            fp.alpha_func, draw.blend_enable, draw.blend_src_rgb,
+                            draw.blend_dst_rgb, draw.blend_src_alpha, draw.blend_dst_alpha, msl);
+                    for (unsigned k = 0; k < 32; k++) {
+                        fprintf(stderr, "R350_FPC %u c[%u]=%g,%g,%g,%g\n", dumped, k,
+                                (double)fc[k][0], (double)fc[k][1],
+                                (double)fc[k][2], (double)fc[k][3]);
+                    }
+                    for (unsigned k = 0; k < 16; k++) {
+                        if (draw.textures[k].width) {
+                            fprintf(stderr, "R350_SAMPLER %u unit=%u filter=%08x "
+                                    "format=%08x,%08x offset=%08x size=%ux%u\n",
+                                    dumped, k, RG(0x4400+k*4), RG(0x4480+k*4),
+                                    RG(0x44c0+k*4), RG(0x4540+k*4),
+                                    draw.textures[k].width, draw.textures[k].height);
+                        }
+                    }
+                    for (unsigned v = 0; v < nv && v < 6; v++) {
+                        for (unsigned k = 0; k < 16; k++) {
+                            if (vp.attribute_mask & (1u << k)) {
+                                const float *a = triangles[v].a[k];
+                                fprintf(stderr, "R350_ATTR %u v%u a%u=%g,%g,%g,%g\n",
+                                        dumped, v, k, (double)a[0], (double)a[1],
+                                        (double)a[2], (double)a[3]);
+                            }
+                        }
+                    }
+                }
                 for (unsigned i = 0; i < 256; i++) {
                     if (vc[i][0] || vc[i][1] || vc[i][2] || vc[i][3]) {
                         fprintf(stderr, "R350_VPC %u c[%u]=%g %g %g %g\n",
@@ -9120,6 +9749,7 @@ static bool r350_linear_draw(PPCMacGPUState *s, const uint32_t *words,
             }
             g_free(vmsl);
         }
+    pipeline_trace_done:;
     }
     r200_perf_high(s, (uint64_t)offset + draw.target_size);
     if (offset == s->regs.crtc_offset) {
@@ -9150,7 +9780,9 @@ done:
                     r350_reject_census[i].count, r350_reject_census[i].reason);
         }
     }
-    if (!success && s->r350_shader_snapshots && s->r350->rejection_snapshots < 16) {
+    if (!success && (s->r350_shader_snapshots ||
+                    PE_ENV_ON("POWEREMU_R350_FAILURE_TRACE")) &&
+        s->r350->rejection_snapshots < 16) {
         bool seen = false;
         for (unsigned i=0; i<s->r350->rejection_snapshots; i++) {
             if (!strncmp(reason, s->r350->rejection_reason[i], 127)) seen = true;
@@ -9159,6 +9791,7 @@ done:
             g_strlcpy(s->r350->rejection_reason[s->r350->rejection_snapshots++],
                       reason, sizeof(s->r350->rejection_reason[0]));
             fprintf(stderr, "R350_FAILURE draw=%u reason=%s\n", s->r350->draws_seen, reason);
+            fprintf(stderr, "R350_FAILURE_VF_CNTL %08x\n", RG(0x2084));
             fprintf(stderr, "R350_PACKET draw=%u src=%d words=%u captured=%u fb=%08x agp=%08x\n",
                     s->r350->draws_seen, source, count, MIN(count,4096u),
                     s->regs.mc_fb_location,s->regs.mc_agp_location);
@@ -9545,6 +10178,43 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             uint32_t pkt_count = ((hdr >> 16) & 0x3FFF) + 1;
             uint32_t reg_base = hdr & 0x7FFF;
             bool one_reg_wr = (hdr >> 15) & 1;
+
+            const char *parent_dump = getenv("POWEREMU_R350_PM4_PARENT");
+            if (s->r350_probe && parent_dump && g_in_pm4 == 1 &&
+                reg_base == R200_CP_IB_BASE / 4 && !one_reg_wr &&
+                pkt_count == 2 && i + 1 < size_dw && pm4_data[i + 1] >= 128) {
+                static unsigned parents;
+                if (parents < 16) {
+                    char *path = g_strdup_printf("%s-%u.bin", parent_dump, parents++);
+                    if (g_file_set_contents(path, (const char *)pm4_data,
+                                            size_dw * sizeof(*pm4_data), NULL)) {
+                        fprintf(stderr, "R350_IB_PARENT path=%s at=%u hdr=%08x\n",
+                                path, i - 1, hdr);
+                    }
+                    g_free(path);
+                }
+            }
+
+            /* Bounded diagnostics for command-stream corruption during a
+             * mode switch. A normal shader upload cannot touch the memory
+             * controller or AIC registers. Keep the packet boundary as well
+             * as its writes so a bad translation is distinguishable from a
+             * guest-programmed aperture change. */
+            if (s->r350_probe && getenv("POWEREMU_R350_IBLOST") &&
+                reg_base * 4 <= 0x1e4 &&
+                (reg_base + (one_reg_wr ? 0 : pkt_count - 1)) * 4 >= 0x148) {
+                static unsigned aperture_packets;
+                if (aperture_packets++ < 128) {
+                    fprintf(stderr, "R350_APERTURE_PKT ib=%08x at=%u/%u "
+                            "hdr=%08x reg=%04x n=%u one=%u data=",
+                            s->regs.cp_ib_base, i - 1, size_dw, hdr,
+                            reg_base * 4, pkt_count, one_reg_wr);
+                    for (unsigned j = 0; j < MIN(12u, MIN(pkt_count, size_dw - i)); j++) {
+                        fprintf(stderr, "%08x,", pm4_data[i + j]);
+                    }
+                    fputc('\n', stderr);
+                }
+            }
 
             /* Phase A — VRAM watch: check before & after Type 0 processing */
             uint32_t vw_before = 0;
@@ -10387,13 +11057,20 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                            dst_x, dst_y, blit_w, blit_h,
                                            false, color != 0);
                         }
-                        /* MC helper handles tiling transparently */
-                        for (uint32_t row = 0; row < blit_h; row++) {
-                            for (uint32_t col = 0; col < blit_w; col++) {
-                                uint64_t d_linear = (uint64_t)offset +
-                                    (uint64_t)(dst_y + row) * pitch +
-                                    (uint64_t)(dst_x + col) * bpp;
-                                fill_vram_px(s, vram, d_linear, color, bpp);
+                        /* Use the same bounded row fill as MMIO clears.
+                         * Keep the MC-aware pixel fallback for tiled or
+                         * non-32-bit surfaces, and retain the access barrier
+                         * above plus dirty/depth notifications below. */
+                        if (!fill_rect_fast(s, vram, offset, pitch,
+                                            dst_x, dst_y, blit_w, blit_h,
+                                            bpp, color)) {
+                            for (uint32_t row = 0; row < blit_h; row++) {
+                                for (uint32_t col = 0; col < blit_w; col++) {
+                                    uint64_t d_linear = (uint64_t)offset +
+                                        (uint64_t)(dst_y + row) * pitch +
+                                        (uint64_t)(dst_x + col) * bpp;
+                                    fill_vram_px(s, vram, d_linear, color, bpp);
+                                }
                             }
                         }
                         uint64_t dirty_start = (uint64_t)offset +
@@ -10794,6 +11471,19 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 trace_ppc_mac_gpu_3d_cmd(opcode, body_dw);
 
             } else if (opcode == 0x32) {
+                if (s->r350_probe && getenv("POWEREMU_R350_POINT")) {
+                    fprintf(stderr, "R350_ZMASK start=%08x count=%08x "
+                            "mask=%08x off=%08x pitch=%08x value=%08x "
+                            "bw=%08x format=%08x scissor=%08x\n",
+                            body_dw > 0 ? d[0] : 0, body_dw > 1 ? d[1] : 0,
+                            body_dw > 2 ? d[2] : 0,
+                            s->r300_shadow[0x4f20 / 4],
+                            s->r300_shadow[0x4f24 / 4],
+                            s->r300_shadow[0x4f28 / 4],
+                            s->r300_shadow[0x4f1c / 4],
+                            s->r300_shadow[0x4f10 / 4],
+                            s->r300_shadow[0x43e4 / 4]);
+                }
                 /*
                  * 3D_CLEAR_ZMASK (d[0] first tile, d[1] tile count, d[2]
                  * mask value).  With Z compression on (ZSTENCILCNTL bits
@@ -10804,10 +11494,17 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  * opcode used to be run as an indirect buffer at GPU address
                  * d[0] - i.e. the front buffer's pixels executed as PM4.
                  */
-                r200_clear_depth_buffer(s);
+                if (s->r350_probe && s->r350_linear_render) {
+                    r350_clear_zmask(s, d, body_dw);
+                } else {
+                    r200_clear_depth_buffer(s);
+                }
 
             } else if (opcode == 0x37) {
                 /* 3D_CLEAR_HIZ: no hierarchical Z is modelled. */
+
+            } else if (opcode == 0x38) {
+                r350_clear_cmask(s, d, body_dw);
 
             } else if (opcode == 0x33) {
                 /*
@@ -10874,6 +11571,15 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
 
             i += body_dw;
         } else {
+            if (s->r350_probe && getenv("POWEREMU_R350_IBLOST")) {
+                static unsigned type1;
+                if (type1++ < 32) {
+                    fprintf(stderr, "R350_TYPE1 hdr=%08x at=%u/%u next=%08x,%08x\n",
+                            hdr, i - 1, size_dw,
+                            i < size_dw ? pm4_data[i] : 0,
+                            i + 1 < size_dw ? pm4_data[i + 1] : 0);
+                }
+            }
             /* Type 1: skip data words */
             uint32_t pkt_count = ((hdr >> 16) & 0x3FFF) + 1;
             i += pkt_count;
@@ -10947,6 +11653,18 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
 
     s->regs.stall_ib_done++;
     s->regs.stall_ib_dwords += ib_size_dw;
+    if (s->r350_probe && getenv("POWEREMU_R350_IBLOST") &&
+        (ib_data[0] >> 30) == 0 &&
+        (((ib_data[0] >> 16) & 0x3fff) + 1) >= ib_size_dw) {
+        static unsigned raw_ib;
+        if (raw_ib++ < 32) {
+            fprintf(stderr, "R350_IB_RAW base=%08x n=%u first=%08x "
+                    "pm4=%u pio_remaining=%u pio_reg=%08x me=%08x csq=%08x\n",
+                    ib_base, ib_size_dw, ib_data[0], g_in_pm4,
+                    s->pm4_pkt_count, s->pm4_pkt_reg,
+                    s->regs.cp_me_cntl, s->regs.cp_csq_cntl);
+        }
+    }
     ppc_mac_gpu_process_pm4(s, ib_data, ib_size_dw);
     g_free(ib_data);
 }
@@ -10964,6 +11682,45 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
  *   - RPTR and WPTR are in DWord units
  *   - Ring wraps at (ring_size_dw - 1)
  */
+/* Diagnostic only: report ring-processing intervals while MMIO owns BQL.
+ * Aggregated output avoids logging every draw or changing GPU serialization. */
+static bool gpu_audio_timing_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("POWEREMU_AUDIO_TIMING") != NULL;
+    }
+    return on;
+}
+
+static void gpu_audio_timing_record(int64_t began, int64_t ended)
+{
+    static int64_t last, max_begin, max_end;
+    static uint64_t batches, total_ns, max_ns, over_ms;
+    uint64_t elapsed = ended - began;
+
+    batches++;
+    total_ns += elapsed;
+    over_ms += elapsed > SCALE_MS;
+    if (elapsed > max_ns) {
+        max_ns = elapsed;
+        max_begin = began;
+        max_end = ended;
+    }
+    if (!last) {
+        last = ended;
+    } else if (ended - last >= NANOSECONDS_PER_SECOND) {
+        qemu_log("gpu-audio-timing: wall-ns %" PRId64
+                 " batches %" PRIu64 " ring-total-us %" PRIu64
+                 " ring-max-us %" PRIu64 " ring-over-1ms %" PRIu64
+                 " ring-begin-ns %" PRId64 " ring-end-ns %" PRId64 "\n",
+                 ended, batches, total_ns / 1000, max_ns / 1000, over_ms,
+                 max_begin, max_end);
+        last = ended;
+        batches = total_ns = max_ns = over_ms = 0;
+    }
+}
+
 static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
                                              uint32_t old_rptr,
                                              uint32_t new_wptr)
@@ -10991,33 +11748,17 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
      * The ring buffer base (CP_RB_BASE) is an AGP address that needs
      * GART translation to access system RAM. */
     uint32_t *rb_data = g_malloc(count * 4);
-    AddressSpace *as = pci_get_address_space(&s->pci);
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t offset_dw = (old_rptr + i) & ring_mask;
-        uint32_t gpu_addr = s->regs.cp_rb_base + offset_dw * 4;
-        hwaddr phys;
-
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
-            gpu_debug_log("RING: GART translate failed at gpu_addr=0x%x "
-                          "(rb_base=0x%x offset_dw=%u)",
-                          gpu_addr, s->regs.cp_rb_base, offset_dw);
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t offset_dw = (old_rptr + done) & ring_mask;
+        uint32_t n = MIN(count - done, ring_size_dw - offset_dw);
+        uint32_t address = s->regs.cp_rb_base + offset_dw * 4;
+        if (!ppc_mac_gpu_read_command_words(s, address, rb_data + done, n)) {
+            gpu_debug_log("RING: command read failed at gpu_addr=0x%x", address);
             g_free(rb_data);
             return;
         }
-
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
-        if (r != MEMTX_OK) {
-            gpu_debug_log("RING: read failed at phys=0x%"PRIx64, (uint64_t)phys);
-            g_free(rb_data);
-            return;
-        }
-
-        /* Ring buffer data is written by PPC CPU in big-endian */
-        rb_data[i] = be32_to_cpu(raw);
+        done += n;
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
@@ -11410,7 +12151,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
-    if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
+    if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG7 && !(addr & 3) &&
         r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
         /* fence poll: answered without flushing later work */
     } else if (addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
@@ -11936,11 +12677,11 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         break;
 
     /* Scratch registers — key fence-completion polling path */
-    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
+    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG7: {
         int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
         val = s->regs.scratch_reg[scratch_idx];
         if (getenv("POWEREMU_FENCE_TRACE")) {
-            static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
+            static uint32_t last[8] = { 0xFFFFFFFF }; static int n;
             if (val != last[scratch_idx] && n++ < 40) {
                 last[scratch_idx] = val;
                 fprintf(stderr, "ppc-mac-gpu fence: guest reads reg%d = %u\n",
@@ -12197,7 +12938,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                          idx >= 0 ? g_post_probe_audit.entries[idx].count : 0,
                          addr == R200_RBBM_STATUS ? "status_poll" :
                          (addr >= R200_SCRATCH_REG0 &&
-                          addr <= R200_SCRATCH_REG5) ? "fence" :
+                          addr <= R200_SCRATCH_REG7) ? "fence" :
                          addr == R200_CP_STAT ? "cp_status" :
                          (addr >= 0x1C00 && addr < 0x4000) ? "3d_reg" :
                          "other",
@@ -12254,7 +12995,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                     const char *ctx =
                         e->reg == R200_RBBM_STATUS ? "STATUS_POLL" :
                         (e->reg >= R200_SCRATCH_REG0 &&
-                         e->reg <= R200_SCRATCH_REG5) ? "FENCE" :
+                         e->reg <= R200_SCRATCH_REG7) ? "FENCE" :
                         e->reg == R200_CP_STAT ? "CP_STATUS" :
                         (e->reg >= 0x1C00 && e->reg < 0x4000) ? "3D_REG" :
                         (e->reg == R200_CRTC_VLINE_CRNT_VLINE ||
@@ -12359,6 +13100,28 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
     r350_probe_access(s, addr, val, true);
+    /*
+     * Every write to GA_POINT_SIZE, with its access size and the draw count
+     * at the time.  Warcraft's depth clear arrives with the height field
+     * zero, and a point of zero height clears nothing on real hardware
+     * either -- so either the register is written in halves and we are
+     * reading it between them, or the size for those draws does not come
+     * from here at all.  The access size separates the two.
+     */
+    if (unlikely(addr == 0x421c && getenv("POWEREMU_R350_POINT") != NULL)) {
+        static unsigned wlog;
+        /* Only the writes that zero a dimension, which are the ones in
+         * question: the desktop's own full-screen points and its 0.5px
+         * minimum filled the cap before the application ever started. */
+        bool zero_dim = ((uint32_t)val >> 16) == 0 ||
+                        ((uint32_t)val & 0xffff) == 0;
+        if (zero_dim && wlog < 40) {
+            wlog++;
+            fprintf(stderr, "R350_POINTREG write size=%u value=%08x "
+                    "draws_so_far=%u\n", size, (uint32_t)val,
+                    s->r350 ? s->r350->draws_seen : 0);
+        }
+    }
     /*
      * The display stride comes out right on one card and wrong on the other
      * from the same guest, so the question is which writes each one is
@@ -12482,6 +13245,16 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.mc_fb_location = val;
         break;
     case R200_MC_AGP_LOCATION:
+        if (s->r350_probe && getenv("POWEREMU_R350_IBLOST")) {
+            static unsigned aperture_writes;
+            if (aperture_writes++ < 128) {
+                fprintf(stderr, "R350_APERTURE_WRITE old=%08x new=%08x "
+                        "size=%u pm4=%u ib=%08x last=%08x\n",
+                        s->regs.mc_agp_location, (uint32_t)val, size,
+                        g_in_pm4, s->regs.cp_ib_base,
+                        s->mc_agp_location_last_valid);
+            }
+        }
         s->regs.mc_agp_location = val;
         break;
 
@@ -12495,8 +13268,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* RBBM soft reset */
     case R200_RBBM_SOFT_RESET:
-        /* Acknowledge the reset request, but don't actually reset much */
+    case 0x170c: /* R300 alias */
+        /* Reset the R350 command queue without disturbing display state. */
         trace_ppc_mac_gpu_soft_reset(val);
+        if (s->r350_probe && (val & 1)) {
+            s->regs.cp_rb_rptr = s->regs.cp_rb_wptr = 0;
+            s->r300_shadow[0x071c / 4] = 0;
+            s->pm4_pkt_count = s->pm4_fifo_idx = 0;
+        }
         break;
 
     /* Surface */
@@ -12518,7 +13297,6 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     case 0x4020: /* R300_GB_AA_CONFIG */
     case 0x2140: /* R300_VAP_CNTL_STATUS */
     case 0x2150: /* R300_VAP_PVS_STATE_FLUSH_REG */
-    case 0x170C: /* R300_RBBM_SOFT_RESET */
     case 0x4100: /* R300_TX_ENABLE */
     case 0x4200: /* R300_TX_FILTER0_0 */
     case 0x4204: /* R300_TX_FILTER0_1 */
@@ -12861,11 +13639,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
         break;
+    case 0x071c: /* CP_RB_RPTR_WR: transferred on WPTR with bit31 enabled */
+        s->r300_shadow[0x071c / 4] = val;
+        break;
     case R200_CP_RB_WPTR: {
         /* Ring submission advances the primary queue pointers; see
          * CP_CSQ_STAT. */
         s->csq_pri_ptr++;
         uint32_t old_rptr = s->regs.cp_rb_rptr;
+        if (s->r350_probe && (s->regs.cp_rb_cntl & (1u << 31))) {
+            old_rptr = s->r300_shadow[0x071c / 4];
+        }
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
                       val, s->regs.cp_rb_wptr,
                       (int)val - (int)s->regs.cp_rb_wptr);
@@ -12875,17 +13659,28 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          * Process ring buffer commands if the microengine is started.
          * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
          */
-        if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
+        unsigned csq_mode = s->regs.cp_csq_cntl >> 28;
+        bool ring_enabled = !s->r350_probe || csq_mode == 2 ||
+                            csq_mode == 4 || csq_mode == 7;
+        bool running = ring_enabled && !(s->regs.cp_me_cntl & (1u << 28));
+        if (running && val != old_rptr) {
             s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
             r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
                                                           : val;
+            bool audio_timing = gpu_audio_timing_on();
+            int64_t began = audio_timing ?
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
             ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
+            if (audio_timing) {
+                gpu_audio_timing_record(began,
+                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+            }
         }
 
         /* Everything is carried out here, so the ring is empty again --
          * in the card's own register and in the copy the driver may be
          * reading from memory instead. */
-        s->regs.cp_rb_rptr = val;
+        s->regs.cp_rb_rptr = running || !s->r350_probe ? val : old_rptr;
         ppc_mac_gpu_rptr_writeback(s);
         /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
          * sees a different value after we process commands. */
@@ -12893,6 +13688,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     }
     case R200_CP_ME_CNTL:
+        if (s->r350_probe && getenv("POWEREMU_R350_IBLOST")) {
+            static unsigned me_writes;
+            if (me_writes++ < 64) {
+                fprintf(stderr, "R350_ME_WRITE old=%08x new=%08x pm4=%u\n",
+                        s->regs.cp_me_cntl, (uint32_t)val, g_in_pm4);
+            }
+        }
         s->regs.cp_me_cntl = val;
         gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", val, !(val & 0x10000000));
         break;
@@ -12909,7 +13711,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
          * NOTE: Do NOT auto-complete scratch registers here.
          *
          * The IB command stream itself contains PM4 type0 packets that
-         * write fence values to SCRATCH_REG0-5.  Those writes flow through
+         * write fence values to SCRATCH_REG0-7.  Those writes flow through
          * ppc_mac_gpu_mmio_write() → scratch_writeback() during IB
          * processing, so the correct fence value is already written to
          * the GART/VRAM writeback address by the time the IB finishes.
@@ -13011,7 +13813,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Scratch registers with writeback */
-    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
+    case R200_SCRATCH_REG0 ... R200_SCRATCH_REG7: {
         int idx = (addr - R200_SCRATCH_REG0) / 4;
 
         s->regs.scratch_reg[idx] = val;
@@ -14016,6 +14818,13 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                  (1 << 10));       /* D2 supported */
 
     trace_ppc_mac_gpu_realize(s->vram_size_mb, s->vram_size);
+#ifdef __APPLE__
+    /* Opt-in warm compilation must happen during realize, before vCPUs and
+     * guest audio start. Lazy renderer creation would move it into MMIO. */
+    if (s->r350_probe && getenv("POWEREMU_R350_SHADER_CACHE")) {
+        s->r350->renderer = r300_metal_create();
+    }
+#endif
 }
 
 /* PCI config space read/write hooks for debugging */
@@ -14228,6 +15037,22 @@ static void ppc_mac_gpu_append_cpu_perf(GString *out)
         }
     }
 #endif
+}
+
+/* Every distinct texture surface this card sampled; see r350_tex_inventory. */
+static char *ppc_mac_gpu_get_tex_inventory(Object *obj, Error **errp)
+{
+    GString *out = g_string_new(NULL);
+
+    g_string_append_printf(out, "textures=%u\n", r350_tex_seen_n);
+    for (unsigned i = 0; i < r350_tex_seen_n; i++) {
+        const R350TexSeen *e = &r350_tex_seen[i];
+        g_string_append_printf(out,
+            "%08x %4ux%-4u pitch=%-5u fmt=%08x %s draws=%" PRIu64 "\n",
+            e->offset, e->width, e->height, e->pitch, e->fmt,
+            e->agp ? "agp" : "vram", e->draws);
+    }
+    return g_string_free(out, FALSE);
 }
 
 static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
@@ -14489,6 +15314,8 @@ static void ppc_mac_gpu_class_init(ObjectClass *klass, void *data)
     dc->hotpluggable = false;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_str(klass, "perf", ppc_mac_gpu_get_perf, NULL);
+    object_class_property_add_str(klass, "x-tex-inventory",
+                                  ppc_mac_gpu_get_tex_inventory, NULL);
     /* Write a path to dump VRAM at that exact moment -- see the setter. */
     object_class_property_add_str(klass, "x-vram-dump", NULL,
                                   ppc_mac_gpu_set_vram_dump);

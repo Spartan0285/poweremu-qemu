@@ -73,6 +73,8 @@ void gpu_submit_set_pass_ender(void (*end_pass)(void));
 
 /* The open command buffer, opening one if there is none. */
 id<MTLCommandBuffer> gpu_submit_buffer(void);
+/* Claim encoding ownership, closing another backend's open pass first. */
+id<MTLCommandBuffer> gpu_submit_buffer_for(void (*end_pass)(void));
 bool gpu_submit_have_buffer(void);
 
 /*
@@ -120,7 +122,8 @@ bool gpu_range_busy(uint64_t lo, uint64_t hi, bool write_access);
  * Would an access to [lo, hi) in *this* batch read or retarget memory the
  * same batch has already written through a different view?  @same names the
  * view the caller will use; writing again through that same view is not a
- * conflict, because Metal orders those against each other.
+ * conflict, because Metal orders those against each other. A target also
+ * conflicts with earlier sampled reads overlapping the bytes it overwrites.
  */
 bool gpu_batch_conflict(uint64_t lo, uint64_t hi, const GPUSurfaceKey *same);
 
