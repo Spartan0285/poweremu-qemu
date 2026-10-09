@@ -27,7 +27,10 @@
 #include <pthread.h>            /* pthread_X */
 
 #include "qemu/main-loop.h"
+#include "qemu/atomic.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
+#include "qemu/timer.h"
 #include "audio.h"
 
 #define AUDIO_CAP "coreaudio"
@@ -42,6 +45,26 @@ typedef struct coreaudioVoiceOut {
     UInt32 audioDevicePropertyBufferFrameSize;
     AudioDeviceIOProcID ioprocid;
     bool enabled;
+    bool ioproc_started;
+    /* BQL serializes the producer; the device IOProc is the sole consumer.
+     * Release publishes copied PCM / consumed space, acquire observes it.
+     * Reset only with the device stopped and its IOProc destroyed. */
+    bool spsc_output;
+    /* Optional diagnostic PCM handoff, callback -> main thread. */
+    uint8_t *capture_pcm;
+    size_t capture_size;
+    uint64_t capture_written, capture_read, capture_dropped;
+    FILE *capture_file;
+    unsigned capture_generation;
+    int64_t capture_last_ms;
+    uint64_t output_written, output_read;
+    bool debug_audio;
+    int64_t debug_last_ms;
+    uint64_t debug_callbacks, debug_empty_callbacks, debug_missing_frames;
+    uint64_t debug_invocations, debug_unusable_callbacks;
+    /* Producer-side PCM diagnostics; BQL owns these counters. */
+    uint64_t debug_producer_frames, debug_producer_zero_frames;
+    uint64_t debug_producer_zero_run, debug_producer_zero_max;
 } coreaudioVoiceOut;
 
 /*
@@ -159,23 +182,6 @@ static OSStatus coreaudio_set_streamformat(AudioDeviceID id,
                                       NULL,
                                       size,
                                       d);
-}
-
-static OSStatus coreaudio_get_isrunning(AudioDeviceID id, UInt32 *result)
-{
-    UInt32 size = sizeof(*result);
-    AudioObjectPropertyAddress addr = {
-        kAudioDevicePropertyDeviceIsRunning,
-        kAudioDevicePropertyScopeOutput,
-        kAudioObjectPropertyElementMain
-    };
-
-    return AudioObjectGetPropertyData(id,
-                                      &addr,
-                                      0,
-                                      NULL,
-                                      &size,
-                                      result);
 }
 
 static void coreaudio_logstatus (OSStatus status)
@@ -297,8 +303,152 @@ static int coreaudio_buf_unlock (coreaudioVoiceOut *core, const char *fn_name)
     return 0;
 }
 
+/* Capture the actual output packets without doing file IO in the IOProc.
+ * This is driver-input PCM, not a recording of the physical speakers. */
+static void coreaudio_capture_push(coreaudioVoiceOut *core,
+                                   const AudioBufferList *buffers)
+{
+    if (!core->capture_pcm || !buffers->mNumberBuffers ||
+        !buffers->mBuffers[0].mData) {
+        return;
+    }
+    size_t bytes = buffers->mBuffers[0].mDataByteSize;
+    uint64_t written = core->capture_written;
+    uint64_t read = qatomic_load_acquire(&core->capture_read);
+    size_t free = core->capture_size - (written - read);
+    size_t n = MIN(bytes, free);
+    size_t at = written % core->capture_size;
+    size_t first = MIN(n, core->capture_size - at);
+    const uint8_t *pcm = buffers->mBuffers[0].mData;
+    memcpy(core->capture_pcm + at, pcm, first);
+    memcpy(core->capture_pcm, pcm + first, n - first);
+    qatomic_store_release(&core->capture_written, written + n);
+    if (bytes > n) {
+        qatomic_fetch_add(&core->capture_dropped, bytes - n);
+    }
+}
+
+static void coreaudio_capture_drain(coreaudioVoiceOut *core)
+{
+    if (!core->capture_file) {
+        return;
+    }
+    uint64_t read = core->capture_read;
+    uint64_t written = qatomic_load_acquire(&core->capture_written);
+    size_t bytes = written - read;
+    size_t at = read % core->capture_size;
+    size_t first = MIN(bytes, core->capture_size - at);
+    if ((first && fwrite(core->capture_pcm + at, 1, first, core->capture_file) != first) ||
+        (bytes > first && fwrite(core->capture_pcm, 1, bytes - first,
+                                 core->capture_file) != bytes - first)) {
+        dolog("Diagnostic PCM capture write failed\n");
+    }
+    qatomic_store_release(&core->capture_read, written);
+}
+
+static void coreaudio_capture_end(coreaudioVoiceOut *core)
+{
+    /* Called only after AudioDeviceStop / DestroyIOProcID. */
+    if (core->capture_file) {
+        coreaudio_capture_drain(core);
+        fclose(core->capture_file);
+        dolog("Diagnostic PCM capture dropped %" PRIu64 " bytes\n",
+              core->capture_dropped);
+        core->capture_file = NULL;
+    }
+    g_free(core->capture_pcm);
+    core->capture_pcm = NULL;
+}
+
+static void coreaudio_capture_begin(coreaudioVoiceOut *core)
+{
+    const char *prefix = getenv("POWEREMU_COREAUDIO_CAPTURE");
+    if (!prefix || !*prefix) {
+        return;
+    }
+    char *path = g_strdup_printf("%s.%d.%u-%d.f32", prefix, getpid(),
+                                 ++core->capture_generation, core->hw.info.freq);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        dolog("Cannot create diagnostic PCM capture: %s\n", strerror(errno));
+        g_free(path);
+        return;
+    }
+    core->capture_file = fdopen(fd, "wb");
+    if (!core->capture_file) {
+        close(fd);
+        g_free(path);
+        return;
+    }
+    core->capture_size = (size_t)core->hw.info.freq *
+                        core->hw.info.bytes_per_frame * 4;
+    core->capture_pcm = g_malloc(core->capture_size);
+    core->capture_written = core->capture_read = core->capture_dropped = 0;
+    dolog("Diagnostic PCM %s: float32 native endian, %d Hz, %d channels\n",
+          path, core->hw.info.freq, core->hw.info.nchannels);
+    g_free(path);
+}
+
+/* Snapshot counters on the main audio thread; SPSC counters are atomic,
+ * legacy counters use the buffer lock. Never log or take BQL in the IOProc. */
+static void coreaudio_debug_tick(coreaudioVoiceOut *core)
+{
+    uint64_t callbacks, empty, missing;
+    int64_t now;
+
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (core->capture_file && now - core->capture_last_ms >= 100) {
+        coreaudio_capture_drain(core);
+        core->capture_last_ms = now;
+    }
+    if (!core->debug_audio) {
+        return;
+    }
+    if (now - core->debug_last_ms < 1000) {
+        return;
+    }
+    qemu_log("coreaudio-producer: wall-ns %" PRId64
+             " frames %" PRIu64 " exact-zero-frames %" PRIu64
+             " max-zero-run %" PRIu64 "\n",
+             qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+             core->debug_producer_frames, core->debug_producer_zero_frames,
+             core->debug_producer_zero_max);
+    core->debug_producer_frames = core->debug_producer_zero_frames = 0;
+    core->debug_producer_zero_max = 0;
+    qemu_log("coreaudio-io: invoked %" PRIu64 " unusable %" PRIu64 "\n",
+             qatomic_xchg(&core->debug_invocations, 0),
+             qatomic_xchg(&core->debug_unusable_callbacks, 0));
+    if (core->spsc_output) {
+        callbacks = qatomic_xchg(&core->debug_callbacks, 0);
+        empty = qatomic_xchg(&core->debug_empty_callbacks, 0);
+        missing = qatomic_xchg(&core->debug_missing_frames, 0);
+        core->debug_last_ms = now;
+        size_t queued = (core->output_written -
+                         qatomic_load_acquire(&core->output_read)) /
+                        core->hw.info.bytes_per_frame;
+        qemu_log("coreaudio: callbacks %" PRIu64 " empty %" PRIu64
+                 " missing-frames %" PRIu64 " spsc 1 queued-frames %zu"
+                 " capacity-frames %zu\n", callbacks, empty, missing, queued,
+                 core->hw.size_emul / core->hw.info.bytes_per_frame);
+        return;
+    }
+    if (coreaudio_buf_lock(core, "debug")) {
+        return;
+    }
+    callbacks = core->debug_callbacks;
+    empty = core->debug_empty_callbacks;
+    missing = core->debug_missing_frames;
+    core->debug_callbacks = 0;
+    core->debug_empty_callbacks = 0;
+    core->debug_missing_frames = 0;
+    core->debug_last_ms = now;
+    coreaudio_buf_unlock(core, "debug");
+    qemu_log("coreaudio: callbacks %" PRIu64 " empty %" PRIu64
+             " missing-frames %" PRIu64 "\n", callbacks, empty, missing);
+}
+
 #define COREAUDIO_WRAPPER_FUNC(name, ret_type, args_decl, args) \
-    static ret_type glue(coreaudio_, name)args_decl             \
+    static ret_type glue(coreaudio_legacy_, name)args_decl             \
     {                                                           \
         coreaudioVoiceOut *core = (coreaudioVoiceOut *) hw;     \
         ret_type ret;                                           \
@@ -310,17 +460,155 @@ static int coreaudio_buf_unlock (coreaudioVoiceOut *core, const char *fn_name)
         ret = glue(audio_generic_, name)args;                   \
                                                                 \
         coreaudio_buf_unlock(core, "coreaudio_" #name);             \
+        coreaudio_debug_tick(core);                              \
         return ret;                                             \
     }
 COREAUDIO_WRAPPER_FUNC(buffer_get_free, size_t, (HWVoiceOut *hw), (hw))
 COREAUDIO_WRAPPER_FUNC(get_buffer_out, void *, (HWVoiceOut *hw, size_t *size),
                        (hw, size))
-COREAUDIO_WRAPPER_FUNC(put_buffer_out, size_t,
-                       (HWVoiceOut *hw, void *buf, size_t size),
-                       (hw, buf, size))
 COREAUDIO_WRAPPER_FUNC(write, size_t, (HWVoiceOut *hw, void *buf, size_t size),
                        (hw, buf, size))
 #undef COREAUDIO_WRAPPER_FUNC
+
+/* Observe the already clipped PCM before publishing it to CoreAudio. This
+ * distinguishes source/mixer silence from a shortage in the device callback.
+ * Optional diagnostics only; no scanning on ordinary playback builds. */
+static void coreaudio_debug_produced(coreaudioVoiceOut *core,
+                                     const void *buf, size_t size)
+{
+    if (!core->debug_audio) {
+        return;
+    }
+    size_t bpf = core->hw.info.bytes_per_frame;
+    const uint8_t *pcm = buf;
+    for (size_t at = 0; at + bpf <= size; at += bpf) {
+        uint8_t nonzero = 0;
+        for (size_t ch = 0; ch < bpf; ch++) {
+            nonzero |= pcm[at + ch];
+        }
+        core->debug_producer_frames++;
+        if (!nonzero) {
+            core->debug_producer_zero_frames++;
+            core->debug_producer_zero_run++;
+            core->debug_producer_zero_max = MAX(core->debug_producer_zero_max,
+                                               core->debug_producer_zero_run);
+        } else {
+            core->debug_producer_zero_run = 0;
+        }
+    }
+}
+
+/* No allocation, lock, logging, guest access or BQL in this handoff.
+ * hw->pos_emul/pending_emul belong to the generic legacy ring only. */
+static size_t coreaudio_legacy_put_buffer_out(HWVoiceOut *hw,
+                                               void *buf, size_t size)
+{
+    coreaudioVoiceOut *core = (coreaudioVoiceOut *)hw;
+    if (coreaudio_buf_lock(core, "coreaudio_put_buffer_out")) {
+        return 0;
+    }
+    coreaudio_debug_produced(core, buf, size);
+    size_t result = audio_generic_put_buffer_out(hw, buf, size);
+    coreaudio_buf_unlock(core, "coreaudio_put_buffer_out");
+    coreaudio_debug_tick(core);
+    return result;
+}
+
+static size_t coreaudio_buffer_get_free(HWVoiceOut *hw)
+{
+    coreaudioVoiceOut *core = (coreaudioVoiceOut *)hw;
+    if (!core->spsc_output) {
+        return coreaudio_legacy_buffer_get_free(hw);
+    }
+    /* Report even when a full queue prevents further put-buffer calls. */
+    if (core->debug_audio || core->capture_file) {
+        coreaudio_debug_tick(core);
+    }
+    uint64_t read = qatomic_load_acquire(&core->output_read);
+    return hw->size_emul - (core->output_written - read);
+}
+
+static void *coreaudio_get_buffer_out(HWVoiceOut *hw, size_t *size)
+{
+    coreaudioVoiceOut *core = (coreaudioVoiceOut *)hw;
+    if (!core->spsc_output) {
+        return coreaudio_legacy_get_buffer_out(hw, size);
+    }
+    if (!hw->buf_emul || !hw->size_emul) {
+        *size = 0;
+        return NULL;
+    }
+    size_t at = core->output_written % hw->size_emul;
+    size_t free = coreaudio_buffer_get_free(hw);
+    *size = MIN(free, hw->size_emul - at);
+    return hw->buf_emul + at;
+}
+
+static size_t coreaudio_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
+{
+    coreaudioVoiceOut *core = (coreaudioVoiceOut *)hw;
+    if (!core->spsc_output) {
+        return coreaudio_legacy_put_buffer_out(hw, buf, size);
+    }
+    size_t at = core->output_written % hw->size_emul;
+    assert(buf == hw->buf_emul + at && size <= hw->size_emul - at &&
+           size <= coreaudio_buffer_get_free(hw));
+    coreaudio_debug_produced(core, buf, size);
+    qatomic_store_release(&core->output_written, core->output_written + size);
+    coreaudio_debug_tick(core);
+    return size;
+}
+
+static size_t coreaudio_write(HWVoiceOut *hw, void *buf, size_t size)
+{
+    coreaudioVoiceOut *core = (coreaudioVoiceOut *)hw;
+    return core->spsc_output ? audio_generic_write(hw, buf, size) :
+                             coreaudio_legacy_write(hw, buf, size);
+}
+
+static OSStatus coreaudio_spsc_output(AudioDeviceID device,
+                                     AudioBufferList *buffers,
+                                     coreaudioVoiceOut *core)
+{
+    HWVoiceOut *hw = &core->hw;
+    /* Silence all supplied storage, including an obsolete-device callback.
+     * Never assume the device still requests its initialization period. */
+    for (UInt32 i = 0; i < buffers->mNumberBuffers; i++) {
+        if (buffers->mBuffers[i].mData) {
+            memset(buffers->mBuffers[i].mData, 0,
+                   buffers->mBuffers[i].mDataByteSize);
+        }
+    }
+    if (device != core->outputDeviceID || !buffers->mNumberBuffers ||
+        !buffers->mBuffers[0].mData || !hw->buf_emul || !hw->size_emul) {
+        if (core->debug_audio) {
+            qatomic_fetch_add(&core->debug_unusable_callbacks, 1);
+        }
+        return 0;
+    }
+    size_t bpf = hw->info.bytes_per_frame;
+    size_t requested = buffers->mBuffers[0].mDataByteSize / bpf * bpf;
+    uint64_t read = core->output_read;
+    uint64_t written = qatomic_load_acquire(&core->output_written);
+    size_t available = written - read;
+    size_t bytes = MIN(requested, available);
+    size_t at = read % hw->size_emul;
+    size_t first = MIN(bytes, hw->size_emul - at);
+    uint8_t *out = buffers->mBuffers[0].mData;
+    memcpy(out, hw->buf_emul + at, first);
+    memcpy(out + first, hw->buf_emul, bytes - first);
+    qatomic_store_release(&core->output_read, read + bytes);
+    coreaudio_capture_push(core, buffers);
+    if (core->debug_audio) {
+        qatomic_fetch_add(&core->debug_callbacks, 1);
+        if (bytes < requested) {
+            qatomic_fetch_add(&core->debug_empty_callbacks, 1);
+            qatomic_fetch_add(&core->debug_missing_frames,
+                              (requested - bytes) / bpf);
+        }
+    }
+    return 0;
+}
 
 /*
  * callback to feed audiooutput buffer. called without BQL.
@@ -335,11 +623,37 @@ static OSStatus audioDeviceIOProc(
     const AudioTimeStamp *inOutputTime,
     void *hwptr)
 {
+    coreaudioVoiceOut *spsc = hwptr;
+    if (spsc->debug_audio) {
+        qatomic_fetch_add(&spsc->debug_invocations, 1);
+    }
+    if (!outOutputData) {
+        if (spsc->debug_audio) {
+            qatomic_fetch_add(&spsc->debug_unusable_callbacks, 1);
+        }
+        return 0;
+    }
+    if (spsc->spsc_output) {
+        return coreaudio_spsc_output(inDevice, outOutputData, spsc);
+    }
     UInt32 frameCount, pending_frames;
-    void *out = outOutputData->mBuffers[0].mData;
     HWVoiceOut *hw = hwptr;
     coreaudioVoiceOut *core = (coreaudioVoiceOut *) hwptr;
     size_t len;
+
+    for (UInt32 i = 0; i < outOutputData->mNumberBuffers; i++) {
+        if (outOutputData->mBuffers[i].mData) {
+            memset(outOutputData->mBuffers[i].mData, 0,
+                   outOutputData->mBuffers[i].mDataByteSize);
+        }
+    }
+    if (!outOutputData->mNumberBuffers || !outOutputData->mBuffers[0].mData) {
+        if (core->debug_audio) {
+            qatomic_fetch_add(&core->debug_unusable_callbacks, 1);
+        }
+        return 0;
+    }
+    void *out = outOutputData->mBuffers[0].mData;
 
     if (coreaudio_buf_lock (core, "audioDeviceIOProc")) {
         inInputTime = 0;
@@ -351,17 +665,22 @@ static OSStatus audioDeviceIOProc(
         return 0;
     }
 
-    frameCount = core->audioDevicePropertyBufferFrameSize;
+    /* The device can request a different period after initialization. Never
+     * write past its supplied storage or leave a larger period unfilled. */
+    frameCount = outOutputData->mBuffers[0].mDataByteSize /
+                 hw->info.bytes_per_frame;
     pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
-
-    /* if there are not enough samples, set signal and return */
-    if (pending_frames < frameCount) {
-        inInputTime = 0;
-        coreaudio_buf_unlock (core, "audioDeviceIOProc(empty)");
-        return 0;
+    if (core->debug_audio) {
+        core->debug_callbacks++;
+        if (pending_frames < frameCount) {
+            core->debug_empty_callbacks++;
+            core->debug_missing_frames += frameCount - pending_frames;
+        }
     }
 
-    len = frameCount * hw->info.bytes_per_frame;
+    /* A partial period still contains valid audio. Consume it in order
+     * rather than withholding the entire period for a small shortage. */
+    len = MIN(frameCount, pending_frames) * hw->info.bytes_per_frame;
     while (len) {
         size_t write_len, start;
 
@@ -377,6 +696,11 @@ static OSStatus audioDeviceIOProc(
         out += write_len;
     }
 
+    if (pending_frames < frameCount) {
+        memset(out, 0, (frameCount - pending_frames) * hw->info.bytes_per_frame);
+    }
+
+    coreaudio_capture_push(core, outOutputData);
     coreaudio_buf_unlock (core, "audioDeviceIOProc");
     return 0;
 }
@@ -496,7 +820,10 @@ static OSStatus init_out_device(coreaudioVoiceOut *core)
     core->audioDevicePropertyBufferFrameSize = audioDevicePropertyBufferFrameSize;
     core->hw.samples = core->bufferCount * core->audioDevicePropertyBufferFrameSize;
     audio_generic_initialize_buffer_out(&core->hw);
+    core->output_written = core->output_read = 0;
+    coreaudio_capture_begin(core);
     core->ioprocid = ioprocid;
+    core->ioproc_started = false;
 
     return 0;
 }
@@ -504,21 +831,12 @@ static OSStatus init_out_device(coreaudioVoiceOut *core)
 static void fini_out_device(coreaudioVoiceOut *core)
 {
     OSStatus status;
-    UInt32 isrunning;
 
-    /* stop playback */
-    status = coreaudio_get_isrunning(core->outputDeviceID, &isrunning);
-    if (status != kAudioHardwareBadObjectError) {
-        if (status != kAudioHardwareNoError) {
-            coreaudio_logerr(status,
-                             "Could not determine whether Device is playing\n");
-        }
-
-        if (isrunning) {
-            status = AudioDeviceStop(core->outputDeviceID, core->ioprocid);
-            if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
-                coreaudio_logerr(status, "Could not stop playback\n");
-            }
+    /* DeviceIsRunning describes all clients, not this IOProc. */
+    if (core->ioproc_started) {
+        status = AudioDeviceStop(core->outputDeviceID, core->ioprocid);
+        if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
+            coreaudio_logerr(status, "Could not stop playback\n");
         }
     }
 
@@ -528,37 +846,63 @@ static void fini_out_device(coreaudioVoiceOut *core)
     if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
         coreaudio_logerr(status, "Could not remove IOProc\n");
     }
+    coreaudio_capture_end(core);
+    core->ioproc_started = false;
     core->outputDeviceID = kAudioDeviceUnknown;
 }
 
 static void update_device_playback_state(coreaudioVoiceOut *core)
 {
     OSStatus status;
-    UInt32 isrunning;
+    static int timing = -1;
+    if (timing < 0) timing = getenv("POWEREMU_AUDIO_TIMING") != NULL;
 
-    status = coreaudio_get_isrunning(core->outputDeviceID, &isrunning);
-    if (status != kAudioHardwareNoError) {
-        if (status != kAudioHardwareBadObjectError) {
-            coreaudio_logerr(status,
-                             "Could not determine whether Device is playing\n");
-        }
-
+    if (!core->outputDeviceID || !core->ioprocid) {
         return;
     }
 
     if (core->enabled) {
-        /* start playback */
-        if (!isrunning) {
+        /* Another app may already be playing on this device. Starting our
+         * registered IOProc is still necessary to receive callbacks. */
+        if (!core->ioproc_started) {
+            int64_t began = timing ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
             status = AudioDeviceStart(core->outputDeviceID, core->ioprocid);
+            if (timing) {
+                int64_t ended = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                qemu_log("audio-transition: operation=start begin-ns %" PRId64
+                         " end-ns %" PRId64 " duration-us %" PRId64
+                         " status %d\n", began, ended, (ended - began) / 1000, status);
+            }
+            if (core->debug_audio) {
+                qemu_log("coreaudio-device: start device %u status %d\n",
+                         core->outputDeviceID, status);
+            }
+            if (status == kAudioHardwareNoError) {
+                core->ioproc_started = true;
+            }
             if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
                 coreaudio_logerr (status, "Could not resume playback\n");
             }
         }
     } else {
         /* stop playback */
-        if (isrunning) {
+        if (core->ioproc_started) {
+            int64_t began = timing ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
             status = AudioDeviceStop(core->outputDeviceID,
                                      core->ioprocid);
+            if (timing) {
+                int64_t ended = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                qemu_log("audio-transition: operation=stop begin-ns %" PRId64
+                         " end-ns %" PRId64 " duration-us %" PRId64
+                         " status %d\n", began, ended, (ended - began) / 1000, status);
+            }
+            if (core->debug_audio) {
+                qemu_log("coreaudio-device: stop device %u status %d\n",
+                         core->outputDeviceID, status);
+            }
+            if (status == kAudioHardwareNoError || status == kAudioHardwareBadDeviceError) {
+                core->ioproc_started = false;
+            }
             if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
                 coreaudio_logerr(status, "Could not pause playback\n");
             }
@@ -617,6 +961,11 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as,
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
     core->bufferCount = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    core->debug_audio = getenv("SCREAMER_DEBUG") != NULL;
+    /* Opt-in until matched live testing validates device changes and audio.
+     * The existing mutex path remains a same-binary control. */
+    const char *spsc = getenv("POWEREMU_COREAUDIO_SPSC");
+    core->spsc_output = spsc && !strcmp(spsc, "1");
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_addr, handle_voice_change,

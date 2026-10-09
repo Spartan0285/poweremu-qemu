@@ -116,8 +116,19 @@ static const char *s_spk = "screamer";
 static struct {
     int64_t last;
     uint64_t pulled, written, underruns, zero_runs, zero_frames, reads[16];
+    uint64_t pace_max_ns, pace_discarded, overflow_frames;
+    uint64_t tx_budget_lost, tx_descriptor_empty, tx_descriptor_completions;
+    uint64_t prime_waits;
+    uint64_t exact_zero_frames, exact_zero_runs, exact_zero_max;
+    uint64_t host_step_max_ns;
+    int64_t host_step_begin, host_step_end;
     int zr;
 } sdbg;
+
+/* Preserve a run across reporting intervals; these are exact stereo zeros,
+ * unlike the historical left-channel low-amplitude counter above. */
+static uint64_t sdbg_exact_run;
+static int64_t sdbg_pace_host_last;
 
 static int sdbg_on = -1;                /* SCREAMER_DEBUG=1: per-second stats */
 
@@ -135,6 +146,21 @@ static void sdbg_tick(ScreamerState *s)
                  PRIu64 " dma-silent-runs %" PRIu64 " (%" PRIu64 " frames) queued %d\n",
                  sdbg.pulled, sdbg.written, sdbg.underruns, sdbg.zero_runs,
                  sdbg.zero_frames, (int)(s->wpos - s->rpos));
+        qemu_log("screamer: timer-max-us %" PRIu64 " catchup-discarded %"
+                 PRIu64 " ring-overflow %" PRIu64 " frames\n",
+                 sdbg.pace_max_ns / 1000, sdbg.pace_discarded,
+                 sdbg.overflow_frames);
+        qemu_log("screamer-timing: wall-ns %" PRId64
+                 " virtual-ns %" PRId64 " host-step-max-us %" PRIu64
+                 " step-begin-ns %" PRId64 " step-end-ns %" PRId64
+                 " dma-exact-zero-frames %" PRIu64
+                 " runs-ge64 %" PRIu64 " max-run-frames %" PRIu64 "\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                 sdbg.host_step_max_ns / 1000,
+                 sdbg.host_step_begin, sdbg.host_step_end,
+                 sdbg.exact_zero_frames, sdbg.exact_zero_runs,
+                 sdbg.exact_zero_max);
         qemu_log("screamer: reads");
         for (int r = 0; r < 16; r++) {
             if (sdbg.reads[r]) {
@@ -142,6 +168,12 @@ static void sdbg_tick(ScreamerState *s)
             }
         }
         qemu_log("\n");
+        qemu_log("screamer: tx-budget-lost %" PRIu64
+                 " descriptor-empty-ticks %" PRIu64
+                 " descriptor-completions %" PRIu64
+                 " prime-waits %" PRIu64 "\n",
+                 sdbg.tx_budget_lost, sdbg.tx_descriptor_empty,
+                 sdbg.tx_descriptor_completions, sdbg.prime_waits);
         memset(&sdbg, 0, sizeof(sdbg));
         sdbg.last = now;
     }
@@ -160,6 +192,7 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
     samples = MIN(MIN(io->len >> s->shift, max), s->samples);
     int overflow = samples - (s->samples - (s->wpos - s->rpos));
     if (overflow > 0) {
+        sdbg.overflow_frames += overflow;
         s->rpos += overflow;
     }
     if (s->rpos >= s->samples) {
@@ -182,6 +215,15 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
     for (int k = 0; sdbg_on > 0 && k < samples; k++) {
         const uint8_t *f = &s->mixbuf[((s->wpos + k) % s->samples) << s->shift];
         int16_t l = (int16_t)((f[0] << 8) | f[1]);
+        if (!(f[0] | f[1] | f[2] | f[3])) {
+            sdbg.exact_zero_frames++;
+            if (++sdbg_exact_run == 64) {
+                sdbg.exact_zero_runs++;
+            }
+            sdbg.exact_zero_max = MAX(sdbg.exact_zero_max, sdbg_exact_run);
+        } else {
+            sdbg_exact_run = 0;
+        }
         if (l > -200 && l < 200) {
             if (++sdbg.zr == 64) {
                 sdbg.zero_runs++;
@@ -207,6 +249,7 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
 
     /* Continue DBDMA if we have completed the transfer, otherwise defer */
     if (io->len == 0 && samples) {
+        sdbg.tx_descriptor_completions++;
         SCREAMER_DPRINTF("-> End of transfer\n");
         io->dma_end(io);
     }
@@ -228,12 +271,32 @@ static void screamer_pace_cb(void *opaque)
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (sdbg_on > 0) {
+        int64_t host_now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (sdbg_pace_host_last &&
+            host_now - sdbg_pace_host_last > sdbg.host_step_max_ns) {
+            sdbg.host_step_max_ns = host_now - sdbg_pace_host_last;
+            sdbg.host_step_begin = sdbg_pace_host_last;
+            sdbg.host_step_end = host_now;
+        }
+        sdbg_pace_host_last = host_now;
+        sdbg.pace_max_ns = MAX(sdbg.pace_max_ns, now - s->pace_last);
+    }
     s->pace_frac += (now - s->pace_last) * (int64_t)s->rate;
     s->pace_last = now;
     int64_t due = s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac -= due * NANOSECONDS_PER_SECOND;
+    if (due > (int64_t)s->rate / 20) {
+        sdbg.pace_discarded += due - (int64_t)s->rate / 20;
+    }
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
 
+    /* A dispatched timer is no longer pending. Completing a DMA descriptor
+     * below may synchronously start the next one, whose TX/RX entry point
+     * uses timer_pending() to detect a genuinely idle hardware clock. Arm
+     * the next tick first so that continuation cannot reset pace_frac and
+     * throw away the fractional frames accumulated on every tick. */
+    timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
     int moved = 0;
     int64_t out_left = due, in_left = due;
     while (out_left > 0 && s->io.len) {
@@ -268,10 +331,21 @@ static void screamer_pace_cb(void *opaque)
          * fraction of a timer tick on every descriptor completion. */
         s->pace_frac += MIN(out_left, in_left) * NANOSECONDS_PER_SECOND;
         s->pace_idle = 0;
+    } else if (s->io.len || (s->in_running && s->in_io.len)) {
+        /* A full host queue is backpressure, not an idle guest DMA engine.
+         * Keep polling so output resumes when the backend drains again. */
+        s->pace_idle = 0;
     } else if (++s->pace_idle > 200) {      /* ~200 ms without DMA: stop */
+        sdbg_pace_host_last = 0;
+        sdbg_exact_run = 0;
+        timer_del(s->pace_timer);
         return;
     }
-    timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
+    if (sdbg_on > 0) {
+        int64_t carried = moved ? MIN(out_left, in_left) : 0;
+        sdbg.tx_budget_lost += out_left - carried;
+        sdbg.tx_descriptor_empty += due > 0 && !s->io.len;
+    }
 }
 
 static void pmac_screamer_tx(DBDMA_io *io)
@@ -505,6 +579,7 @@ static void screamerspk_callback(void *opaque, int free_b)
     }
     if (!s->primed) {
         if (s->wpos - s->rpos < s->rate * SCREAMER_PRIME_MS / 1000) {
+            sdbg.prime_waits++;
             return;
         }
         s->primed = true;

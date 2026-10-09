@@ -26,6 +26,7 @@
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
+#include "qemu/log.h"
 #include "system/cpu-timers.h"
 #include "system/replay.h"
 #include "qemu/main-loop.h"
@@ -290,10 +291,59 @@ static void glib_pollfds_poll(void)
 
 #define MAX_MAIN_LOOP_SPIN (1000)
 
+/* Diagnose audio deadline misses without changing scheduling or BQL ownership.
+ * Only the main loop writes these counters; no logging on audio callbacks. */
+static bool audio_timing_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("POWEREMU_AUDIO_TIMING") != NULL;
+    }
+    return on;
+}
+
+static void audio_timing_record(int64_t asked, int64_t poll_ns,
+                                int64_t lock_started, int64_t lock_acquired)
+{
+    static int64_t last;
+    static uint64_t loops, poll_late_max, lock_max, lock_total, lock_over_ms;
+    static int64_t lock_begin, lock_end;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t lock_ns = lock_acquired - lock_started;
+
+    loops++;
+    if (asked > 0 && poll_ns > asked) {
+        poll_late_max = MAX(poll_late_max, poll_ns - asked);
+    }
+    if (lock_ns > lock_max) {
+        lock_max = lock_ns;
+        lock_begin = lock_started;
+        lock_end = lock_acquired;
+    }
+    lock_total += lock_ns;
+    lock_over_ms += lock_ns > SCALE_MS;
+    if (!last) {
+        last = now;
+    } else if (now - last >= 5 * NANOSECONDS_PER_SECOND) {
+        qemu_log("audio-mainloop: wall-ns %" PRId64
+                 " virtual-ns %" PRId64 " loops %" PRIu64
+                 " poll-late-max-us %" PRIu64 " lock-max-us %" PRIu64
+                 " lock-total-us %" PRIu64 " lock-over-1ms %" PRIu64
+                 " lock-begin-ns %" PRId64 " lock-end-ns %" PRId64 "\n",
+                 now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), loops,
+                 poll_late_max / 1000, lock_max / 1000, lock_total / 1000,
+                 lock_over_ms, lock_begin, lock_end);
+        last = now;
+        loops = poll_late_max = lock_max = lock_total = lock_over_ms = 0;
+    }
+}
+
 static int os_host_main_loop_wait(int64_t timeout)
 {
     GMainContext *context = g_main_context_default();
     int ret;
+    bool audio_timing = audio_timing_on();
+    int64_t began = 0, woke = 0, locking = 0;
 
     g_main_context_acquire(context);
 
@@ -302,10 +352,23 @@ static int os_host_main_loop_wait(int64_t timeout)
     bql_unlock();
     replay_mutex_unlock();
 
+    if (audio_timing) {
+        began = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
+    if (audio_timing) {
+        woke = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
 
     replay_mutex_lock();
+    if (audio_timing) {
+        locking = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
     bql_lock();
+    if (audio_timing) {
+        audio_timing_record(timeout, woke - began, locking,
+                            qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+    }
 
     glib_pollfds_poll();
 

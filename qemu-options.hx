@@ -3178,7 +3178,7 @@ SRST
         Then when you use on the host ``telnet localhost 5555``, you
         connect to the guest telnet server.
 
-    ``guestfwd=[tcp]:server:port-dev``; \ ``guestfwd=[tcp]:server:port-cmd:command``
+    ``guestfwd=[tcp]:server:port-dev``; \ ``guestfwd=[tcp]:server:port-cmd:command``; \ ``guestfwd=[tcp]:server:port-unix-connect:path``
         Forward guest TCP connections to the IP address server on port
         port to the character device dev or to a program executed by
         cmd:command which gets spawned for each connection. This option
@@ -3202,6 +3202,13 @@ SRST
             # call "netcat 10.10.1.1 4321" on every TCP connection to 10.0.2.100:1234
             # and connect the TCP stream to its stdin/stdout
             |qemu_system| -nic  'user,id=n1,guestfwd=tcp:10.0.2.100:1234-cmd:netcat 10.10.1.1 4321'
+
+        With ``unix-connect:path``, open an independent connection to a host
+        Unix stream socket for each guest TCP connection, without starting a
+        command process. This preserves separate concurrent clients; unlike a
+        shared character device, their replies cannot share a single stream.
+        The host service must listen at ``path`` when the guest connects.
+
 
 ``-netdev tap,id=id[,fd=h][,ifname=name][,script=file][,downscript=dfile][,br=bridge][,helper=helper]``
     Configure a host TAP network backend with ID id.

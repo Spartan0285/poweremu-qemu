@@ -1085,6 +1085,20 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp)
                        "forwarding rule '%s'", config_str);
             return -1;
         }
+    } else if (g_str_has_prefix(p, "unix-connect:")) {
+#ifdef G_OS_UNIX
+        /* Unlike a shared chardev, libslirp opens a separate host socket
+         * for each guest TCP connection. Avoid spawning a relay while the
+         * emulated network device holds the big QEMU lock. */
+        if (!p[13] || slirp_add_unix(s->slirp, &p[13], &server, port) < 0) {
+            error_setg(errp, "Conflicting/invalid Unix guest forwarding "
+                       "rule '%s'", config_str);
+            return -1;
+        }
+#else
+        error_setg(errp, "Unix guest forwarding is unavailable on this host");
+        return -1;
+#endif
     } else {
         Error *err = NULL;
         /*
