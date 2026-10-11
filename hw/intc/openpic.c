@@ -44,6 +44,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "system/system.h"
 
 /* #define DEBUG_OPENPIC */
 
@@ -190,6 +191,94 @@ static inline uint64_t ns_to_ticks(uint64_t ns)
 static inline uint64_t ticks_to_ns(uint64_t ticks)
 {
     return ticks * OPENPIC_TIMER_NS_PER_TICK;
+}
+
+/* Opt-in Screamer TX interrupt admission trace for KeyLargo only. Under
+ * BQL, bounded/pre-touched memory, with file IO only at stopped exit.
+ * Frame snapshots can be joined to the independent producer trace by time;
+ * this observes PIC admission/EOI, not guest takeTimeStamp execution. */
+#define SCREAMER_IRQ_TRACE_CAPACITY 65536
+typedef struct ScreamerIRQRecord {
+    int64_t wall_ns, virtual_ns;
+    uint32_t kind, irq, cpu, vector, level, reserved;
+} ScreamerIRQRecord;
+static struct {
+    ScreamerIRQRecord *records;
+    size_t count;
+    uint64_t dropped;
+    char *path;
+    Notifier exit;
+} screamer_irq_trace;
+enum { SIRQ_LEVEL = 1, SIRQ_IACK, SIRQ_EOI };
+
+static void screamer_irq_trace_event(OpenPICState *opp, int irq, int cpu,
+                                     uint32_t kind, uint32_t level)
+{
+    if (!screamer_irq_trace.records ||
+        opp->model != OPENPIC_MODEL_KEYLARGO || irq != 0x09) {
+        return;
+    }
+    if (screamer_irq_trace.count == SCREAMER_IRQ_TRACE_CAPACITY) {
+        screamer_irq_trace.dropped++;
+        return;
+    }
+    ScreamerIRQRecord *r =
+        &screamer_irq_trace.records[screamer_irq_trace.count++];
+    *r = (ScreamerIRQRecord) {
+        .wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        .kind = kind, .irq = irq, .cpu = cpu,
+        .vector = IVPR_VECTOR(opp, opp->src[irq].ivpr), .level = level,
+    };
+}
+
+static void screamer_irq_trace_exit(Notifier *notify, void *data)
+{
+    FILE *f = fopen(screamer_irq_trace.path, "wb");
+    bool ok = false;
+    if (f) {
+        size_t n = fwrite(screamer_irq_trace.records, sizeof(ScreamerIRQRecord),
+                          screamer_irq_trace.count, f);
+        int closed = fclose(f);
+        ok = n == screamer_irq_trace.count && closed == 0;
+    }
+    char *path = g_strdup_printf("%s.json", screamer_irq_trace.path);
+    FILE *meta = fopen(path, "w");
+    if (meta) {
+        fprintf(meta, "{\"record_bytes\":%zu,\"records\":%zu,"
+                "\"dropped\":%" PRIu64 ",\"flush_ok\":%s}\n",
+                sizeof(ScreamerIRQRecord), screamer_irq_trace.count,
+                screamer_irq_trace.dropped, ok ? "true" : "false");
+        fclose(meta);
+    }
+    g_free(path);
+    g_free(screamer_irq_trace.records);
+    g_free(screamer_irq_trace.path);
+    screamer_irq_trace.records = NULL;
+    screamer_irq_trace.path = NULL;
+}
+
+static void screamer_irq_trace_init(OpenPICState *opp)
+{
+    const char *prefix = getenv("POWEREMU_SCREAMER_IRQ_TRACE");
+    if (opp->model != OPENPIC_MODEL_KEYLARGO || !prefix || prefix[0] != '/' ||
+        screamer_irq_trace.records) {
+        return;
+    }
+    screamer_irq_trace.records = g_try_malloc0_n(SCREAMER_IRQ_TRACE_CAPACITY,
+                                                sizeof(ScreamerIRQRecord));
+    if (!screamer_irq_trace.records) {
+        return;
+    }
+    volatile uint8_t *bytes = (volatile uint8_t *)screamer_irq_trace.records;
+    for (size_t i = 0; i < SCREAMER_IRQ_TRACE_CAPACITY * sizeof(ScreamerIRQRecord);
+         i += 4096) {
+        bytes[i] = 0;
+    }
+    screamer_irq_trace.path = g_strdup_printf("%s.%d.screamer-irq", prefix,
+                                             getpid());
+    screamer_irq_trace.exit.notify = screamer_irq_trace_exit;
+    qemu_add_exit_notifier(&screamer_irq_trace.exit);
 }
 
 static inline void IRQ_setbit(IRQQueue *q, int n_IRQ)
@@ -395,6 +484,7 @@ static void openpic_set_irq(void *opaque, int n_IRQ, int level)
         abort();
     }
 
+    screamer_irq_trace_event(opp, n_IRQ, -1, SIRQ_LEVEL, level);
     src = &opp->src[n_IRQ];
     DPRINTF("openpic: set irq %d = %d ivpr=0x%08x",
             n_IRQ, level, src->ivpr);
@@ -1042,6 +1132,7 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
             break;
         }
 
+        screamer_irq_trace_event(opp, s_IRQ, idx, SIRQ_EOI, 0);
         IRQ_resetbit(&dst->servicing, s_IRQ);
         /* Set up next servicing IRQ */
         s_IRQ = IRQ_get_next(opp, &dst->servicing);
@@ -1096,6 +1187,7 @@ static uint32_t openpic_iack(OpenPICState *opp, IRQDest *dst, int cpu)
         /* IRQ enter servicing state */
         IRQ_setbit(&dst->servicing, irq);
         retval = IVPR_VECTOR(opp, src->ivpr);
+        screamer_irq_trace_event(opp, irq, cpu, SIRQ_IACK, 0);
     }
 
     if (!src->level) {
@@ -1615,6 +1707,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
 
     sysbus_init_mmio(d, &opp->mem);
     qdev_init_gpio_in(dev, openpic_set_irq, opp->max_irq);
+    screamer_irq_trace_init(opp);
 }
 
 static const Property openpic_properties[] = {

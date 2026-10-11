@@ -113,6 +113,220 @@ static const char *s_spk = "screamer";
  * so the backend's timer and the DMA pacing timer can drift in phase. */
 #define SCREAMER_PRIME_MS 40
 
+/* Diagnostic raw DMA boundary: bounded and page-touched before execution.
+ * BQL serializes producers. Neither capture nor overflow performs file IO. */
+#define SCREAMER_PCM_BYTES (128 * 1024 * 1024)
+#define SCREAMER_PCM_RECORDS 1000000
+typedef struct ScreamerPCMRecord {
+    int64_t wall_ns, virtual_ns;
+    uint64_t offset, dma_addr;
+    uint32_t frames, frame_count, rate, shift;
+} ScreamerPCMRecord;
+static struct {
+    uint8_t *bytes;
+    ScreamerPCMRecord *records;
+    size_t used, count;
+    uint64_t dropped_bytes, dropped_records;
+    char *path;
+    Notifier exit;
+} screamer_pcm;
+
+static bool screamer_pcm_flush(const char *path, const void *data, size_t bytes)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = fwrite(data, 1, bytes, f) == bytes;
+    return fclose(f) == 0 && ok;
+}
+
+static void screamer_pcm_exit(Notifier *notify, void *data)
+{
+    bool pcm_ok = screamer_pcm_flush(screamer_pcm.path, screamer_pcm.bytes,
+                                     screamer_pcm.used);
+    char *events = g_strdup_printf("%s.events", screamer_pcm.path);
+    bool events_ok = screamer_pcm_flush(events, screamer_pcm.records,
+                        screamer_pcm.count * sizeof(ScreamerPCMRecord));
+    char *metadata = g_strdup_printf("%s.json", screamer_pcm.path);
+    FILE *f = fopen(metadata, "w");
+    if (f) {
+        fprintf(f, "{\"record_bytes\":%zu,\"bytes\":%zu,\"records\":%zu,"
+                "\"dropped_bytes\":%" PRIu64 ",\"dropped_records\":%" PRIu64
+                ",\"pcm_flush_ok\":%s,\"events_flush_ok\":%s}\n",
+                sizeof(ScreamerPCMRecord), screamer_pcm.used, screamer_pcm.count,
+                screamer_pcm.dropped_bytes, screamer_pcm.dropped_records,
+                pcm_ok ? "true" : "false", events_ok ? "true" : "false");
+        fclose(f);
+    }
+    g_free(events);
+    g_free(metadata);
+    g_free(screamer_pcm.bytes);
+    g_free(screamer_pcm.records);
+    g_free(screamer_pcm.path);
+    screamer_pcm.bytes = NULL;
+    screamer_pcm.records = NULL;
+    screamer_pcm.path = NULL;
+}
+
+static void screamer_pcm_init(void)
+{
+    const char *prefix = getenv("POWEREMU_SCREAMER_PCM_CAPTURE");
+    if (!prefix || prefix[0] != '/' || screamer_pcm.bytes) {
+        return;
+    }
+    uint8_t *pcm = g_try_malloc0_n(SCREAMER_PCM_BYTES, 1);
+    ScreamerPCMRecord *records = g_try_malloc0_n(SCREAMER_PCM_RECORDS,
+                                               sizeof(ScreamerPCMRecord));
+    if (!pcm || !records) {
+        g_free(pcm);
+        g_free(records);
+        return;
+    }
+    volatile uint8_t *pages = pcm;
+    for (size_t i = 0; i < SCREAMER_PCM_BYTES; i += 4096) {
+        pages[i] = 0;
+    }
+    pages = (volatile uint8_t *)records;
+    for (size_t i = 0; i < SCREAMER_PCM_RECORDS * sizeof(*records); i += 4096) {
+        pages[i] = 0;
+    }
+    screamer_pcm.bytes = pcm;
+    screamer_pcm.records = records;
+    screamer_pcm.path = g_strdup_printf("%s.%d.screamer-pcm", prefix, getpid());
+    screamer_pcm.exit.notify = screamer_pcm_exit;
+    qemu_add_exit_notifier(&screamer_pcm.exit);
+}
+
+static void screamer_pcm_capture(ScreamerState *s, int frames)
+{
+    if (!screamer_pcm.bytes || frames <= 0) {
+        return;
+    }
+    /* Device formats use one to four bytes per frame. Reject future wider
+     * formats rather than shifting an unchecked diagnostic byte count. */
+    if (s->shift > 2 || s->shift < 0 || frames > s->samples) {
+        screamer_pcm.dropped_records++;
+        return;
+    }
+    size_t bytes = (size_t)frames << s->shift;
+    if (bytes > SCREAMER_PCM_BYTES - screamer_pcm.used ||
+        screamer_pcm.count == SCREAMER_PCM_RECORDS) {
+        screamer_pcm.dropped_bytes += bytes;
+        screamer_pcm.dropped_records++;
+        return;
+    }
+    ScreamerPCMRecord *r = &screamer_pcm.records[screamer_pcm.count++];
+    *r = (ScreamerPCMRecord) {
+        .wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        .offset = screamer_pcm.used, .dma_addr = s->io.addr,
+        .frames = frames, .frame_count = s->regs[FRAME_CNT_REG],
+        .rate = s->rate, .shift = s->shift,
+    };
+    for (int done = 0; done < frames;) {
+        int at = (s->wpos + done) % s->samples;
+        int n = MIN(frames - done, s->samples - at);
+        memcpy(screamer_pcm.bytes + screamer_pcm.used,
+               s->mixbuf + (at << s->shift), (size_t)n << s->shift);
+        screamer_pcm.used += (size_t)n << s->shift;
+        done += n;
+    }
+}
+
+/* Opt-in, bounded producer trace. All producers run under BQL; never write
+ * files or allocate from timer/MMIO/audio servicing paths. Flush at exit. */
+#define SCREAMER_TRACE_CAPACITY 4000000
+/* Native-endian 56-byte records. Frame reads indicate register observation,
+ * not actual guest interrupt service or takeTimeStamp execution. */
+typedef struct ScreamerTraceRecord {
+    int64_t wall_ns, virtual_ns;
+    uint64_t dma_addr;
+    uint32_t frame_count, queued, dma_len, rate;
+    uint32_t kind, arg, zero_frames, reserved;
+} ScreamerTraceRecord;
+static struct {
+    ScreamerTraceRecord *records;
+    size_t count;
+    uint64_t dropped;
+    char *path;
+    Notifier exit;
+} screamer_trace;
+
+enum { STRACE_TX = 1, STRACE_PACE, STRACE_FRAME_READ,
+       STRACE_FRAME_WRITE, STRACE_OUTPUT, STRACE_DESCRIPTOR };
+
+static void screamer_trace_event(ScreamerState *s, uint32_t kind,
+                                 uint32_t arg, uint32_t zero_frames)
+{
+    if (!screamer_trace.records) {
+        return;
+    }
+    if (screamer_trace.count == SCREAMER_TRACE_CAPACITY) {
+        screamer_trace.dropped++;
+        return;
+    }
+    ScreamerTraceRecord *r = &screamer_trace.records[screamer_trace.count++];
+    *r = (ScreamerTraceRecord) {
+        .wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        .dma_addr = s->io.addr, .frame_count = s->regs[FRAME_CNT_REG],
+        .queued = s->wpos - s->rpos, .dma_len = s->io.len,
+        .rate = s->rate, .kind = kind, .arg = arg, .zero_frames = zero_frames,
+    };
+}
+
+static void screamer_trace_exit(Notifier *notify, void *data)
+{
+    FILE *f = fopen(screamer_trace.path, "wb");
+    bool ok = false;
+    if (f) {
+        size_t n = fwrite(screamer_trace.records, sizeof(ScreamerTraceRecord),
+                          screamer_trace.count, f);
+        int closed = fclose(f);
+        ok = n == screamer_trace.count && closed == 0;
+    }
+    char *meta_path = g_strdup_printf("%s.json", screamer_trace.path);
+    FILE *meta = fopen(meta_path, "w");
+    if (meta) {
+        fprintf(meta, "{\"record_bytes\":%zu,\"records\":%zu,"
+                "\"dropped\":%" PRIu64 ",\"flush_ok\":%s}\n",
+                sizeof(ScreamerTraceRecord), screamer_trace.count,
+                screamer_trace.dropped, ok ? "true" : "false");
+        fclose(meta);
+    }
+    g_free(meta_path);
+    qemu_log("screamer: bounded trace records %zu dropped %" PRIu64
+             " flush %s\n", screamer_trace.count, screamer_trace.dropped,
+             ok ? "ok" : "failed");
+    g_free(screamer_trace.records);
+    g_free(screamer_trace.path);
+    screamer_trace.records = NULL;
+    screamer_trace.path = NULL;
+}
+
+static void screamer_trace_init(void)
+{
+    const char *prefix = getenv("POWEREMU_SCREAMER_TRACE");
+    if (!prefix || prefix[0] != '/' || screamer_trace.records) {
+        return;
+    }
+    screamer_trace.records = g_try_malloc0_n(SCREAMER_TRACE_CAPACITY,
+                                            sizeof(ScreamerTraceRecord));
+    if (!screamer_trace.records) {
+        return;
+    }
+    /* Touch every page before the guest starts. */
+    volatile uint8_t *bytes = (volatile uint8_t *)screamer_trace.records;
+    for (size_t i = 0; i < SCREAMER_TRACE_CAPACITY * sizeof(ScreamerTraceRecord);
+         i += 4096) {
+        bytes[i] = 0;
+    }
+    screamer_trace.path = g_strdup_printf("%s.%d.screamer", prefix, getpid());
+    screamer_trace.exit.notify = screamer_trace_exit;
+    qemu_add_exit_notifier(&screamer_trace.exit);
+}
+
 static struct {
     int64_t last;
     uint64_t pulled, written, underruns, zero_runs, zero_frames, reads[16];
@@ -179,13 +393,70 @@ static void sdbg_tick(ScreamerState *s)
     }
 }
 
+#include "screamer-slot.h"
+
 static int pmac_screamer_rx_transfer(ScreamerState *s, int max);
+
+/* Default-off DBDMA lifecycle experiment; no clock or IRQ changes. */
+static bool screamer_lifecycle_fix;
+
+static bool screamer_dma_can_transfer(DBDMA_io *io)
+{
+    if (!screamer_lifecycle_fix) {
+        return true;
+    }
+    DBDMA_channel *ch = io->channel;
+    return ch && ch->io.processing && ch->io.len == io->len &&
+           ch->io.addr == io->addr &&
+           (ch->regs[DBDMA_STATUS] & (RUN | ACTIVE)) == (RUN | ACTIVE) &&
+           !(ch->regs[DBDMA_STATUS] & (PAUSE | DEAD));
+}
+
+static void screamer_dma_sync(DBDMA_io *io)
+{
+    if (screamer_lifecycle_fix) {
+        DBDMA_channel *ch = io->channel;
+        ch->io.addr = io->addr;
+        ch->io.len = io->len;
+    }
+}
+
+static void screamer_dma_flush(DBDMA_io *io, DBDMA_io *pending)
+{
+    DBDMA_channel *ch = io->channel;
+    uint32_t control = ch->regs[DBDMA_CONTROL];
+    uint16_t mask = control >> 16, value = control;
+    /* mac_dbdma invokes flush before committing the new channel status. */
+    uint32_t status = (ch->regs[DBDMA_STATUS] & ~(mask & (RUN | PAUSE))) |
+                      (value & mask & (RUN | PAUSE));
+    uint16_t cmd = le16_to_cpu(ch->current.command) & COMMAND_MASK;
+    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
+        cmd == INPUT_MORE || cmd == INPUT_LAST) {
+        ch->current.xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+        ch->current.res_count = cpu_to_le16(io->len);
+        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+                         &ch->current, sizeof(dbdma_cmd),
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+    /* Pause and explicit FLUSH retain the unfinished descriptor. No memory
+     * copy is outstanding: the memory-to-ring transfer is synchronous.
+     * Retaining processing prevents channel_run from replaying its beginning.
+     * Stop abandons the copied descriptor; restart fetches the guest program. */
+    if (!(status & RUN)) {
+        ch->io.processing = false;
+        pending->len = 0;
+    }
+}
 
 /* Move up to max frames of the current TX descriptor into the ring. */
 static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
 {
     DBDMA_io *io = &s->io;
     int samples;
+
+    if (!screamer_dma_can_transfer(io)) {
+        return 0;
+    }
 
     /* The guest hardware clock must not stop when the host output stalls.
      * Retain the newest frames and discard only stale queued host audio. */
@@ -209,13 +480,17 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
         done += n;
     }
 
+    screamer_slot_transfer(s, samples);
+    screamer_pcm_capture(s, samples);
     SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
     s->regs[FRAME_CNT_REG] += samples;   /* frames "played": DMA-paced time */
     sdbg.pulled += samples;
-    for (int k = 0; sdbg_on > 0 && k < samples; k++) {
+    uint32_t trace_zeros = 0;
+    for (int k = 0; (sdbg_on > 0 || screamer_trace.records) && k < samples; k++) {
         const uint8_t *f = &s->mixbuf[((s->wpos + k) % s->samples) << s->shift];
         int16_t l = (int16_t)((f[0] << 8) | f[1]);
         if (!(f[0] | f[1] | f[2] | f[3])) {
+            trace_zeros++;
             sdbg.exact_zero_frames++;
             if (++sdbg_exact_run == 64) {
                 sdbg.exact_zero_runs++;
@@ -234,8 +509,10 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
         }
     }
 
+    screamer_trace_event(s, STRACE_TX, samples, trace_zeros);
     io->addr += (samples << s->shift);
     io->len -= (samples << s->shift);
+    screamer_dma_sync(io);
     s->wpos += samples;
 
     /*
@@ -266,11 +543,15 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
  */
 #define SCREAMER_PACE_NS (1 * SCALE_MS)
 
+/* Opt-in scheduling experiment; normal hardware timing remains the default. */
+static bool screamer_slice_pacing;
+
 static void screamer_pace_cb(void *opaque)
 {
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    screamer_slot_tick(s);
     if (sdbg_on > 0) {
         int64_t host_now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (sdbg_pace_host_last &&
@@ -290,12 +571,22 @@ static void screamer_pace_cb(void *opaque)
         sdbg.pace_discarded += due - (int64_t)s->rate / 20;
     }
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
+    if (screamer_slice_pacing && due > 256 &&
+        (s->io.len || (s->in_running && s->in_io.len))) {
+        /* Return to the event loop between owed DMA slices so guest mixing
+         * can run. Preserve the remaining budget, with the existing 50 ms
+         * stall bound. TX/RX use the same admitted hardware-clock budget. */
+        s->pace_frac += (due - 256) * NANOSECONDS_PER_SECOND;
+        due = 256;
+    }
 
     /* A dispatched timer is no longer pending. Completing a DMA descriptor
      * below may synchronously start the next one, whose TX/RX entry point
      * uses timer_pending() to detect a genuinely idle hardware clock. Arm
      * the next tick first so that continuation cannot reset pace_frac and
      * throw away the fractional frames accumulated on every tick. */
+    screamer_trace_event(s, STRACE_PACE, due,
+                        s->pace_frac / NANOSECONDS_PER_SECOND);
     timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
     int moved = 0;
     int64_t out_left = due, in_left = due;
@@ -356,6 +647,7 @@ static void pmac_screamer_tx(DBDMA_io *io)
                      " len: %x\n", io->addr, io->len);
 
     memcpy(&s->io, io, sizeof(DBDMA_io));
+    screamer_trace_event(s, STRACE_DESCRIPTOR, 0, 0);
     s->pace_idle = 0;
     if (!timer_pending(s->pace_timer)) {
         s->pace_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -369,6 +661,12 @@ static void pmac_screamer_tx_flush(DBDMA_io *io)
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
+
+    if (screamer_lifecycle_fix) {
+        ScreamerState *s = io->opaque;
+        screamer_dma_flush(io, &s->io);
+        return;
+    }
 
     SCREAMER_DPRINTF("DMA TX flush!\n");
 #if 0
@@ -420,6 +718,9 @@ static int pmac_screamer_rx_transfer(ScreamerState *s, int max)
     int queued = s->in_wpos - s->in_rpos;
     int done;
 
+    if (!screamer_dma_can_transfer(io)) {
+        return 0;
+    }
     if (frames <= 0) {
         return 0;
     }
@@ -452,6 +753,7 @@ static int pmac_screamer_rx_transfer(ScreamerState *s, int max)
 
     io->addr += (hwaddr)frames << s->shift;
     io->len -= frames << s->shift;
+    screamer_dma_sync(io);
 
     if (io->len == 0) {
         s->in_running = false;
@@ -521,6 +823,15 @@ static void pmac_screamer_rx_flush(DBDMA_io *io)
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
 
+    if (screamer_lifecycle_fix) {
+        ScreamerState *s = io->opaque;
+        screamer_dma_flush(io, &s->in_io);
+        if (!s->in_io.len) {
+            s->in_running = false;
+        }
+        return;
+    }
+
     SCREAMER_DPRINTF("DMA RX flush!\n");
 #if 1
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
@@ -549,6 +860,7 @@ static void screamerspk_callback(void *opaque, int free_b)
     ScreamerState *s = opaque;
     int samples, generated;
 
+    screamer_trace_event(s, STRACE_OUTPUT, free_b, 0);
     if (free_b == 0) {
         return;
     }
@@ -698,6 +1010,7 @@ static void screamer_reset(DeviceState *dev)
 {
     ScreamerState *s = SCREAMER(dev);
     
+    screamer_slot_invalidate();
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
     memset(&s->io, 0, sizeof(DBDMA_io));
@@ -717,11 +1030,19 @@ static void screamer_reset(DeviceState *dev)
 static void screamer_realizefn(DeviceState *dev, Error **errp)
 {
     ScreamerState *s = SCREAMER(dev);
+    const char *slice = getenv("POWEREMU_SCREAMER_SLICE_PACING");
+    const char *lifecycle = getenv("POWEREMU_SCREAMER_LIFECYCLE_FIX");
+
+    screamer_slice_pacing = slice && !strcmp(slice, "1");
+    screamer_lifecycle_fix = lifecycle && !strcmp(lifecycle, "1");
 
     if (!AUD_register_card(s_spk, &s->card, errp)) {
         return;
     }
 
+    screamer_trace_init();
+    screamer_pcm_init();
+    screamer_slot_init();
     s->rate = 44100;
     s->pace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, screamer_pace_cb, s);
     screamer_update_settings(s);
@@ -771,6 +1092,7 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
      * reason.
      */
     if (s->rate != old_rate) {
+        screamer_slot_invalidate();
         screamer_update_settings(s);
     }
 
@@ -916,6 +1238,9 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
 
     SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " -> %x\n", __func__, addr, val);
 
+    if (addr == FRAME_CNT_REG) {
+        screamer_trace_event(s, STRACE_FRAME_READ, val, 0);
+    }
     strace("RD", (uint32_t)addr, val);
     return val;
 }
@@ -953,7 +1278,9 @@ static void screamer_write(void *opaque, hwaddr addr,
          * unimplemented path and be dropped, so the counter carried on from
          * wherever the last stream had left it.
          */
+        screamer_slot_invalidate();
         s->regs[addr] = val & 0xffffffff;
+        screamer_trace_event(s, STRACE_FRAME_WRITE, val, 0);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,

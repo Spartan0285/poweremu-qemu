@@ -28,6 +28,10 @@
 #include "system/replay.h"
 #include "system/system.h"
 
+#ifdef CONFIG_DARWIN
+#include <pthread/qos.h>
+#endif
+
 #ifdef CONFIG_SDL
 /*
  * SDL insists on wrapping the main() function with its own implementation on
@@ -44,6 +48,19 @@
 static void *qemu_default_main(void *opaque)
 {
     int status;
+
+#ifdef CONFIG_DARWIN
+    /* The Darwin event loop runs on a separate thread. Test matching the
+     * vCPU QoS here, on the thread that actually dispatches DMA timers. */
+    const char *audio_qos = getenv("POWEREMU_MAINLOOP_QOS");
+    if (audio_qos && !strcmp(audio_qos, "1")) {
+        int result = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        qos_class_t actual_qos = QOS_CLASS_UNSPECIFIED;
+        pthread_get_qos_class_np(pthread_self(), &actual_qos, NULL);
+        fprintf(stderr, "POWEREMU_MAINLOOP_QOS result=%d class=%u\n", result,
+                (unsigned)actual_qos);
+    }
+#endif
 
     replay_mutex_lock();
     bql_lock();

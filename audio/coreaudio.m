@@ -36,6 +36,13 @@
 #define AUDIO_CAP "coreaudio"
 #include "audio_int.h"
 
+typedef struct CoreaudioCapturePacket {
+    int64_t wall_ns;
+    uint64_t pcm_offset;
+    uint64_t bytes;
+    uint64_t copied_bytes;
+} CoreaudioCapturePacket;
+
 typedef struct coreaudioVoiceOut {
     HWVoiceOut hw;
     pthread_mutex_t buf_mutex;
@@ -57,6 +64,11 @@ typedef struct coreaudioVoiceOut {
     FILE *capture_file;
     unsigned capture_generation;
     int64_t capture_last_ms;
+    bool capture_deferred;
+    CoreaudioCapturePacket *capture_packets;
+    size_t capture_packet_count, capture_packet_capacity;
+    uint64_t capture_packet_dropped;
+    FILE *capture_packet_file;
     uint64_t output_written, output_read;
     bool debug_audio;
     int64_t debug_last_ms;
@@ -306,7 +318,8 @@ static int coreaudio_buf_unlock (coreaudioVoiceOut *core, const char *fn_name)
 /* Capture the actual output packets without doing file IO in the IOProc.
  * This is driver-input PCM, not a recording of the physical speakers. */
 static void coreaudio_capture_push(coreaudioVoiceOut *core,
-                                   const AudioBufferList *buffers)
+                                   const AudioBufferList *buffers,
+                                   size_t copied_bytes)
 {
     if (!core->capture_pcm || !buffers->mNumberBuffers ||
         !buffers->mBuffers[0].mData) {
@@ -314,6 +327,18 @@ static void coreaudio_capture_push(coreaudioVoiceOut *core,
     }
     size_t bytes = buffers->mBuffers[0].mDataByteSize;
     uint64_t written = core->capture_written;
+    if (core->capture_packets) {
+        if (core->capture_packet_count < core->capture_packet_capacity) {
+            CoreaudioCapturePacket *packet =
+                &core->capture_packets[core->capture_packet_count++];
+            packet->wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            packet->pcm_offset = written;
+            packet->bytes = bytes;
+            packet->copied_bytes = copied_bytes;
+        } else {
+            core->capture_packet_dropped++;
+        }
+    }
     uint64_t read = qatomic_load_acquire(&core->capture_read);
     size_t free = core->capture_size - (written - read);
     size_t n = MIN(bytes, free);
@@ -356,8 +381,49 @@ static void coreaudio_capture_end(coreaudioVoiceOut *core)
               core->capture_dropped);
         core->capture_file = NULL;
     }
+    if (core->capture_packet_file) {
+        if (fwrite(core->capture_packets, sizeof(*core->capture_packets),
+                   core->capture_packet_count, core->capture_packet_file) !=
+            core->capture_packet_count) {
+            dolog("Diagnostic callback timing write failed\n");
+        }
+        fclose(core->capture_packet_file);
+        core->capture_packet_file = NULL;
+        dolog("Diagnostic callback timing dropped %" PRIu64 " packets\n",
+              core->capture_packet_dropped);
+    }
+    g_free(core->capture_packets);
+    core->capture_packets = NULL;
+    core->capture_packet_count = core->capture_packet_capacity = 0;
     g_free(core->capture_pcm);
     core->capture_pcm = NULL;
+    core->capture_deferred = false;
+}
+
+/* QA can retain a bounded recording until the IOProc stops. This avoids
+ * synchronous recording writes on the emulation thread during playback.
+ * Invalid settings retain the existing four-second streaming capture. */
+static unsigned coreaudio_capture_seconds(void)
+{
+    const char *value = getenv("POWEREMU_COREAUDIO_CAPTURE_SECONDS");
+    char *end;
+    unsigned long seconds;
+
+    if (!value || !*value || *value < '0' || *value > '9') {
+        return 0;
+    }
+    errno = 0;
+    seconds = strtoul(value, &end, 10);
+    return !errno && !*end && seconds >= 1 && seconds <= 600 ? seconds : 0;
+}
+
+static void coreaudio_capture_poll(coreaudioVoiceOut *core, int64_t now)
+{
+    if (core->capture_file && !core->capture_deferred &&
+        now - core->capture_last_ms >= 100) {
+        coreaudio_capture_drain(core);
+        core->capture_last_ms = now;
+    }
 }
 
 static void coreaudio_capture_begin(coreaudioVoiceOut *core)
@@ -380,12 +446,46 @@ static void coreaudio_capture_begin(coreaudioVoiceOut *core)
         g_free(path);
         return;
     }
+    unsigned seconds = coreaudio_capture_seconds();
+    core->capture_deferred = seconds != 0;
     core->capture_size = (size_t)core->hw.info.freq *
-                        core->hw.info.bytes_per_frame * 4;
+                        core->hw.info.bytes_per_frame * (seconds ? seconds : 4);
     core->capture_pcm = g_malloc(core->capture_size);
+    /* Commit diagnostic storage before IO starts, so the callback does not
+     * fault in a large untouched allocation as it records the first sound. */
+    for (size_t at = 0; at < core->capture_size; at += 4096) {
+        ((volatile uint8_t *)core->capture_pcm)[at] = 0;
+    }
     core->capture_written = core->capture_read = core->capture_dropped = 0;
     dolog("Diagnostic PCM %s: float32 native endian, %d Hz, %d channels\n",
           path, core->hw.info.freq, core->hw.info.nchannels);
+    if (core->capture_deferred) {
+        /* Fixed-size native-endian records: monotonic ns, retained PCM byte
+         * offset, requested bytes and copied bytes. Allocate before starting IO;
+         * write only after stopping it. Full metadata is explicitly counted. */
+        char *packet_path = g_strdup_printf("%s.callbacks", path);
+        int packet_fd = open(packet_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (packet_fd >= 0) {
+            core->capture_packet_file = fdopen(packet_fd, "wb");
+            if (!core->capture_packet_file) {
+                close(packet_fd);
+            } else {
+                core->capture_packet_capacity =
+                    (size_t)core->hw.info.freq * seconds / 32 + 1024;
+                core->capture_packets = g_new(CoreaudioCapturePacket,
+                                              core->capture_packet_capacity);
+                size_t packet_bytes = core->capture_packet_capacity *
+                                      sizeof(*core->capture_packets);
+                for (size_t at = 0; at < packet_bytes; at += 4096) {
+                    ((volatile uint8_t *)core->capture_packets)[at] = 0;
+                }
+                core->capture_packet_count = core->capture_packet_dropped = 0;
+            }
+        }
+        g_free(packet_path);
+        dolog("Diagnostic PCM retains %u seconds in memory until output stops\n",
+              seconds);
+    }
     g_free(path);
 }
 
@@ -397,10 +497,7 @@ static void coreaudio_debug_tick(coreaudioVoiceOut *core)
     int64_t now;
 
     now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    if (core->capture_file && now - core->capture_last_ms >= 100) {
-        coreaudio_capture_drain(core);
-        core->capture_last_ms = now;
-    }
+    coreaudio_capture_poll(core, now);
     if (!core->debug_audio) {
         return;
     }
@@ -598,7 +695,7 @@ static OSStatus coreaudio_spsc_output(AudioDeviceID device,
     memcpy(out, hw->buf_emul + at, first);
     memcpy(out + first, hw->buf_emul, bytes - first);
     qatomic_store_release(&core->output_read, read + bytes);
-    coreaudio_capture_push(core, buffers);
+    coreaudio_capture_push(core, buffers, bytes);
     if (core->debug_audio) {
         qatomic_fetch_add(&core->debug_callbacks, 1);
         if (bytes < requested) {
@@ -700,7 +797,9 @@ static OSStatus audioDeviceIOProc(
         memset(out, 0, (frameCount - pending_frames) * hw->info.bytes_per_frame);
     }
 
-    coreaudio_capture_push(core, outOutputData);
+    coreaudio_capture_push(core, outOutputData,
+                           MIN(frameCount, pending_frames) *
+                           hw->info.bytes_per_frame);
     coreaudio_buf_unlock (core, "audioDeviceIOProc");
     return 0;
 }

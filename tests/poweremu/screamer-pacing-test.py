@@ -36,6 +36,9 @@ source = r'''
 #define QEMU_CLOCK_REALTIME 0
 #define QEMU_CLOCK_VIRTUAL 1
 #define SCREAMER_DPRINTF(...) ((void)0)
+#define screamer_trace_event(...) ((void)0)
+#define screamer_slot_tick(...) ((void)0)
+#define screamer_slot_transfer(...) ((void)0)
 #define DBDMA_STATUS 0
 #define RUN 1
 #define AUD_log(...) ((void)0)
@@ -53,6 +56,7 @@ static bool timer_pending(QEMUTimer *t) { return t->pending; }
 static void timer_mod(QEMUTimer *t, int64_t deadline) { t->pending=true; t->deadline=deadline; }
 static void timer_del(QEMUTimer *t) { t->pending=false; }
 static int sdbg_on;
+static bool screamer_slice_pacing;
 static uint64_t sdbg_exact_run;
 static int64_t sdbg_pace_host_last;
 static struct {
@@ -134,7 +138,33 @@ int main(void)
         pmac_screamer_tx(&next);
         assert(timer.pending && s.pace_last==now && !s.pace_frac);
     }
-    puts("PASS exact fractional-frame conservation over 10,000 irregular ticks at four rates, synchronous TX/RX descriptors, idle stop/restart, 500 ms host backpressure and recovery");
+    for (unsigned duplex=0; duplex<2; duplex++) {
+        QEMUTimer timer = {0};
+        ScreamerState s = {.pace_timer=&timer, .rate=44100,
+            .input=duplex, .in_voice=&timer, .in_running=duplex};
+        DBDMA_io next = {.opaque=&s, .len=32*4};
+        now=0; tx_frames=rx_frames=0;
+        memset(&sdbg,0,sizeof(sdbg)); screamer_slice_pacing=true;
+        pmac_screamer_tx(&next); s.in_io=next;
+        now=30000000; timer.pending=false; screamer_pace_cb(&s);
+        assert(tx_frames==256 && timer.deadline==now+SCALE_MS);
+        assert(s.pace_frac/NANOSECONDS_PER_SECOND==1067);
+        if (duplex) assert(rx_frames==tx_frames);
+        for (unsigned tick=0; tick<20; tick++) {
+            uint64_t before=tx_frames;
+            now+=SCALE_MS;timer.pending=false;screamer_pace_cb(&s);
+            assert(tx_frames-before<=256 && timer.pending);
+            if (duplex) assert(rx_frames==tx_frames);
+        }
+        assert(tx_frames==now*s.rate/NANOSECONDS_PER_SECOND);
+        assert(!sdbg.pace_discarded);
+        s.io.len=s.in_io.len=0;
+        for (unsigned tick=0;tick<201;tick++) {
+            now+=SCALE_MS;timer.pending=false;screamer_pace_cb(&s);
+        }
+        assert(!timer.pending);
+    }
+    puts("PASS fractional conservation, duplex continuation, restart/backpressure and opt-in bounded catch-up slices with drained debt");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='pe-screamer-pacing-') as d:

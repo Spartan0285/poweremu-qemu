@@ -75,7 +75,7 @@ typedef struct {
 } coreaudioVoiceOut;
 static int coreaudio_buf_lock(coreaudioVoiceOut *c, const char *name) { assert(!c->spsc_output); return 0; }
 static int coreaudio_buf_unlock(coreaudioVoiceOut *c, const char *name) { return 0; }
-static void coreaudio_capture_push(coreaudioVoiceOut *c, const AudioBufferList *b) {}
+static void coreaudio_capture_push(coreaudioVoiceOut *c, const AudioBufferList *b, size_t copied) { assert(copied <= b->mBuffers[0].mDataByteSize); }
 '''
 spsc_stubs = r'''
 #define qatomic_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
