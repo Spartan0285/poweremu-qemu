@@ -6571,6 +6571,39 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (!r200_submit_owns(st)) {
         return -1;      /* not ours to render; the device falls back */
     }
+    bool external_rt = pkt->rt_host_data != NULL;
+    uint64_t external_row_bytes = 0, external_tight_length = 0;
+    NSUInteger external_metal_row_bytes = 0;
+    id<MTLBuffer> external_buffer = nil;
+    id<MTLTexture> external_texture = nil;
+    id<MTLCommandBuffer> external_command = nil;
+    id<MTLRenderCommandEncoder> external_encoder = nil;
+    if (external_rt) {
+        /* The external target is deliberately a narrow, synchronous path:
+         * no depth/stencil and the 32-bit colour format only.  Its storage
+         * belongs to the caller, not to the VRAM alias/cache or submit-layer
+         * hazard table. */
+        if (!st->commandQueue ||
+            ((pkt->rb3d_cntl >> 10) & 0xF) != 6 ||
+            pkt->depth_enable || pkt->stencil_enable ||
+            pkt->rt_width == 0 || pkt->rt_height == 0 ||
+            pkt->rt_pitch < pkt->rt_width ||
+            pkt->rt_pitch > UINT32_MAX / 4) {
+            return -1;
+        }
+        external_row_bytes = (uint64_t)pkt->rt_pitch * 4;
+        if (external_row_bytes > UINT64_MAX / pkt->rt_height) {
+            return -1;
+        }
+        external_tight_length = external_row_bytes * pkt->rt_height;
+        /* Bounds also keep a malformed guest descriptor from requesting an
+         * unbounded shared allocation on the host. */
+        if (external_tight_length != pkt->rt_host_length ||
+            external_tight_length > 256ULL * 1024 * 1024 ||
+            external_row_bytes > NSUIntegerMax) {
+            return -1;
+        }
+    }
     /* 16-bit colour targets (3/4/15) are handled below with an R16Uint
      * view; anything else is skipped there. */
 
@@ -6594,10 +6627,17 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     MTLPixelFormat rtpf = rt16 ? MTLPixelFormatR16Uint : MTLPixelFormatBGRA8Unorm;
     NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rtpf];
     uint32_t bpr = pkt->rt_pitch * (rt16 ? 2 : 4);
-    if ((pkt->rt_offset % align) || (bpr % align)) {
+    if (!external_rt && ((pkt->rt_offset % align) || (bpr % align))) {
         r200_metal_warn(2, "render target not aligned for a linear view",
                         pkt->rt_offset, bpr);
         return -1;
+    }
+
+    if (external_rt) {
+        /* Order any earlier VRAM writes before CPU-side source texture
+         * staging and before this independent target starts. */
+        r200_end_pass();
+        gpu_submit_flush();
     }
 
     @autoreleasepool {
@@ -6891,97 +6931,159 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         GPUSurfaceKey rk = { pkt->rt_offset, pkt->rt_width, pkt->rt_height, bpr,
                           (uint32_t)rtpf };
         uint64_t rlo = pkt->rt_offset, rhi = rlo + (uint64_t)bpr * pkt->rt_height;
-        bool full = gpu_written_full();
-        bool conflict = gpu_batch_conflict(rlo, rhi, &rk);
-        for (int t = 0; t < R200_MAX_TEX && !conflict; t++) {
-            const R200TexUnit *tu = &pkt->tex[t];
-            if (u.texinfo[t][0] && !tu->host_data) {
-                conflict = gpu_batch_conflict(tu->offset, tu->offset +
-                               (uint64_t)tu->pitch * tu->height, NULL);
-            }
-        }
-        if (full) {
-            gpu_submit_flush();                  /* forget everything written */
-        } else if (conflict) {
-            gpu_submit_note_conflict();
-            if (gpu_submit_split_enabled()) {
-                gpu_submit_split();                /* the GPU keeps the order */
-            } else {
-                gpu_submit_flush();
-            }
-        }
         bool want_ds = pkt->depth_enable || pkt->stencil_enable;
-        bool enc_ds = g_r200_enc_depth_off != ~0u;
-        if (g_r200_enc &&
-            (memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
-             (want_ds && (!enc_ds || g_r200_enc_depth_off != pkt->depth_offset ||
-                          g_r200_enc_depth_pitch != pkt->depth_pitch)))) {
-            [g_r200_enc endEncoding];
-            [g_r200_enc release];
-            g_r200_enc = nil;
-        }
-        if (!g_r200_enc) {
-            id<MTLTexture> rt = gpu_view(rk, rtpf, true);
-            if (!rt) {
-                r200_metal_warn(4, "render target view failed", pkt->rt_offset, bpr);
+        if (external_rt) {
+            /* The temporary buffer/texture are never inserted into the
+             * process-global view cache or hazard table. */
+            NSUInteger min_alignment =
+                [dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm];
+            if (min_alignment == 0 || external_row_bytes > NSUIntegerMax - min_alignment) {
+                return -1;
+            }
+            external_metal_row_bytes =
+                (NSUInteger)(((external_row_bytes + min_alignment - 1) /
+                              min_alignment) * min_alignment);
+            if (external_metal_row_bytes < external_row_bytes ||
+                pkt->rt_height > NSUIntegerMax / external_metal_row_bytes) {
+                return -1;
+            }
+            size_t metal_length = (size_t)external_metal_row_bytes * pkt->rt_height;
+            external_buffer = [[dev newBufferWithLength:metal_length
+                options:MTLResourceStorageModeShared] autorelease];
+            if (!external_buffer) {
+                return -1;
+            }
+            uint8_t *metal_bytes = [external_buffer contents];
+            if (!metal_bytes) {
+                return -1;
+            }
+            for (uint32_t y = 0; y < pkt->rt_height; y++) {
+                memcpy(metal_bytes + (size_t)y * external_metal_row_bytes,
+                       pkt->rt_host_data + (size_t)y * external_row_bytes,
+                       (size_t)external_row_bytes);
+            }
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:pkt->rt_width height:pkt->rt_height mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModeShared;
+            external_texture = [[external_buffer
+                newTextureWithDescriptor:td offset:0
+                bytesPerRow:external_metal_row_bytes] autorelease];
+            if (!external_texture) {
+                return -1;
+            }
+            external_command = [[st->commandQueue commandBuffer] retain];
+            if (!external_command) {
                 return -1;
             }
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = rt;
+            rp.colorAttachments[0].texture = external_texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id<MTLTexture> dtex = nil;
-            MTLPixelFormat zpf = pkt->depth_bpp == 2 ? MTLPixelFormatR16Uint
-                                                     : MTLPixelFormatR32Uint;
-            if (want_ds) {
-                /* guest depth buffer, in place, as a second colour attachment */
-                GPUSurfaceKey dk = { pkt->depth_offset, pkt->rt_width, pkt->rt_height,
-                                  pkt->depth_pitch * pkt->depth_bpp, (uint32_t)zpf };
-                NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
-                if ((pkt->depth_bpp == 2 && !g_r200_pipeline_z16) ||
-                    pkt->depth_pitch < pkt->rt_width || (dk.offset % za) ||
-                    (dk.pitch % za) ||
-                    (uint64_t)dk.offset + (uint64_t)dk.pitch * dk.height > vram_size) {
-                    r200_metal_warn(128, "depth buffer not usable in place",
-                                    pkt->depth_offset, pkt->depth_pitch);
+            external_encoder = [[external_command
+                renderCommandEncoderWithDescriptor:rp] retain];
+            if (!external_encoder) {
+                [external_command release];
+                external_command = nil;
+                return -1;
+            }
+            [external_encoder setDepthClipMode:MTLDepthClipModeClamp];
+            [external_encoder setRenderPipelineState:g_r200_pipeline];
+            [external_encoder setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
+                                                        pkt->rt_height, 0, 1 }];
+        } else {
+            bool full = gpu_written_full();
+            bool conflict = gpu_batch_conflict(rlo, rhi, &rk);
+            for (int t = 0; t < R200_MAX_TEX && !conflict; t++) {
+                const R200TexUnit *tu = &pkt->tex[t];
+                if (u.texinfo[t][0] && !tu->host_data) {
+                    conflict = gpu_batch_conflict(tu->offset, tu->offset +
+                                   (uint64_t)tu->pitch * tu->height, NULL);
+                }
+            }
+            if (full) {
+                gpu_submit_flush();              /* forget everything written */
+            } else if (conflict) {
+                gpu_submit_note_conflict();
+                if (gpu_submit_split_enabled()) {
+                    gpu_submit_split();          /* the GPU keeps the order */
                 } else {
-                    dtex = gpu_view(dk, zpf, true);
+                    gpu_submit_flush();
+                }
+            }
+            bool enc_ds = g_r200_enc_depth_off != ~0u;
+            if (g_r200_enc &&
+                (memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
+                 (want_ds && (!enc_ds || g_r200_enc_depth_off != pkt->depth_offset ||
+                              g_r200_enc_depth_pitch != pkt->depth_pitch)))) {
+                [g_r200_enc endEncoding];
+                [g_r200_enc release];
+                g_r200_enc = nil;
+            }
+            if (!g_r200_enc) {
+                id<MTLTexture> rt = gpu_view(rk, rtpf, true);
+                if (!rt) {
+                    r200_metal_warn(4, "render target view failed", pkt->rt_offset, bpr);
+                    return -1;
+                }
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = rt;
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLTexture> dtex = nil;
+                MTLPixelFormat zpf = pkt->depth_bpp == 2 ? MTLPixelFormatR16Uint
+                                                         : MTLPixelFormatR32Uint;
+                if (want_ds) {
+                    /* guest depth buffer, in place, as a second colour attachment */
+                    GPUSurfaceKey dk = { pkt->depth_offset, pkt->rt_width, pkt->rt_height,
+                                      pkt->depth_pitch * pkt->depth_bpp, (uint32_t)zpf };
+                    NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
+                    if ((pkt->depth_bpp == 2 && !g_r200_pipeline_z16) ||
+                        pkt->depth_pitch < pkt->rt_width || (dk.offset % za) ||
+                        (dk.pitch % za) ||
+                        (uint64_t)dk.offset + (uint64_t)dk.pitch * dk.height > vram_size) {
+                        r200_metal_warn(128, "depth buffer not usable in place",
+                                        pkt->depth_offset, pkt->depth_pitch);
+                    } else {
+                        dtex = gpu_view(dk, zpf, true);
+                    }
+                    if (dtex) {
+                        uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
+                        gpu_note_written(dlo, dhi, &dk);
+                    }
                 }
                 if (dtex) {
-                    uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
-                    gpu_note_written(dlo, dhi, &dk);
+                    rp.colorAttachments[1].texture = dtex;
+                    rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+                    rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+                    g_r200_enc_depth_off = pkt->depth_offset;
+                    g_r200_enc_depth_pitch = pkt->depth_pitch;
+                    g_r200_enc_depth_z16 = pkt->depth_bpp == 2;
+                } else {
+                    g_r200_enc_depth_off = ~0u;
                 }
-            }
-            if (dtex) {
-                rp.colorAttachments[1].texture = dtex;
-                rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
-                rp.colorAttachments[1].storeAction = MTLStoreActionStore;
-                g_r200_enc_depth_off = pkt->depth_offset;
-                g_r200_enc_depth_pitch = pkt->depth_pitch;
-                g_r200_enc_depth_z16 = pkt->depth_bpp == 2;
-            } else {
-                g_r200_enc_depth_off = ~0u;
-            }
-            g_r200_enc = [[gpu_submit_buffer_for(r200_end_pass) renderCommandEncoderWithDescriptor:rp] retain];
+                g_r200_enc = [[gpu_submit_buffer_for(r200_end_pass) renderCommandEncoderWithDescriptor:rp] retain];
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
-            [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
-            [g_r200_enc setRenderPipelineState:
-                rt16 ? (!dtex ? g_r200_pipeline_c16 :
-                        pkt->depth_bpp == 2 ? g_r200_pipeline_c16_z16
-                                            : g_r200_pipeline_c16_z32)
-                     : (!dtex ? g_r200_pipeline :
-                        pkt->depth_bpp == 2 ? g_r200_pipeline_z16
-                                            : g_r200_pipeline_z32)];
-            [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
-                                                  pkt->rt_height, 0, 1 }];
-            g_r200_enc_key = rk;
-            g_r200_stat_passes++;
-            gpu_note_written(rlo, rhi, &rk);
+                [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
+                [g_r200_enc setRenderPipelineState:
+                    rt16 ? (!dtex ? g_r200_pipeline_c16 :
+                            pkt->depth_bpp == 2 ? g_r200_pipeline_c16_z16
+                                                : g_r200_pipeline_c16_z32)
+                         : (!dtex ? g_r200_pipeline :
+                            pkt->depth_bpp == 2 ? g_r200_pipeline_z16
+                                                : g_r200_pipeline_z32)];
+                [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
+                                                      pkt->rt_height, 0, 1 }];
+                g_r200_enc_key = rk;
+                g_r200_stat_passes++;
+                gpu_note_written(rlo, rhi, &rk);
+            }
         }
-        id<MTLRenderCommandEncoder> enc = g_r200_enc;
+        id<MTLRenderCommandEncoder> enc = external_rt ? external_encoder : g_r200_enc;
         [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
-        if (g_r200_enc_depth_off != ~0u) {
+        if (!external_rt && g_r200_enc_depth_off != ~0u) {
             /* depth-less draws reuse a depth pass with test/write off */
             uint32_t fl = g_r200_enc_depth_z16 ? 8u : 0u;
             if (want_ds) {
@@ -7044,6 +7146,41 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                                    MTLPrimitiveTypeTriangle
                 vertexStart:0 vertexCount:pkt->num_indices];
         g_r200_stat_draws++;
+        if (external_rt) {
+            /* Unlike local VRAM draws this target is not visible to the
+             * submit layer.  Commit and wait here, then publish only a
+             * successfully completed result to the caller's RAM staging. */
+            [external_encoder endEncoding];
+            [external_encoder release];
+            external_encoder = nil;
+            [external_command commit];
+            [external_command waitUntilCompleted];
+            bool completed = external_command.status == MTLCommandBufferStatusCompleted;
+            if (completed) {
+                const uint8_t *metal_bytes = [external_buffer contents];
+                if (!metal_bytes) {
+                    completed = false;
+                } else {
+                    for (uint32_t y = 0; y < pkt->rt_height; y++) {
+                        memcpy(pkt->rt_host_data + (size_t)y * external_row_bytes,
+                               metal_bytes + (size_t)y * external_metal_row_bytes,
+                               (size_t)external_row_bytes);
+                    }
+                }
+            }
+            if (!completed) {
+                qemu_log("ppc-mac-gpu r200: external target command failed: %s\n",
+                         external_command.error ?
+                         [[external_command.error localizedDescription] UTF8String] :
+                         "command did not complete");
+            }
+            [external_command release];
+            external_command = nil;
+            if (!completed) {
+                return -1;
+            }
+            return 0;
+        }
         {   /* debug: read the depth word back after the first depth draws */
             static int zchk;
             if (want_ds && g_r200_enc_depth_off != ~0u && zchk < 12 &&

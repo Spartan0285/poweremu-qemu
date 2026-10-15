@@ -725,6 +725,15 @@ struct PPCMacGPUState {
     uint32_t pm4_blit_src_po;
     uint32_t pm4_blit_dst_po;
     bool     pm4_blit_valid;
+    /* Split-coordinate 2D register writes used by the narrow optional
+     * R200 AIC readback candidate. Runtime-only, outside the migrated regs. */
+    uint32_t aic_blit_src_x, aic_blit_src_y;
+    uint32_t aic_blit_dst_x, aic_blit_dst_y;
+    uint8_t aic_blit_xy_valid;
+    /* Current R200 2D source/destination tile controls, sampled only by the
+     * default-off AIC readback candidate. */
+    uint32_t aic_blit_src_tile, aic_blit_dst_tile;
+    uint8_t aic_blit_tile_valid;
     /* How big that register file is, saved with the machine so a state
      * written by another build cannot be poured into a different layout. */
     uint32_t regs_size;

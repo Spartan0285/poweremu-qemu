@@ -19,6 +19,7 @@
 #define HW_DISPLAY_PPC_MAC_GPU_RENDERER_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
 /*
@@ -202,6 +203,11 @@ typedef struct R200DrawPacket {
     uint32_t rt_pitch;            /* pixels per row */
     uint32_t rt_format;           /* RB3D_CNTL colour format field */
     uint32_t rt_width, rt_height;
+    /* Optional external 32-bit colour target. Rows are tightly packed in
+     * guest byte order (rt_pitch * 4 bytes), with rt_host_length exactly
+     * rt_height rows. NULL keeps the normal batched VRAM path unchanged. */
+    uint8_t *rt_host_data;
+    size_t rt_host_length;
     uint32_t scissor[4];          /* x0, y0, x1, y1 (exclusive) */
     uint32_t excl[3][4];          /* exclusive aux scissors: x0, y0, x1, y1 */
     uint32_t num_excl;

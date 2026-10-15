@@ -43,6 +43,8 @@
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
+#include "ppc_mac_gpu_target.h"
+#include "ppc_mac_gpu_aic_blit.h"
 #include "ppc_mac_gpu_r300_fp.h"
 #include "ati_r350_pvs.h"
 #include "ppc_mac_gpu_r300_metal.h"
@@ -3545,6 +3547,7 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
                                     uint32_t ib_size_dw);
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s);
 static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s);
+static bool ppc_mac_gpu_aic_blit_candidate(PPCMacGPUState *s);
 static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned int size);
 
@@ -5806,7 +5809,50 @@ static bool r200_direct_enabled(void)
     return enabled;
 }
 
+/* Experimental AIC/AGP render targets stay disabled unless explicitly set. */
+static bool r200_aic_rt_enabled(void)
+{
+    return PE_ENV_ON("POWEREMU_R200_AIC_RT");
+}
+
+/* Unlike the draw-side target check, this can be reached for every MMIO
+ * write. Cache the opt-in once so the disabled default adds no getenv work
+ * to the GPU register hot path. */
+static bool r200_aic_blit_enabled(void)
+{
+    static gsize enabled_once;
+    if (g_once_init_enter(&enabled_once)) {
+        g_once_init_leave(&enabled_once,
+                           PE_ENV_ON("POWEREMU_R200_AIC_RT") ? 2 : 1);
+    }
+    return enabled_once == 2;
+}
+
 #define R3D(a) (s->regs.regs_3d[R200_3D_IDX(a)])
+
+static bool r200_async_target_external(PPCMacGPUState *s)
+{
+    uint32_t raw = R3D(0x1C40) & ~0xFu;
+    uint32_t pitch = R3D(0x1C48) & 0x7ff;
+    uint32_t rb3d = R3D(0x1C3C);
+    uint32_t cfmt = (rb3d >> 10) & 0xf;
+    uint32_t bpp = cfmt == 3 || cfmt == 4 || cfmt == 15 ? 2 : 4;
+    uint32_t height = ((R3D(0x1C44) >> 16) & 0x7ff) + 1;
+    uint32_t agp = s->regs.mc_agp_location;
+    if ((agp == 0 || agp == 0x80000000u) && s->mc_agp_location_last_valid) {
+        agp = s->mc_agp_location_last_valid;
+    }
+    uint64_t agp_start = (uint64_t)(agp & 0xffff) << 16;
+    uint64_t agp_end = ((uint64_t)(agp >> 16) << 16) | 0xffff;
+    bool agp_enabled = agp != 0 && agp != 0x80000000u && agp_end >= agp_start;
+    uint64_t fb_start = (uint64_t)(s->regs.mc_fb_location & 0xffff) << 16;
+    PPCMacGPUTargetKind kind = pe_gpu_classify_target(
+        raw, (uint64_t)pitch * bpp * height,
+        (s->regs.aic_ctrl & 1) != 0, s->regs.aic_lo_addr,
+        s->regs.aic_hi_addr, agp_enabled, agp_start, agp_end,
+        fb_start, s->regs.config_memsize);
+    return kind == PPC_MAC_GPU_TARGET_AIC || kind == PPC_MAC_GPU_TARGET_AGP;
+}
 
 static inline float r200_f32(uint32_t bits)
 {
@@ -6410,6 +6456,320 @@ static void r200_clear_depth_buffer(PPCMacGPUState *s)
 
 /* Vertex sources for ppc_mac_gpu_r200_draw(). */
 enum { R200_SRC_VBUF, R200_SRC_INDX, R200_SRC_IMMD };
+
+/* Physical spans are captured before GPU work; copyback never translates a
+ * GART address a second time after the renderer has completed. */
+typedef PPCMacGPUPhysicalSpan R200HostSpan;
+
+static int r200_host_span_compare(const void *ap, const void *bp)
+{
+    const R200HostSpan *a = ap, *b = bp;
+    return a->physical < b->physical ? -1 : a->physical > b->physical;
+}
+
+#define R200_HOST_RT_MAX_BYTES (16u * 1024u * 1024u)
+#define R200_HOST_RT_MAX_SPANS (R200_HOST_RT_MAX_BYTES / 4096 + 2)
+
+static bool r200_host_rt_spans(PPCMacGPUState *s, uint32_t gpu_address,
+                               PPCMacGPUTargetKind kind, size_t length,
+                               R200HostSpan *spans,
+                               size_t *nspans)
+{
+    size_t done = 0, count = 0;
+
+    while (done < length) {
+        uint32_t ga = gpu_address + done;
+        size_t page_left = 4096 - (ga & 4095);
+        size_t gpu_chunk = MIN(length - done, page_left);
+        hwaddr physical;
+        bool translated = kind == PPC_MAC_GPU_TARGET_AIC
+            ? ppc_mac_gpu_gart_translate(s, ga, &physical)
+            : kind == PPC_MAC_GPU_TARGET_AGP
+                ? ppc_mac_gpu_agp_translate(s, ga, &physical) : false;
+        if (!translated) {
+            return false;
+        }
+        size_t in_page = 0;
+        while (in_page < gpu_chunk) {
+            hwaddr xlat, available = gpu_chunk - in_page;
+            MemoryRegion *mr = address_space_translate(&address_space_memory,
+                physical + in_page, &xlat, &available, true,
+                MEMTXATTRS_UNSPECIFIED);
+            if (!memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
+                mr == &s->vram || mr->readonly || !available) {
+                return false;
+            }
+            if (count >= R200_HOST_RT_MAX_SPANS) {
+                return false;
+            }
+            size_t n = MIN((size_t)available, gpu_chunk - in_page);
+            spans[count++] = (R200HostSpan) {
+                .physical = physical + in_page,
+                .offset = done + in_page,
+                .length = n,
+            };
+            in_page += n;
+        }
+        done += gpu_chunk;
+    }
+    qsort(spans, count, sizeof(*spans), r200_host_span_compare);
+    if (!pe_gpu_spans_disjoint(spans, count)) {
+        return false;
+    }
+    *nspans = count;
+    return true;
+}
+
+static bool r200_host_rt_read(const R200HostSpan *spans, size_t nspans,
+                              uint8_t *buffer)
+{
+    for (size_t i = 0; i < nspans; i++) {
+        if (address_space_read(&address_space_memory, spans[i].physical,
+                               MEMTXATTRS_UNSPECIFIED,
+                               buffer + spans[i].offset,
+                               spans[i].length) != MEMTX_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool r200_host_rt_write(const R200HostSpan *spans, size_t nspans,
+                               const uint8_t *buffer)
+{
+    for (size_t i = 0; i < nspans; i++) {
+        if (address_space_write(&address_space_memory, spans[i].physical,
+                                MEMTXATTRS_UNSPECIFIED,
+                                buffer + spans[i].offset,
+                                spans[i].length) != MEMTX_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A very narrow, opt-in implementation of the captured Tiger window
+ * readback blit.  The raw VRAM bytes are copied unchanged: no conversion is
+ * inferred from the GMC or surface byte-order controls. */
+static bool ppc_mac_gpu_aic_blit_candidate(PPCMacGPUState *s)
+{
+    const uint32_t bpp = PE_R200_AIC_BLIT_BPP;
+    const uint32_t width = s->regs.dst_width;
+    const uint32_t height = s->regs.dst_height;
+    const uint32_t gmc = s->regs.dp_gui_master_cntl;
+    const uint64_t row_bytes64 = (uint64_t)width * bpp;
+    uint64_t packed_length64;
+    size_t row_bytes, packed_length;
+    uint32_t fb_start, saved_fb, saved_memsize, saved_aic_ctrl;
+    uint32_t saved_aic_lo, saved_aic_hi, saved_aic_pt;
+    uint32_t saved_agp_reg, saved_agp, saved_agp_last, saved_gmc;
+    uint32_t saved_src_offset, saved_src_pitch, saved_dst_offset;
+    uint32_t saved_dst_pitch, saved_width, saved_height;
+    uint32_t saved_src_tile, saved_dst_tile;
+    uint8_t saved_tile_valid;
+    uint32_t sx, sy, dx, dy;
+    uint64_t src_gpu, dst_gpu, src_envelope, dst_envelope;
+    uint64_t src_vram_offset, local_size, agp_start, agp_end;
+    bool agp_enabled;
+    PPCMacGPUTargetKind src_kind, dst_kind;
+    uint8_t *packed = NULL;
+    R200HostSpan *spans = NULL, *row_spans_buf = NULL;
+    size_t span_count = 0;
+    bool ok = false;
+
+    seq_log("AIC2D enter gmc=%08x src=%08x/%u dst=%08x/%u xy=%u,%u/%u,%u size=%ux%u valid=%x po=%08x/%08x bql=%d",
+            gmc, s->regs.src_offset, s->regs.src_pitch,
+            s->regs.dst_offset, s->regs.dst_pitch,
+            s->aic_blit_src_x, s->aic_blit_src_y,
+            s->aic_blit_dst_x, s->aic_blit_dst_y,
+            width, height, s->aic_blit_xy_valid,
+            s->regs.src_pitch_offset, s->regs.dst_pitch_offset,
+            bql_locked());
+
+    if (!r200_aic_blit_enabled() ||
+        s->aic_blit_xy_valid != 0x0f ||
+        !pe_r200_aic_blit_signature(gmc, width, height,
+                                    s->regs.src_pitch, s->regs.dst_pitch,
+                                    gmc_dst_bpp(gmc),
+                                    s->aic_blit_src_x, s->aic_blit_src_y,
+                                    s->aic_blit_dst_x, s->aic_blit_dst_y)) {
+        return false;
+    }
+
+    /* The captured sequence uses direct pitch/offset registers; the cached
+     * combined pitch/offset values are unrelated to this operation. The
+     * guest sets SRC_TILE=1, but the current R200 renderer stores its target
+     * linearly (color_tiled=false) and MC tiling is disabled. Accept only
+     * that measured emulator storage contract and the captured tile controls. */
+    if (((gmc >> 16) & 0xff) != 0xcc || ((gmc >> 24) & 7) != 2 ||
+        ((gmc >> 8) & 0xf) != 6 ||
+        !pe_r200_aic_linear_storage_mode(s->aic_blit_src_tile,
+                                         s->aic_blit_dst_tile,
+                                         s->aic_blit_tile_valid,
+                                         MC_TILED_SURFACES_ENABLED,
+                                         false)) {
+        return false;
+    }
+    if (row_bytes64 > SIZE_MAX ||
+        height > PE_R200_AIC_BLIT_MAX_BYTES / row_bytes64) {
+        return false;
+    }
+    packed_length64 = row_bytes64 * height;
+    if (packed_length64 > SIZE_MAX) {
+        return false;
+    }
+    row_bytes = row_bytes64;
+    packed_length = packed_length64;
+
+    sx = s->aic_blit_src_x;
+    sy = s->aic_blit_src_y;
+    dx = s->aic_blit_dst_x;
+    dy = s->aic_blit_dst_y;
+    saved_src_offset = s->regs.src_offset;
+    saved_src_pitch = s->regs.src_pitch;
+    saved_dst_offset = s->regs.dst_offset;
+    saved_dst_pitch = s->regs.dst_pitch;
+    saved_width = width;
+    saved_height = height;
+    saved_gmc = gmc;
+    saved_src_tile = s->aic_blit_src_tile;
+    saved_dst_tile = s->aic_blit_dst_tile;
+    saved_tile_valid = s->aic_blit_tile_valid;
+    saved_fb = s->regs.mc_fb_location;
+    saved_memsize = s->regs.config_memsize;
+    saved_aic_ctrl = s->regs.aic_ctrl;
+    saved_aic_lo = s->regs.aic_lo_addr;
+    saved_aic_hi = s->regs.aic_hi_addr;
+    saved_aic_pt = s->regs.aic_pt_base;
+    saved_agp_reg = s->regs.mc_agp_location;
+    saved_agp_last = s->mc_agp_location_last_valid;
+    if (!saved_memsize || packed_length > R200_HOST_RT_MAX_BYTES ||
+        saved_src_pitch < row_bytes || saved_dst_pitch < row_bytes) {
+        return false;
+    }
+
+    fb_start = (saved_fb & 0xffff) << 16;
+    src_gpu = (uint64_t)saved_src_offset + (uint64_t)sy * saved_src_pitch +
+              (uint64_t)sx * bpp;
+    dst_gpu = (uint64_t)saved_dst_offset + (uint64_t)dy * saved_dst_pitch +
+              (uint64_t)dx * bpp;
+    src_envelope = (uint64_t)(height - 1) * saved_src_pitch + row_bytes;
+    dst_envelope = (uint64_t)(height - 1) * saved_dst_pitch + row_bytes;
+    if (src_gpu > UINT32_MAX || dst_gpu > UINT32_MAX ||
+        src_envelope - 1 > UINT32_MAX - src_gpu ||
+        dst_envelope - 1 > UINT32_MAX - dst_gpu || src_gpu < fb_start) {
+        return false;
+    }
+    local_size = MIN((uint64_t)saved_memsize, s->vram_size);
+    src_vram_offset = src_gpu - fb_start;
+    if (src_vram_offset > local_size ||
+        src_envelope > local_size - src_vram_offset) {
+        return false;
+    }
+
+    saved_agp = (saved_agp_reg == 0 || saved_agp_reg == 0x80000000u) && saved_agp_last
+        ? saved_agp_last : saved_agp_reg;
+    agp_start = (uint64_t)(saved_agp & 0xffff) << 16;
+    agp_end = ((uint64_t)(saved_agp >> 16) << 16) | 0xffff;
+    agp_enabled = saved_agp != 0 && saved_agp != 0x80000000u &&
+                  agp_end >= agp_start;
+    src_kind = pe_gpu_classify_target(src_gpu, src_envelope,
+        (saved_aic_ctrl & 1) != 0, saved_aic_lo, saved_aic_hi,
+        agp_enabled, agp_start, agp_end, fb_start, local_size);
+    dst_kind = pe_gpu_classify_target(dst_gpu, dst_envelope,
+        (saved_aic_ctrl & 1) != 0, saved_aic_lo, saved_aic_hi,
+        agp_enabled, agp_start, agp_end, fb_start, local_size);
+    seq_log("AIC2D classify src=%d dst=%d fb=%08x local=%llx",
+            src_kind, dst_kind, fb_start, (unsigned long long)local_size);
+    if (src_kind != PPC_MAC_GPU_TARGET_LOCAL ||
+        dst_kind != PPC_MAC_GPU_TARGET_AIC ||
+        !(saved_aic_ctrl & 1) || saved_aic_hi < saved_aic_lo ||
+        !bql_locked()) {
+        return false;
+    }
+
+    packed = g_try_malloc(packed_length);
+    spans = g_try_new(R200HostSpan, R200_HOST_RT_MAX_SPANS);
+    row_spans_buf = g_try_new(R200HostSpan, R200_HOST_RT_MAX_SPANS);
+    if (!packed || !spans || !row_spans_buf) {
+        goto out;
+    }
+
+    /* Finish all older GPU writes before reading the local source.  This
+     * drain can drop BQL, so the exact command and address interpretation
+     * are compared again before planning or touching either memory range. */
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_T3));
+    rcu_read_lock();
+    bool stable = saved_src_offset == s->regs.src_offset &&
+        saved_src_pitch == s->regs.src_pitch &&
+        saved_dst_offset == s->regs.dst_offset &&
+        saved_dst_pitch == s->regs.dst_pitch &&
+        saved_width == s->regs.dst_width && saved_height == s->regs.dst_height &&
+        saved_gmc == s->regs.dp_gui_master_cntl &&
+        saved_src_tile == s->aic_blit_src_tile &&
+        saved_dst_tile == s->aic_blit_dst_tile &&
+        saved_tile_valid == s->aic_blit_tile_valid &&
+        saved_fb == s->regs.mc_fb_location &&
+        saved_memsize == s->regs.config_memsize &&
+        saved_aic_ctrl == s->regs.aic_ctrl &&
+        saved_aic_lo == s->regs.aic_lo_addr &&
+        saved_aic_hi == s->regs.aic_hi_addr &&
+        saved_aic_pt == s->regs.aic_pt_base &&
+        saved_agp_reg == s->regs.mc_agp_location &&
+        saved_agp_last == s->mc_agp_location_last_valid &&
+        sx == s->aic_blit_src_x && sy == s->aic_blit_src_y &&
+        dx == s->aic_blit_dst_x && dy == s->aic_blit_dst_y &&
+        s->aic_blit_xy_valid == 0x0f;
+    bool source_tiled = false;
+    uint64_t src_end = src_vram_offset + src_envelope;
+    for (int i = 0; i < MC_TILED_SURFACE_MAX; i++) {
+        uint64_t tile_start = s->tiled_surfaces[i].base;
+        /* The registry still records guest metadata while the MC swizzle
+         * is disabled. Match mc_find_tiled_surface(): those entries do not
+         * describe the renderer's current physical byte layout. */
+        if (MC_TILED_SURFACES_ENABLED && s->tiled_surfaces[i].active &&
+            pe_r200_aic_ranges_overlap(src_vram_offset, src_end - src_vram_offset,
+                                       tile_start, s->tiled_surfaces[i].size)) {
+            source_tiled = true;
+            break;
+        }
+    }
+    seq_log("AIC2D source stable=%d tiled=%d", stable, source_tiled);
+    if (stable && !source_tiled &&
+        pe_r200_aic_blit_pack_rows(memory_region_get_ram_ptr(&s->vram),
+            local_size, src_vram_offset, saved_src_pitch, row_bytes, height,
+            packed, packed_length)) {
+        for (size_t row = 0; row < height; row++) {
+            uint64_t row_gpu = dst_gpu + row * (uint64_t)saved_dst_pitch;
+            size_t row_spans = 0;
+            if (row_gpu > UINT32_MAX ||
+                !r200_host_rt_spans(s, (uint32_t)row_gpu,
+                                    PPC_MAC_GPU_TARGET_AIC, row_bytes,
+                                    row_spans_buf, &row_spans) ||
+                row_spans > R200_HOST_RT_MAX_SPANS - span_count) {
+                goto unlock;
+            }
+            if (!pe_r200_aic_append_spans(spans, R200_HOST_RT_MAX_SPANS,
+                                          &span_count, row_spans_buf,
+                                          row_spans, row * row_bytes)) {
+                goto unlock;
+            }
+        }
+        qsort(spans, span_count, sizeof(*spans), r200_host_span_compare);
+        if (pe_gpu_spans_disjoint(spans, span_count)) {
+            ok = r200_host_rt_write(spans, span_count, packed);
+        }
+        seq_log("AIC2D write spans=%zu bytes=%zu ok=%d", span_count,
+                packed_length, ok);
+    }
+unlock:
+    rcu_read_unlock();
+out:
+    g_free(row_spans_buf);
+    g_free(spans);
+    g_free(packed);
+    return ok;
+}
 
 /*
  * Handle one R200 draw packet: 3D_DRAW_VBUF_2 (vertices from the AOS
@@ -7514,16 +7874,141 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t rt_cfmt = (pkt.rb3d_cntl >> 10) & 0xF;
     uint32_t rt_bpp = (rt_cfmt == 3 || rt_cfmt == 4 || rt_cfmt == 15) ? 2 : 4;
-    if (pkt.rt_pitch == 0 ||
+    bool host_target = false, host_rejected = false, rendered = false;
+    uint32_t raw_target = R3D(0x1C40) & ~0xFu;
+    uint64_t host_length = (uint64_t)pkt.rt_pitch * rt_bpp * pkt.rt_height;
+    PPCMacGPUTargetKind target_kind = PPC_MAC_GPU_TARGET_INVALID;
+    if (r200_aic_rt_enabled()) {
+        uint32_t agp = s->regs.mc_agp_location;
+        if ((agp == 0 || agp == 0x80000000u) && s->mc_agp_location_last_valid) {
+            agp = s->mc_agp_location_last_valid;
+        }
+        uint64_t agp_start = (uint64_t)(agp & 0xffff) << 16;
+        uint64_t agp_end = ((uint64_t)(agp >> 16) << 16) | 0xffff;
+        bool agp_enabled = agp != 0 && agp != 0x80000000u && agp_end >= agp_start;
+        uint64_t fb_start = (uint64_t)(s->regs.mc_fb_location & 0xffff) << 16;
+        target_kind = pe_gpu_classify_target(
+            raw_target, host_length,
+            (s->regs.aic_ctrl & 1) != 0, s->regs.aic_lo_addr,
+            s->regs.aic_hi_addr, agp_enabled, agp_start, agp_end,
+            fb_start, s->regs.config_memsize);
+        if (target_kind == PPC_MAC_GPU_TARGET_AIC ||
+            target_kind == PPC_MAC_GPU_TARGET_AGP) {
+            host_target = true;
+            if (rt_cfmt != 6 || host_length > R200_HOST_RT_MAX_BYTES ||
+                pkt.depth_enable || pkt.stencil_enable || !pkt.rt_pitch ||
+                !pkt.rt_height) {
+                host_rejected = true;
+            }
+        } else if (target_kind == PPC_MAC_GPU_TARGET_INVALID) {
+            host_rejected = true;
+        }
+    }
+
+    if (host_rejected) {
+        r200_warn_once(&r200_warned, 4096,
+                       "external render target rejected (addr=%08x pitch=%u height=%u format=%u)",
+                       raw_target, pkt.rt_pitch, pkt.rt_height, rt_cfmt);
+    } else if (host_target) {
+        size_t length = host_length, nspans = 0;
+        R200HostSpan *spans = g_try_new(R200HostSpan, R200_HOST_RT_MAX_SPANS);
+        uint8_t *host = g_try_malloc(length);
+        R200Vertex *owned_verts = NULL;
+        uint32_t *owned_indices = NULL;
+        bool geometry_copy_ok = pkt.num_verts && pkt.num_indices &&
+            pkt.num_verts <= 32768 && pkt.num_indices <= 65536 &&
+            pkt.verts && pkt.indices;
+        bool need_bql = !bql_locked();
+        bool ok = false;
+        /* r200_flush_at() may drop BQL while draining an older async draw.
+         * Pin the address interpretation to the same command/register image. */
+        uint32_t saved_fb = s->regs.mc_fb_location;
+        uint32_t saved_memsize = s->regs.config_memsize;
+        uint32_t saved_aic_ctrl = s->regs.aic_ctrl;
+        uint32_t saved_aic_lo = s->regs.aic_lo_addr;
+        uint32_t saved_aic_hi = s->regs.aic_hi_addr;
+        uint32_t saved_aic_pt = s->regs.aic_pt_base;
+        uint32_t saved_agp = s->regs.mc_agp_location;
+        uint32_t saved_agp_last = s->mc_agp_location_last_valid;
+        uint32_t saved_target = R3D(0x1C40);
+        uint32_t saved_pitch = R3D(0x1C48);
+        uint32_t saved_cntl = R3D(0x1C3C);
+        uint32_t saved_br = R3D(0x1C44);
+
+        if (geometry_copy_ok) {
+            size_t verts_bytes = (size_t)pkt.num_verts * sizeof(*owned_verts);
+            size_t indices_bytes = (size_t)pkt.num_indices * sizeof(*owned_indices);
+            owned_verts = g_try_malloc(verts_bytes);
+            owned_indices = g_try_malloc(indices_bytes);
+            if (!owned_verts || !owned_indices) {
+                geometry_copy_ok = false;
+            } else {
+                memcpy(owned_verts, pkt.verts, verts_bytes);
+                memcpy(owned_indices, pkt.indices, indices_bytes);
+                pkt.verts = owned_verts;
+                pkt.indices = owned_indices;
+            }
+        }
+        if (host && spans && geometry_copy_ok) {
+            /* Complete earlier local/worker draws before snapshotting source
+             * RAM for this synchronous external target. */
+            r200_flush_at(s, R200_WHY_TAG(R200_WHY_T3));
+            if (need_bql) {
+                bql_lock();
+            }
+            rcu_read_lock();
+            bool stable = saved_fb == s->regs.mc_fb_location &&
+                saved_memsize == s->regs.config_memsize &&
+                saved_aic_ctrl == s->regs.aic_ctrl &&
+                saved_aic_lo == s->regs.aic_lo_addr &&
+                saved_aic_hi == s->regs.aic_hi_addr &&
+                saved_aic_pt == s->regs.aic_pt_base &&
+                saved_agp == s->regs.mc_agp_location &&
+                saved_agp_last == s->mc_agp_location_last_valid &&
+                saved_target == R3D(0x1C40) && saved_pitch == R3D(0x1C48) &&
+                saved_cntl == R3D(0x1C3C) && saved_br == R3D(0x1C44);
+            if (stable && r200_host_rt_spans(s, raw_target, target_kind, length,
+                                   spans, &nspans) &&
+                r200_host_rt_read(spans, nspans, host)) {
+                pkt.rt_host_data = host;
+                pkt.rt_host_length = length;
+                /* External targets are synchronous: the backend must finish
+                 * GPU work and copy rows back before this call returns. */
+                r200_rate.draws++;
+                if (r200_render_draw(s, vram, &pkt) == 0) {
+                    ok = r200_host_rt_write(spans, nspans, host);
+                }
+            }
+            rcu_read_unlock();
+            if (need_bql) {
+                bql_unlock();
+            }
+        }
+        rendered = ok;
+        g_free(host);
+        g_free(spans);
+        g_free(owned_verts);
+        g_free(owned_indices);
+        if (!ok) {
+            r200_warn_once(&r200_warned, 8192,
+                           "external render target mapping or synchronous copyback failed at %08x",
+                           raw_target);
+        }
+    } else if (pkt.rt_pitch == 0 ||
         (uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp >
         s->vram_size) {
         r200_warn_once(&r200_warned, 1024,
                        "render target 0x%x pitch %u height %u outside VRAM",
                        pkt.rt_offset, pkt.rt_pitch, pkt.rt_height);
-    } else if (r200_rate.draws++,
-               r200_render_draw(s, vram, &pkt) == 0) {
-        ppc_mac_gpu_dirty(s, pkt.rt_offset,
-                                (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+    } else {
+        r200_rate.draws++;
+        rendered = r200_render_draw(s, vram, &pkt) == 0;
+    }
+    if (rendered) {
+        if (!host_target) {
+            ppc_mac_gpu_dirty(s, pkt.rt_offset,
+                              (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
+        }
         if (unlikely(r350_sync_draws())) {
             r200_flush_at(s, R200_WHY_TAG(R200_WHY_T3));
         }
@@ -9852,7 +10337,10 @@ static bool ppc_mac_gpu_r200_draw(PPCMacGPUState *s, const uint32_t *d,
         }
         return true;
     }
-    if (r200_async_submit(s, d, body_dw, src)) {
+    /* External targets own a synchronous staging buffer through GPU
+     * completion and DMA copyback; ordinary local draws retain async behavior. */
+    if (!(r200_aic_rt_enabled() && r200_async_target_external(s)) &&
+        r200_async_submit(s, d, body_dw, src)) {
         return true;
     }
     return ppc_mac_gpu_r200_draw_now(s, d, body_dw, src);
@@ -13170,7 +13658,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
         gpu_debug_log("MMIO_WR size=%u addr=0x%04"PRIx64" val=0x%"PRIx64" (%s)",
                       size, (uint64_t)addr, val, nm);
-        trace_ppc_mac_gpu_mmio_write(size, addr, nm, val);
+    }
+    /* QMP-controlled tracing must not depend on the cached, startup-only
+     * synchronous debug logger. Keep register-name lookup off the hot path
+     * while this trace event is disabled. */
+    if (unlikely(trace_event_get_state(TRACE_PPC_MAC_GPU_MMIO_WRITE))) {
+        trace_ppc_mac_gpu_mmio_write(size, addr,
+                                    ppc_mac_gpu_reg_name(addr), val);
     }
 
     /* Handle indexed register access */
@@ -13204,6 +13698,49 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             if (s->r350->pvs_dword < UINT64_MAX) {
                 s->r350->pvs_dword++;
             }
+        }
+        return;
+    }
+
+    /* These four split coordinates are not part of the legacy register
+     * decoder. Capture them only for the opt-in, WIDTH-triggered AIC path;
+     * with the option off, they continue through the original fallback. */
+    if (size == 4 && (addr == 0x1414 || addr == 0x1418 ||
+                      addr == 0x141c || addr == 0x1420) &&
+        r200_aic_blit_enabled()) {
+        switch (addr) {
+        case 0x1414: /* SRC_X */
+            s->aic_blit_src_x = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_xy_valid |= 1u << 0;
+            return;
+        case 0x1418: /* SRC_Y */
+            s->aic_blit_src_y = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_xy_valid |= 1u << 1;
+            return;
+        case 0x141c: /* DST_X */
+            s->aic_blit_dst_x = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_xy_valid |= 1u << 2;
+            return;
+        case 0x1420: /* DST_Y */
+            s->aic_blit_dst_y = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_xy_valid |= 1u << 3;
+            return;
+        default:
+            break;
+        }
+    }
+
+    /* SRC_TILE (0x1704) and DST_TILE (0x1700) describe the live 2D surface
+     * mode. Keep the ordinary unsupported-register path unchanged unless
+     * the readback experiment is explicitly enabled. */
+    if (size == 4 && (addr == 0x1700 || addr == 0x1704) &&
+        r200_aic_blit_enabled()) {
+        if (addr == 0x1700) {
+            s->aic_blit_dst_tile = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_tile_valid |= 1u << 0;
+        } else {
+            s->aic_blit_src_tile = val <= UINT32_MAX ? (uint32_t)val : UINT32_MAX;
+            s->aic_blit_tile_valid |= 1u << 1;
         }
         return;
     }
@@ -13513,18 +14050,32 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_DST_OFFSET:
         s->regs.dst_offset = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_DST_PITCH:
         s->regs.dst_pitch = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_DST_WIDTH:
         s->regs.dst_width = val;
-        /* TODO: Phase 5 - trigger 2D blit when width is written */
+        if (r200_aic_blit_enabled()) {
+            (void)ppc_mac_gpu_aic_blit_candidate(s);
+            /* X is normally set once for a multi-row copy; each row carries
+             * fresh Y values before the next WIDTH trigger. */
+            s->aic_blit_xy_valid &= (1u << 0) | (1u << 2);
+        }
         break;
     case R200_DST_HEIGHT:
         s->regs.dst_height = val;
         break;
     case R200_DST_HEIGHT_WIDTH: {
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         /* Alternate blit trigger with h|w format */
         uint32_t h = (val >> 16) & 0x3FFF;
         uint32_t w = val & 0x3FFF;
@@ -13535,6 +14086,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     }
     case R200_DST_WIDTH_HEIGHT: {
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         /* Blit trigger with w|h format (0x1598) */
         s->regs.dst_width_height = val;
         uint32_t w2 = (val >> 16) & 0x3FFF;
@@ -13546,32 +14100,53 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_DST_Y_X:
         s->regs.dst_y_x = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_DST_X_Y: {
         /* DST_X_Y: bits[31:16]=X, bits[15:0]=Y → convert to Y_X */
         uint32_t x = (val >> 16) & 0xFFFF;
         uint32_t y = val & 0xFFFF;
         s->regs.dst_y_x = (y << 16) | x;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     }
     case R200_SRC_OFFSET:
         s->regs.src_offset = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_SRC_PITCH:
         s->regs.src_pitch = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_SRC_Y_X:
         s->regs.src_y_x = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_SRC_X_Y: {
         /* SRC_X_Y: bits[31:16]=X, bits[15:0]=Y → convert to Y_X */
         uint32_t x = (val >> 16) & 0xFFFF;
         uint32_t y = val & 0xFFFF;
         s->regs.src_y_x = (y << 16) | x;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     }
     case R200_DP_GUI_MASTER_CNTL:
         s->regs.dp_gui_master_cntl = val;
+        if (r200_aic_blit_enabled()) {
+            s->aic_blit_xy_valid = 0;
+        }
         break;
     case R200_DP_BRUSH_FRGD_CLR:
         s->regs.dp_brush_frgd_clr = val;
@@ -14092,9 +14667,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             break;
         }
 
-        /* VAP/TCL and RBBM registers below 0x1C00 — store for readback.
-         * 0x15C0 = VAP_OUTPUT_VTX_FMT_0, 0x15CC = VAP_VTX_STATE_CNTL,
-         * 0x1700 = RBBM_GUICNTL, 0x1704 = SE_TCL_TEX_PROC_CTL_0 */
+        /* VAP/TCL and R200 2D tile registers below 0x1C00 — accept for
+         * readback. 0x15C0 = VAP_OUTPUT_VTX_FMT_0, 0x15CC = VAP_VTX_STATE_CNTL,
+         * 0x1700 = DST_TILE, 0x1704 = SRC_TILE. */
         if (addr == 0x15C0 || addr == 0x15CC ||
             addr == 0x1700 || addr == 0x1704) {
             break;
@@ -14256,6 +14831,11 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     }
 
     memset(&s->regs, 0, sizeof(s->regs));
+    s->aic_blit_src_x = s->aic_blit_src_y = 0;
+    s->aic_blit_dst_x = s->aic_blit_dst_y = 0;
+    s->aic_blit_xy_valid = 0;
+    s->aic_blit_src_tile = s->aic_blit_dst_tile = 0;
+    s->aic_blit_tile_valid = 0;
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
     s->hwc_visible = false;

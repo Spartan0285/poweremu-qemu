@@ -29,6 +29,7 @@ tests = {
   'test-mul64': [],
   # all code tested by test-int128 is inside int128.h
   'test-int128': [],
+  'test-ppc-mac-gpu-target': [],
   'rcutorture': [],
   'test-rcu-list': [],
   'test-rcu-simpleq': [],
