@@ -30,6 +30,7 @@
 #include "system/kvm.h"
 #include "system/runstate.h"
 #include "system/tcg.h"
+#include "system/poweremu-bql-mmio.h"
 #include "qemu/accel.h"
 #include "hw/boards.h"
 #include "migration/vmstate.h"
@@ -442,7 +443,13 @@ static MemTxResult  memory_region_read_accessor(MemoryRegion *mr,
 {
     uint64_t tmp;
 
+    uint64_t pe_begin = unlikely(qatomic_read(&poweremu_bql_mmio_trace_enabled))
+                        ? poweremu_bql_mmio_begin() : 0;
     tmp = mr->ops->read(mr->opaque, addr, size);
+    if (pe_begin) {
+        poweremu_bql_mmio_end(pe_begin, memory_region_name(mr), addr, size,
+                             false, false, (uintptr_t)mr->ops->read, MEMTX_OK);
+    }
     if (mr->subpage) {
         trace_memory_region_subpage_read(get_cpu_index(), mr, addr, tmp, size);
     } else if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
@@ -465,7 +472,13 @@ static MemTxResult memory_region_read_with_attrs_accessor(MemoryRegion *mr,
     uint64_t tmp = 0;
     MemTxResult r;
 
+    uint64_t pe_begin = unlikely(qatomic_read(&poweremu_bql_mmio_trace_enabled))
+                        ? poweremu_bql_mmio_begin() : 0;
     r = mr->ops->read_with_attrs(mr->opaque, addr, &tmp, size, attrs);
+    if (pe_begin) {
+        poweremu_bql_mmio_end(pe_begin, memory_region_name(mr), addr, size,
+                             false, true, (uintptr_t)mr->ops->read_with_attrs, r);
+    }
     if (mr->subpage) {
         trace_memory_region_subpage_read(get_cpu_index(), mr, addr, tmp, size);
     } else if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
@@ -494,7 +507,13 @@ static MemTxResult memory_region_write_accessor(MemoryRegion *mr,
         trace_memory_region_ops_write(get_cpu_index(), mr, abs_addr, tmp, size,
                                       memory_region_name(mr));
     }
+    uint64_t pe_begin = unlikely(qatomic_read(&poweremu_bql_mmio_trace_enabled))
+                        ? poweremu_bql_mmio_begin() : 0;
     mr->ops->write(mr->opaque, addr, tmp, size);
+    if (pe_begin) {
+        poweremu_bql_mmio_end(pe_begin, memory_region_name(mr), addr, size,
+                             true, false, (uintptr_t)mr->ops->write, MEMTX_OK);
+    }
     return MEMTX_OK;
 }
 
@@ -515,7 +534,14 @@ static MemTxResult memory_region_write_with_attrs_accessor(MemoryRegion *mr,
         trace_memory_region_ops_write(get_cpu_index(), mr, abs_addr, tmp, size,
                                       memory_region_name(mr));
     }
-    return mr->ops->write_with_attrs(mr->opaque, addr, tmp, size, attrs);
+    uint64_t pe_begin = unlikely(qatomic_read(&poweremu_bql_mmio_trace_enabled))
+                        ? poweremu_bql_mmio_begin() : 0;
+    MemTxResult r = mr->ops->write_with_attrs(mr->opaque, addr, tmp, size, attrs);
+    if (pe_begin) {
+        poweremu_bql_mmio_end(pe_begin, memory_region_name(mr), addr, size,
+                             true, true, (uintptr_t)mr->ops->write_with_attrs, r);
+    }
+    return r;
 }
 
 static MemTxResult access_with_adjusted_size(hwaddr addr,

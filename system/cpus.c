@@ -47,6 +47,9 @@
 #include "hw/boards.h"
 #include "hw/hw.h"
 #include "trace.h"
+#include "system/system.h"
+#include "poweremu-bql-trace.h"
+#include "system/poweremu-bql-mmio.h"
 
 #ifdef CONFIG_LINUX
 
@@ -68,6 +71,15 @@
 
 /* The Big QEMU Lock (BQL) */
 static QemuMutex bql;
+
+/* Default-off: no clock calls, memory allocation or logging unless requested. */
+static bool pe_bql_enabled;
+static uint64_t pe_bql_owner;
+static PEBQLTrace pe_bql_trace;
+bool poweremu_bql_mmio_trace_enabled;
+static PEBQLMMIOTrace pe_bql_mmio_trace;
+static char *pe_bql_prefix;
+static void pe_bql_init(void);
 
 /*
  * The chosen accelerator is supposed to register this.
@@ -422,6 +434,7 @@ void qemu_init_cpu_loop(void)
     qemu_cond_init(&qemu_cpu_cond);
     qemu_cond_init(&qemu_pause_cond);
     qemu_mutex_init(&bql);
+    pe_bql_init();
 
     qemu_thread_get_self(&io_thread);
 }
@@ -460,7 +473,7 @@ void qemu_wait_io_event(CPUState *cpu)
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        qemu_cond_wait(cpu->halt_cond, &bql);
+        qemu_cond_wait_bql(cpu->halt_cond);
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);
@@ -514,6 +527,211 @@ bool qemu_in_vcpu_thread(void)
 }
 
 QEMU_DEFINE_STATIC_CO_TLS(bool, bql_locked)
+QEMU_DEFINE_STATIC_CO_TLS(PEBQLSegment, pe_bql_current)
+typedef struct PEBQLMMIOStack {
+    uint32_t depth;
+    PEBQLSegment segments[64];
+} PEBQLMMIOStack;
+QEMU_DEFINE_STATIC_CO_TLS(PEBQLMMIOStack, pe_bql_mmio_stack)
+static uint64_t pe_bql_mmio_acquisition_changes;
+
+uint64_t poweremu_bql_mmio_begin(void)
+{
+    uint64_t ns;
+    if (!qatomic_read(&poweremu_bql_mmio_trace_enabled) || !bql_locked()) {
+        return 0;
+    }
+    ns = pe_bql_clock();
+    if (!ns) {
+        pe_bql_mmio_trace.clock_errors++;
+        return 0;
+    }
+    if (ns >= pe_bql_trace.deadline_ns || !get_pe_bql_current().acquisition) {
+        return 0;
+    }
+    PEBQLMMIOStack *stack = get_ptr_pe_bql_mmio_stack();
+    if (stack->depth == G_N_ELEMENTS(stack->segments)) {
+        pe_bql_mmio_trace.drops++;
+        return 0;
+    }
+    stack->segments[stack->depth++] = get_pe_bql_current();
+    return ns;
+}
+
+void poweremu_bql_mmio_end(uint64_t begin, const char *region, uint64_t addr,
+                          unsigned size, bool write, bool with_attrs,
+                          uintptr_t handler, unsigned result)
+{
+    if (begin) {
+        PEBQLMMIOStack *stack = get_ptr_pe_bql_mmio_stack();
+        uint32_t depth = stack->depth;
+        g_assert(depth);
+        PEBQLSegment s = stack->segments[--stack->depth];
+        bool changed = !bql_locked() ||
+                       s.acquisition != get_pe_bql_current().acquisition;
+        if (changed) {
+            qatomic_inc(&pe_bql_mmio_acquisition_changes);
+            return;
+        }
+        PEBQLMMIOEvent e = {
+            .begin_ns = begin, .end_ns = pe_bql_clock(),
+            .acquisition = s.acquisition, .handler = handler, .addr = addr,
+            .tid = s.tid, .cpu = s.cpu, .size = size, .write = write,
+            .with_attrs = with_attrs, .result = result, .depth = depth,
+        };
+        pe_bql_mmio_event(&pe_bql_mmio_trace, &e, region,
+                         pe_bql_trace.start_ns, pe_bql_trace.deadline_ns);
+    }
+}
+
+static void pe_bql_flush(Notifier *notifier, void *data)
+{
+    bool owned = bql_locked();
+    bool ok;
+    FILE *f;
+    char *path;
+
+    /* Exit-only serialization: no producer can append while files flush. */
+    if (!owned) {
+        bql_lock();
+    }
+    PEBQLSegment s = get_pe_bql_current();
+    if (s.begin_ns) {
+        pe_bql_event(&pe_bql_trace, &s, s.begin_ns, pe_bql_clock(), 2, 0);
+    }
+    qatomic_set(&pe_bql_enabled, false);
+    qatomic_set(&poweremu_bql_mmio_trace_enabled, false);
+    qatomic_set(&pe_bql_owner, 0);
+    path = g_strdup_printf("%s.bql.bin", pe_bql_prefix);
+    f = fopen(path, "wb");
+    ok = f != NULL;
+    if (f) {
+        if (fwrite(pe_bql_trace.events, sizeof(PEBQLEvent),
+                   pe_bql_trace.count, f) != pe_bql_trace.count) {
+            ok = false;
+        }
+        if (fclose(f)) {
+            ok = false;
+        }
+    }
+    g_free(path);
+    if (pe_bql_mmio_trace.events) {
+        path = g_strdup_printf("%s.bql-mmio.bin", pe_bql_prefix);
+        f = fopen(path, "wb");
+        if (!f) {
+            ok = false;
+        } else {
+            if (fwrite(pe_bql_mmio_trace.events, sizeof(PEBQLMMIOEvent),
+                       pe_bql_mmio_trace.count, f) != pe_bql_mmio_trace.count) {
+                ok = false;
+            }
+            if (fclose(f)) {
+                ok = false;
+            }
+        }
+        g_free(path);
+    }
+    path = g_strdup_printf("%s.bql.json", pe_bql_prefix);
+    f = fopen(path, "w");
+    if (f) {
+        int n = fprintf(f,
+            "{\"schema\":1,\"clock\":\"CLOCK_MONOTONIC\","
+            "\"record_bytes\":%zu,\"records\":%" PRIu64 ","
+            "\"capacity\":%u,\"drops\":%" PRIu64 ","
+            "\"clock_errors\":%" PRIu64 ",\"start_ns\":%" PRIu64 ","
+            "\"deadline_ns\":%" PRIu64 ",\"threshold_ns\":%" PRIu64 ","
+            "\"condition_reacquires\":%" PRIu64 ","
+            "\"acquisitions\":%" PRIu64 ","
+            "\"bql_lock_impl_runtime\":%" PRIu64 ","
+            "\"return_address_kind\":\"acquisition-caller\","
+            "\"binary_flush_ok\":%s,"
+            "\"mmio_enabled\":%s,\"mmio_record_bytes\":%zu,"
+            "\"mmio_records\":%" PRIu64 ",\"mmio_capacity\":%u,"
+            "\"mmio_drops\":%" PRIu64 ",\"mmio_clock_errors\":%" PRIu64 ","
+            "\"mmio_acquisition_changes\":%" PRIu64 ","
+            "\"mmio_addr_is_region_relative\":true,"
+            "\"owner_hint_is_wait_start_only\":true,"
+            "\"condition_sleep_is_not_hold\":true}\n",
+            sizeof(PEBQLEvent), pe_bql_trace.count, PE_BQL_CAPACITY,
+            pe_bql_trace.drops, pe_bql_trace.clock_errors,
+            pe_bql_trace.start_ns, pe_bql_trace.deadline_ns,
+            PE_BQL_THRESHOLD_NS, pe_bql_trace.cond_reacquires,
+            pe_bql_trace.next_acquisition, (uint64_t)(uintptr_t)bql_lock_impl,
+            ok ? "true" : "false", pe_bql_mmio_trace.events ? "true" : "false",
+            sizeof(PEBQLMMIOEvent), pe_bql_mmio_trace.count,
+            PE_BQL_MMIO_CAPACITY, pe_bql_mmio_trace.drops,
+            pe_bql_mmio_trace.clock_errors,
+            qatomic_read(&pe_bql_mmio_acquisition_changes));
+        if (n < 0 || ferror(f)) {
+            ok = false;
+        }
+        if (fclose(f)) {
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
+    g_free(path);
+    path = g_strdup_printf("%s.bql.flush.json", pe_bql_prefix);
+    f = fopen(path, "w");
+    if (!f || fprintf(f, "{\"all_outputs_ok\":%s}\n",
+                      ok ? "true" : "false") < 0) {
+        error_report("PowerEmu BQL trace final receipt failed");
+    }
+    if (f && fclose(f)) {
+        error_report("PowerEmu BQL trace final receipt close failed");
+    }
+    g_free(path);
+    if (!ok) {
+        error_report("PowerEmu BQL trace flush failed");
+    }
+    if (!owned) {
+        bql_unlock();
+    }
+}
+
+static Notifier pe_bql_exit = { .notify = pe_bql_flush };
+
+static void pe_bql_init(void)
+{
+    const char *prefix = getenv("POWEREMU_BQL_TRACE");
+    if (!prefix || !*prefix) {
+        return;
+    }
+    pe_bql_trace.start_ns = pe_bql_clock();
+    if (!pe_bql_trace.start_ns) {
+        error_report("PowerEmu BQL trace clock initialization failed");
+        return;
+    }
+    pe_bql_trace.deadline_ns = pe_bql_trace.start_ns +
+                              UINT64_C(600000000000);
+    pe_bql_trace.events = g_try_new0(PEBQLEvent, PE_BQL_CAPACITY);
+    if (!pe_bql_trace.events) {
+        error_report("PowerEmu BQL trace allocation failed");
+        return;
+    }
+    /* Commit pages before the hot path. */
+    for (size_t i = 0; i < sizeof(PEBQLEvent) * PE_BQL_CAPACITY; i += 4096) {
+        ((volatile unsigned char *)pe_bql_trace.events)[i] = 0;
+    }
+    const char *mmio = getenv("POWEREMU_BQL_MMIO_TRACE");
+    if (mmio && !strcmp(mmio, "1")) {
+        pe_bql_mmio_trace.events = g_try_new0(PEBQLMMIOEvent,
+                                             PE_BQL_MMIO_CAPACITY);
+        if (!pe_bql_mmio_trace.events) {
+            error_report("PowerEmu BQL MMIO trace allocation failed");
+        } else {
+            for (size_t i = 0; i < sizeof(PEBQLMMIOEvent) *
+                 PE_BQL_MMIO_CAPACITY; i += 4096) {
+                ((volatile unsigned char *)pe_bql_mmio_trace.events)[i] = 0;
+            }
+            qatomic_set(&poweremu_bql_mmio_trace_enabled, true);
+        }
+    }
+    pe_bql_prefix = g_strdup(prefix);
+    qemu_add_exit_notifier(&pe_bql_exit);
+    qatomic_set(&pe_bql_enabled, true);
+}
 
 static uint32_t bql_unlock_blocked;
 
@@ -553,27 +771,81 @@ void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
+    uint64_t begin = 0, owner = 0;
+    bool tracing = qatomic_read(&pe_bql_enabled);
+
     g_assert(!bql_locked());
+    if (tracing) {
+        begin = pe_bql_clock();
+        owner = qatomic_read(&pe_bql_owner);
+    }
     bql_lock_fn(&bql, file, line);
     set_bql_locked(true);
+    if (tracing && qatomic_read(&pe_bql_enabled)) {
+        uint64_t end = pe_bql_clock();
+        PEBQLSegment s = pe_bql_segment(&pe_bql_trace, end, file, line,
+            (uintptr_t)__builtin_return_address(0), qemu_get_thread_id(),
+            current_cpu ? current_cpu->cpu_index : -1);
+        pe_bql_event(&pe_bql_trace, &s, begin, end, 1, owner);
+        set_pe_bql_current(s);
+        qatomic_set(&pe_bql_owner, s.acquisition);
+    }
 }
 
 void bql_unlock(void)
 {
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+    if (qatomic_read(&pe_bql_enabled)) {
+        PEBQLSegment s = get_pe_bql_current();
+        if (s.begin_ns) {
+            pe_bql_event(&pe_bql_trace, &s, s.begin_ns, pe_bql_clock(), 2, 0);
+        }
+        set_pe_bql_current((PEBQLSegment) {0});
+        qatomic_set(&pe_bql_owner, 0);
+    }
     set_bql_locked(false);
     qemu_mutex_unlock(&bql);
 }
 
+static void pe_bql_cond_release(void)
+{
+    if (qatomic_read(&pe_bql_enabled)) {
+        PEBQLSegment s = get_pe_bql_current();
+        if (s.begin_ns) {
+            pe_bql_event(&pe_bql_trace, &s, s.begin_ns, pe_bql_clock(), 2, 0);
+        }
+        set_pe_bql_current((PEBQLSegment) {0});
+        qatomic_set(&pe_bql_owner, 0);
+    }
+}
+
+static void pe_bql_cond_acquired(const char *file, int line, uintptr_t callsite)
+{
+    if (qatomic_read(&pe_bql_enabled)) {
+        PEBQLSegment s = pe_bql_segment(&pe_bql_trace, pe_bql_clock(),
+            file, line, callsite, qemu_get_thread_id(),
+            current_cpu ? current_cpu->cpu_index : -1);
+        pe_bql_trace.cond_reacquires++;
+        set_pe_bql_current(s);
+        qatomic_set(&pe_bql_owner, s.acquisition);
+    }
+}
+
 void qemu_cond_wait_bql(QemuCond *cond)
 {
+    pe_bql_cond_release();
     qemu_cond_wait(cond, &bql);
+    pe_bql_cond_acquired("condition-reacquire", 0,
+                         (uintptr_t)__builtin_return_address(0));
 }
 
 void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
+    pe_bql_cond_release();
     qemu_cond_timedwait(cond, &bql, ms);
+    pe_bql_cond_acquired("timed-condition-reacquire", 0,
+                         (uintptr_t)__builtin_return_address(0));
 }
 
 /* signal CPU creation */
@@ -635,7 +907,7 @@ void pause_all_vcpus(void)
     replay_mutex_unlock();
 
     while (!all_vcpus_paused()) {
-        qemu_cond_wait(&qemu_pause_cond, &bql);
+        qemu_cond_wait_bql(&qemu_pause_cond);
         CPU_FOREACH(cpu) {
             qemu_cpu_kick(cpu);
         }
@@ -705,7 +977,7 @@ void qemu_init_vcpu(CPUState *cpu)
     cpus_accel->create_vcpu_thread(cpu);
 
     while (!cpu->created) {
-        qemu_cond_wait(&qemu_cpu_cond, &bql);
+        qemu_cond_wait_bql(&qemu_cpu_cond);
     }
 }
 

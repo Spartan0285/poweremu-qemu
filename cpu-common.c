@@ -160,7 +160,12 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
     while (!qatomic_load_acquire(&wi.done)) {
         CPUState *self_cpu = current_cpu;
 
+#ifdef CONFIG_USER_ONLY
         qemu_cond_wait(&qemu_work_cond, mutex);
+#else
+        /* System run_on_cpu supplies BQL; account for its released wait. */
+        qemu_cond_wait_bql(&qemu_work_cond);
+#endif
         current_cpu = self_cpu;
     }
 }
